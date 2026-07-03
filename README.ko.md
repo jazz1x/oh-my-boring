@@ -53,6 +53,20 @@ make ask Q="docker build cache 문제 어떻게 고쳤더라?"
 
 선택적으로 **pgvector** 가속기(`BORING_VECTOR=on`)를 켜면 유사도 검색 + GraphRAG이 추가됩니다.
 
+## 메모리 계약
+
+ohmyboring은 대화 로그를 쌓아두는 도구가 아니라, 기억이 거짓말하지 않도록 작게 나눈 계약들의 묶음입니다.
+
+| 계약 | 보장 |
+| --- | --- |
+| **청킹** | 노트 본문은 1,500자 단위, 200자 겹침으로 나뉩니다. 짧은 노트는 그대로 한 청크가 됩니다. 각 청크는 독립적으로 임베딩되고 `source_path#chunk_idx`로 저장되어, 긴 세션도 주변 맥락을 잃지 않고 검색됩니다. |
+| **슬라이싱** | 읽기 표면은 에이전트에게 넘기기 전에 기억을 자릅니다. MCP `recall`은 `max_results`, `max_tokens`, `project`, `since_hours`로 제한되고, 합성 프롬프트에는 고정 문맥 상한이 있으며, 브리핑/상태 경로는 최신 원천 노트, 현재 클레임, 상한이 있는 관련 문맥을 우선합니다. 생성된 daily brief는 원천 메모리 조각에서 제외되고, eval fixture는 브리핑 표면에서 정리되거나 필터링됩니다. |
+| **적재** | 파일별 파이프라인은 한 방향입니다: 파일 읽기, `frontmatter` 해석, 청크 분리, 임베딩, `upsert`, `prune`, 링크 투영. `sha`가 같으면 재임베딩을 건너뛰고, 바뀐 파일은 새 청크를 먼저 `upsert`한 뒤 오래된 꼬리 청크만 `prune`합니다. 생성 브리프는 적재에서 제외되어 요약이 원본 기억이 되지 않습니다. |
+| **클레임** | 클레임은 시간축 위의 사실입니다. `(subject, predicate)`가 식별자이고, `value`가 현재 상태이며, `kind`/`confidence`가 사용 맥락을 말합니다(`fact`, `decision`, `assumption`, `risk`, `blocked`, `goal`, `term`, `next`). 더 최신 `value`가 이전 row를 대체하고 출처는 `source_path`로 남아, 브리핑이 오래된 본문 서술보다 최신 결정, 리스크, 차단 항목, 다음 행동을 우선할 수 있습니다. |
+| **그래프** | 그래프는 결정론적입니다. `tool`, `concept`, `claim`은 `drudge` 내부의 추가 LLM 추출이 아니라 에이전트가 정리한 `frontmatter`에서 옵니다. Obsidian `relates_to`는 클레임 연속성, 정확한 도구/개념 겹침, 증거가 있는 의미 이웃, 작은 동일 프로젝트 최신성 보강 순서로 투영되고, 허브 노트가 과도한 그물망이 되지 않도록 상한이 걸립니다. |
+
+이 계약들이 대변하는 철학은 분명합니다: `vault/wiki`가 진짜 기억이고, DB는 다시 만들 수 있는 가속기이며, 경계는 추측하지 않고 아는 것만 말해야 합니다. 원본 세션은 쓰기 문에서 한 번 정제되고, 읽기 문은 빠르고, 제한되어 있고, 로컬이며, 설명 가능해야 합니다.
+
 ---
 
 ## 적재하기 (ingestion)
@@ -109,7 +123,7 @@ flowchart LR
 
 - **Read door** — 빠르고 LLM 불필요. `make ask`, `recall.py`, MCP `recall`이 `vault/wiki`를 직접 읽습니다.
 - **Write door** — gated. `distill-session.py`가 로컬 LLM을 호출하고 ohmyboring의 `remember` MCP tool로 기록합니다.
-- **Duplicate gate** — 중복 노트는 기본적으로 건너뜁니다. 같은 세션이나 강한 rollout 복제에서 더 충실한 노트가 들어오면 `remember`가 같은 `wiki-NNNN.md`를 다시 쓰고 재적재합니다.
+- **Duplicate gate** — 중복 노트는 기본적으로 건너뜁니다. 같은 세션이나 강한 롤아웃/수동 중복에서 더 충실한 노트가 들어오면 `remember`가 같은 `wiki-NNNN.md`를 다시 쓰고 재적재합니다. 세션 ID가 없는 중복은 단순 주제 겹침이 아니라 보수적인 식별 신호와 project 호환성이 있어야 합니다.
 
 ### 작업 흐름 그래프 계약
 
@@ -281,7 +295,9 @@ MacBook Pro(M5 Pro, 48 GB RAM) + 로컬 Ollama에서 측정한 결과, 16 GB 티
 | `make ollama` | Ollama 실행 확인(필요시 백그라운드 시작) |
 | `make verify-llm` | provider 접근성, 로드된 모델 id, 실제 embedding 차원 확인 |
 | `make doctor` | 스택, 훅, 마지막 적재, Codex 워커/큐 상태 진단 |
+| `make codex-status-strict` | 자가검증용 Codex 워커/마커 readiness 단계 |
 | `make readiness` | 브리핑 전 strict 게이트; 모델/임베딩, 훅, 컨테이너, 워커, stale marker, freshness finding이 있으면 실패 |
+| `make self-verify-cycle` | 자가검증 한 사이클을 실행하고 `summary.tsv` 증거 행을 추가 |
 | `make self-verify-check` | 라이브 자가검증 요약을 현재 단계 계약으로 평가 |
 | `make ask Q="..."` | recall + 요약 한 번에 |
 | `make sync` | vault 재적재 |
@@ -294,7 +310,8 @@ MacBook Pro(M5 Pro, 48 GB RAM) + 로컬 Ollama에서 측정한 결과, 16 GB 티
 | `make smoke` | end-to-end smoke test |
 | `make logs` | 엔진 로그 |
 | `make events [N=20]` | 엔진 DB의 최근 작업 흐름 이벤트 보기; 실패 시 로컬 스풀 fallback |
-| `make guard` | fmt + clippy + test + Python py-compile |
+| `make recent-events [N=20]` | 자가검증용 recent-events 단계; DB 우선/파일 fallback 관점은 동일 |
+| `make guard` | 스택 없이 실행하는 구조 게이트: Rust, Python, 셸 가드레일, vault 정결도 dry-run |
 | `make quality` | 릴리즈 수용성 drift 게이트 |
 | `make down` | 컨테이너 중지 |
 
@@ -338,7 +355,7 @@ curl -s -X POST http://localhost:7700/stalled \
   -d '{"project":"omb","older_than_days":7}' | jq .
 ```
 
-Hermes cron은 브리핑 스크립트의 stdout을 Slack `mrkdwn` 텍스트로 보냅니다. `make eval` fixture 노트는 게이트 실행 중 검색에는 쓰이지만, 종료 후 prune되며 recency/claim 브리핑 surface에서도 제외되어 일간/주간 브리핑에 섞이지 않습니다.
+Hermes cron은 브리핑 스크립트의 stdout을 Slack `mrkdwn` 텍스트로 보냅니다. `make eval` fixture 노트는 게이트 실행 중 검색에는 쓰이지만, 종료 후 prune되며 recency/claim 브리핑 표면에서도 제외되어 일간/주간 브리핑에 섞이지 않습니다. 스케줄러가 쓰는 `daily-brief-*.md` 파일은 생성 산출물로 `vault/wiki`에 남지만, `daily-brief` 태그 때문에 readiness/health의 source-corpus 점검, recall, vector/claim 브리핑 표면, 중복 후보, DB 적재에서 제외되어 요약이 다음 요약의 원문이 되지 않습니다.
 
 ### PII / 민감 데이터 게이트
 
@@ -403,6 +420,7 @@ curl -s -X POST http://localhost:7700/mcp \
 | 어댑터 | 경로 | 소비 주체 | 진입점 | 역할 |
 |---|---|---|---|---|
 | Claude Code | `agents/claude-code/distill-session.py` | `SessionEnd` / `Stop` hook | 세션을 요약해 `remember` 호출 |
+| Claude Code | `agents/claude-code/session-start-recall.py` | `SessionStart` hook | 첫 턴 전에 구조화 컨텍스트(`/context`)를 로드 |
 | Claude Code | `agents/claude-code/recall.py` | `UserPromptSubmit` hook | 관련 snippet을 가져와 프롬프트 context 주입 |
 | Kimi Code | `agents/kimi/distill-session.py` | `SessionEnd` hook | Kimi 세션을 요약해 `remember` 호출 |
 | Kimi Code | `agents/kimi/recall.py` | `UserPromptSubmit` hook | 관련 snippet을 가져와 프롬프트 context 주입 |
@@ -414,12 +432,30 @@ curl -s -X POST http://localhost:7700/mcp \
 | shared | `agents/shared/boring_config.py` | 어댑터 import | `boring.json` 정책 로더 |
 | shared | `agents/shared/agent_wiring.py` | `install.sh` | 활성화된 에이전트의 hook/MCP 설정을 idempotent하게 구성 |
 
+### 소비 엔드포인트
+
+메모리는 HTTP endpoint 또는 MCP 서버(`http://localhost:7700/mcp`)로 접근할 수 있습니다:
+
+| Endpoint / MCP tool | 목적 | Vector backend |
+|---|---|---|
+| `POST /context` / `context` | 구조화 컨텍스트 카드: decisions, risks, facts, glossary, next_actions | 불필요 |
+| `POST /next_actions` / `next_actions` | 다음 행동 레지스터: 명시적 다음 단계 + 활성 차단 항목 | 필요 |
+| `POST /stalled` / `stalled` | 정체 레지스터: 오래된 다음 단계와 차단 항목 | 필요 |
+| `POST /status` / `project_status` | 30일 프로젝트 상태(Done/Next/Blocked/Decisions/Risks) | 필요 |
+| `POST /weekly` / `weekly_brief` | 최근 7일 전체 프로젝트 브리핑 | 필요 |
+| `POST /decisions` / `decisions` | 프로젝트 결정 claim | 필요 |
+| `POST /risks` / `risks` | 리스크/가정/차단 claim | 필요 |
+| `POST /ask` / `ask` | 메모리 기반 직접 질문 답변 | 불필요 |
+| `POST /search` / `recall` | 원본 메모리 excerpt | 불필요; semantic search는 vector 사용 가능 |
+| `/remember` / `remember` | 정리된 노트 저장 | - |
+
 ### 토큰 예산
 
 자동 검색은 에이전트의 context window를 폭발시킬 수 있으므로, 검색 표면은 예산을 인식합니다.
 
-- MCP `recall`은 `max_tokens`, `max_results`를 받습니다.
-- HTTP `/search`는 `max_tokens`, `max_results`를 받습니다.
+- MCP `recall`과 HTTP `/search`는 `max_tokens`, `max_results`, `project`, `since_hours`를 받습니다.
+- MCP `ask`와 HTTP `/ask`는 `project`, `since_hours`로 검색 범위를 좁힐 수 있습니다.
+- `/context`는 섹션별 `max_items`(기본 5)로 자동 주입 크기를 제한하며 vector search가 필요 없습니다.
 - `recall.py`는 `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS`로 주입 context를 제한합니다.
 - `ask`/`brief` 합성은 검색된 context를 고정 문자 한도 아래로 유지합니다.
 
@@ -449,7 +485,7 @@ MCP를 지원하는 어떤 에이전트도 ohmyboring를 사용할 수 있습니
 - `decisions` *(`BORING_VECTOR=on` 필요)* — 결정 레지스터: 최근 `decision` claim.
 - `risks` *(`BORING_VECTOR=on` 필요)* — 위험 레지스터: 최근 `risk`·`assumption`·`blocked` claim.
 - `neighbors` *(`BORING_VECTOR=on` 필요)* — 토픽에서 출발하는 그래프 순회: 쿼리를 임베딩해 가장 가까운 노트 하나를 잡고, 그 노트의 1-hop 라벨을 반환합니다(`{hit, graph_neighbors, semantic_neighbors}` JSON). `hit`은 매칭된 노트 경로, `graph_neighbors`는 그 노트의 project/topic 라벨, `semantic_neighbors`는 공유 tool/concept 라벨이며 — 노트 경로가 아니라 평탄한 문자열입니다.
-- `claims` *(`BORING_VECTOR=on` 필요)* — 쿼리 근처의 현재(미대체) `{subject, predicate, value}` 결정 top-k.
+- `claims` *(`BORING_VECTOR=on` 필요)* — 쿼리 근처의 현재(미대체) `{subject, predicate, value, kind, confidence, source_path}` 클레임 top-k와 근거 파일 출처. `project`와 `kinds`로 선택 필터링할 수 있습니다.
 - `corpus_status` *(`BORING_VECTOR=on` 필요)* — KB 상태 스냅샷(파일/청크 수, origin/kind/project별, 오염도, graph/semantic 노드+엣지).
 - `events` *(`BORING_VECTOR=on` 필요)* — DB에 OpenTelemetry 형태로 저장된 최근 workflow/adapter 이벤트를 반환합니다. component, event, status, run_id, workflow, since_hours로 필터링할 수 있습니다.
 - `ask` / `brief` / `weekly_brief` / `project_status` / `decisions` / `risks` / `next_actions` / `stalled` — LLM을 실행하는 tool: `ask`는 출처를 인용해 질문에 답하고(wiki-first 모드에서 동작), 나머지는 recency/claim 레지스터이며 `BORING_VECTOR=on`이 필요합니다.
@@ -499,7 +535,7 @@ curl -s -X POST http://localhost:7700/mcp \
 ## 개발 · 가드레일
 
 - SSOT 문서: `drudge/{PHILOSOPHY,RUST-STYLE,ENFORCEMENT}.md`
-- `make guard` = `rustfmt --check` + `clippy -D warnings` + `cargo test`
+- `make guard` = 스택 없이 실행하는 구조 게이트: rustfmt, clippy, Rust 테스트, Python 컴파일/단위 테스트, 셸 가드레일, vault 정결도 dry-run
 - `make quality` = MCP tool, vector 모드 문서, 제거된 위험 surface의 릴리즈 수용성 drift 게이트
 - CI: `rust-gate` · `quality-gate` · `gitleaks` · `cargo-deny` · `trivy`
 - `unsafe_code = "forbid"`

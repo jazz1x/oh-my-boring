@@ -53,6 +53,20 @@ First-run success means:
 
 Optional **pgvector** accelerator (`BORING_VECTOR=on`) adds similarity search + GraphRAG when scale calls for it.
 
+## Memory contracts
+
+ohmyboring is intentionally opinionated: memory is not a pile of chat logs, but a set of small contracts that keep recall honest.
+
+| Contract | What it guarantees |
+| --- | --- |
+| **Chunking** | Note bodies are split into 1,500-character chunks with 200-character overlap. Short notes stay whole. Each chunk is embedded independently and stored as `source_path#chunk_idx`, so long sessions remain searchable without losing nearby context. |
+| **Slicing** | Read surfaces cut memory before it reaches the agent. MCP `recall` is bounded by `max_results`, `max_tokens`, `project`, and `since_hours`; synthesis prompts have a fixed context ceiling; brief/status paths prefer newest source notes, current claims, and capped related context. Generated daily briefs are excluded from source-memory slices, and eval fixtures are pruned or filtered away from briefing surfaces. |
+| **Ingestion** | The per-file pipeline is one-way: read, parse frontmatter, chunk, embed, upsert, prune, and project links. `sha` tracking skips unchanged files, changed files upsert fresh chunks before stale tail chunks are pruned, and generated briefs are skipped so summaries never become source memory. |
+| **Claims** | Claims are temporal facts. `(subject, predicate)` is the identity, `value` is the current state, and `kind`/`confidence` say how to use it (`fact`, `decision`, `assumption`, `risk`, `blocked`, `goal`, `term`, `next`). Newer values supersede older rows while provenance stays on `source_path`, so briefings can prefer current decisions, risks, blockers, and next actions over stale prose. |
+| **Graph** | The graph is deterministic. Tools, concepts, and claims come from agent-curated frontmatter, not from an extra LLM extraction pass inside `drudge`. Obsidian `relates_to` links are projected from claim continuity, exact tool/concept overlap, corroborated semantic neighbors, and a small same-project recency fallback, capped so hub notes do not explode into a mesh. |
+
+These contracts represent the project's philosophy: `vault/wiki` is the source of truth, the database is rebuildable acceleration, and every boundary should say what it knows instead of guessing. Raw sessions are refined once at the write door; reads stay fast, bounded, local, and explainable.
+
 ---
 
 ## Feeding it (ingestion)
@@ -109,11 +123,11 @@ flowchart LR
 
 - **Read door** — fast, no LLM. `make ask`, `recall.py`, MCP `recall` read `vault/wiki` directly.
 - **Write door** — gated. `distill-session.py` calls the local LLM and writes through ohmyboring's deterministic `remember` MCP tool.
-- **Duplicate gate** — duplicate notes are normally skipped; if the same session or a strong rollout copy produces a richer note, `remember` rewrites the same `wiki-NNNN.md` and re-ingests it.
+- **Duplicate gate** — duplicate notes are normally skipped; if the same session or a strong rollout/manual duplicate produces a richer note, `remember` rewrites the same `wiki-NNNN.md` and re-ingests it. Non-session duplicates require conservative identity signals and project compatibility, not topic overlap alone.
 
 ### Workflow graph contract
 
-The ingest loop also has a Rust-side workflow graph contract in `drudge/src/workflow.rs`, documented in `drudge/WORKFLOW.md`. It is a 랭그래프 typed state graph for session discovery, distillation, resolution verification, repair, `remember`, marker update, event logging, and readiness projection. It is not a second runtime orchestrator: Python hooks/workers still perform host I/O, while Rust owns the closed node/edge vocabulary and graph-shape tests.
+The ingest loop also has a Rust-side workflow graph contract in `drudge/src/workflow.rs`, documented in `drudge/WORKFLOW.md`. It is a LangGraph-style typed state graph for session discovery, distillation, resolution verification, repair, `remember`, marker update, event logging, and readiness projection. It is not a second runtime orchestrator: Python hooks/workers still perform host I/O, while Rust owns the closed node/edge vocabulary and graph-shape tests.
 
 ---
 
@@ -281,7 +295,9 @@ One name per layer — the `ohmyzsh` ↔ `~/.oh-my-zsh` pattern. Only the layer 
 | `make ollama` | ensure Ollama is running (start in background if needed) |
 | `make verify-llm` | verify provider reachability, loaded model ids, and actual embedding dimension |
 | `make doctor` | diagnose stack, hooks, latest ingest, and Codex worker/queue status |
+| `make codex-status-strict` | self-verify Codex worker/marker readiness step |
 | `make readiness` | strict pre-briefing gate; fails on model/embed, hook, container, worker, stale-marker, or freshness findings |
+| `make self-verify-cycle` | run one self-verification cycle and append `summary.tsv` evidence rows |
 | `make self-verify-check` | evaluate the live self-verification summary against the current stage contract |
 | `make ask Q="..."` | one-shot recall + synthesis |
 | `make sync` | deterministic re-ingest of the vault |
@@ -294,7 +310,8 @@ One name per layer — the `ohmyzsh` ↔ `~/.oh-my-zsh` pattern. Only the layer 
 | `make smoke` | end-to-end smoke test |
 | `make logs` | engine logs |
 | `make events [N=20]` | show recent workflow events from the engine DB, falling back to the local spool |
-| `make guard` | fmt + clippy + test + Python py-compile |
+| `make recent-events [N=20]` | self-verify recent-events step; same DB-first/file-fallback view |
+| `make guard` | stack-free structural gate: Rust, Python, shell guardrails, and vault hygiene dry-run |
 | `make quality` | release acceptance drift gate |
 | `make down` | stop containers |
 
@@ -338,7 +355,7 @@ curl -s -X POST http://localhost:7700/stalled \
   -d '{"project":"omb","older_than_days":7}' | jq .
 ```
 
-Hermes cron sends briefing script stdout as Slack `mrkdwn` text. `make eval` fixture notes are searchable during the gate but are pruned afterward and excluded from recency/claim briefing surfaces so test corpus entries do not appear in daily or weekly digests.
+Hermes cron sends briefing script stdout as Slack `mrkdwn` text. `make eval` fixture notes are searchable during the gate but are pruned afterward and excluded from recency/claim briefing surfaces so test corpus entries do not appear in daily or weekly digests. Scheduler-written `daily-brief-*.md` files are kept in `vault/wiki` as generated output artifacts, but their `daily-brief` tag excludes them from readiness/health source-corpus checks, recall, vector/claim briefing surfaces, duplicate candidates, and DB ingest so summaries do not become source memory.
 
 ### PII / sensitive-data gate
 
@@ -468,7 +485,7 @@ In the default wiki-first mode (`BORING_VECTOR=off`), tools that rely on recency
 - `decisions` *(requires `BORING_VECTOR=on`)* — decision register: recent `decision` claims for a project.
 - `risks` *(requires `BORING_VECTOR=on`)* — risk register: recent `risk`, `assumption`, and `blocked` claims for a project.
 - `neighbors` *(requires `BORING_VECTOR=on`)* — graph traversal from a topic: embeds the query, takes the single closest note, then returns its 1-hop labels (`{hit, graph_neighbors, semantic_neighbors}` JSON). `hit` is the matched note's path; `graph_neighbors` are its project/topic labels and `semantic_neighbors` its shared tool/concept labels — flat strings, not note paths.
-- `claims` *(requires `BORING_VECTOR=on`)* — top-k current (non-superseded) `{subject, predicate, value}` decisions near a query.
+- `claims` *(requires `BORING_VECTOR=on`)* — top-k current (non-superseded) `{subject, predicate, value, kind, confidence, source_path}` claims near a query, with source provenance. Optionally filter by `project` and `kinds`.
 - `corpus_status` *(requires `BORING_VECTOR=on`)* — KB health snapshot (file/chunk counts, by origin/kind/project, contamination, graph/semantic nodes+edges).
 - `events` *(requires `BORING_VECTOR=on`)* — recent workflow/adapter events stored in the DB as OpenTelemetry-shaped records. Filter by component, event, status, run_id, workflow, or since_hours.
 - `ask` / `brief` / `weekly_brief` / `project_status` / `decisions` / `risks` / `next_actions` / `stalled` — LLM-running tools: `ask` answers a question with cited sources (works in wiki-first mode); the rest are recency/claim registers that require `BORING_VECTOR=on`.
@@ -536,7 +553,7 @@ If you customized `~/.hermes/config.yaml` or `~/.hermes/scripts/briefing.py`, ba
 ## Development · guardrails
 
 - SSOT docs: `drudge/{PHILOSOPHY,RUST-STYLE,ENFORCEMENT}.md`
-- `make guard` = `rustfmt --check` + `clippy -D warnings` + `cargo test`
+- `make guard` = stack-free structural gate: rustfmt, clippy, Rust tests, Python compile/unit tests, shell guardrails, and vault hygiene dry-run
 - `make quality` = release acceptance drift gate for MCP tools, vector-mode docs, and removed dangerous surfaces
 - CI: `rust-gate` · `quality-gate` · `gitleaks` · `cargo-deny` · `trivy`
 - `unsafe_code = "forbid"`

@@ -53,6 +53,20 @@ make ask Q="docker build cache の問題、どう直したっけ？"
 
 オプションの **pgvector** アクセラレータ（`BORING_VECTOR=on`）を有効にすると、類似度検索 + GraphRAG が追加されます。
 
+## メモリ契約
+
+ohmyboring は会話ログを積み上げる道具ではなく、記憶が嘘をつかないように小さな契約へ分けた仕組みです。
+
+| 契約 | 保証すること |
+| --- | --- |
+| **チャンク** | ノート本文は 1,500 文字単位、200 文字の重なりで分割されます。短いノートは 1 つのチャンクのままです。各チャンクは独立して埋め込まれ、`source_path#chunk_idx` として保存されるため、長いセッションでも近い文脈を失わず検索できます。 |
+| **スライス** | 読み取り面は、エージェントへ渡す前に記憶を絞ります。MCP `recall` は `max_results`、`max_tokens`、`project`、`since_hours` で制限され、合成プロンプトには固定の文脈上限があり、ブリーフィング/状態経路は最近の元ノート、現在のクレーム、上限付きの関連文脈を優先します。生成済み daily brief は元メモリのスライスから除外され、eval fixture はブリーフィング面から除去または絞り込みされます。 |
+| **取り込み** | ファイル単位のパイプラインは一方向です: ファイル読み取り、`frontmatter` 解釈、チャンク分割、埋め込み、`upsert`、`prune`、リンク投影。`sha` が同じなら再埋め込みをスキップし、変更されたファイルは新しいチャンクを先に `upsert` してから古い末尾チャンクだけ `prune` します。生成ブリーフは取り込み対象外なので、要約が元の記憶になりません。 |
+| **クレーム** | クレームは時間軸上の事実です。`(subject, predicate)` が識別子、`value` が現在状態、`kind`/`confidence` が利用文脈です（`fact`、`decision`、`assumption`、`risk`、`blocked`、`goal`、`term`、`next`）。より新しい `value` が古い row を置き換え、出典は `source_path` に残るため、ブリーフィングは古い本文記述より最新の決定、リスク、ブロッカー、次アクションを優先できます。 |
+| **グラフ** | グラフは決定論的です。`tool`、`concept`、`claim` は `drudge` 内部の追加 LLM 抽出ではなく、エージェントが整えた `frontmatter` から来ます。Obsidian `relates_to` はクレームの連続性、正確な道具/概念の重なり、証拠のある意味的な隣接、小さな同一プロジェクトの新しさ補完の順で投影され、ハブノートが過剰な網目にならないよう上限がかかります。 |
+
+これらの契約が表す哲学は明確です: `vault/wiki` が本当の記憶で、DB は再構築できる加速器です。境界は推測せず、知っていることだけを言うべきです。元セッションは書き込み口で一度だけ整え、読み取り口は速く、制限され、ローカルで、説明可能であるべきです。
+
 ---
 
 ## 取り込み (ingestion)
@@ -109,11 +123,11 @@ flowchart LR
 
 - **Read door** — 高速、LLM 不要。`make ask`、`recall.py`、MCP `recall` が `vault/wiki` を直接読みます。
 - **Write door** — gated。`distill-session.py` がローカル LLM を呼び出し、ohmyboring の `remember` MCP tool で書き込みます。
-- **Duplicate gate** — 重複ノートは通常スキップします。同じセッションまたは強い rollout コピーから、より内容の濃いノートが来た場合は、`remember` が同じ `wiki-NNNN.md` を書き換えて再取り込みします。
+- **Duplicate gate** — 重複ノートは通常スキップします。同じセッション、または強いロールアウト/手動重複から、より内容の濃いノートが来た場合は、`remember` が同じ `wiki-NNNN.md` を書き換えて再取り込みします。セッション ID がない重複は、単なるトピックの重なりではなく、保守的な識別信号と project 互換性を必要とします。
 
 ### ワークフローグラフ契約
 
-取り込みループには `drudge/src/workflow.rs` に Rust 側のワークフローグラフ契約があり、`drudge/WORKFLOW.md` に文書化されています。セッション検出、蒸留、解像度検証、補強、`remember`、マーカー更新、イベント記録、readiness 投影を、閉じた型の 랭그래프状態グラフとして表します。これは 2 つ目のランタイムオーケストレーターではありません。Python のフック/ワーカーは引き続きホスト I/O を担当し、Rust はノード/エッジ語彙とグラフ形状テストを所有します。
+取り込みループには `drudge/src/workflow.rs` に Rust 側のワークフローグラフ契約があり、`drudge/WORKFLOW.md` に文書化されています。セッション検出、蒸留、解像度検証、補強、`remember`、マーカー更新、イベント記録、readiness 投影を、閉じた型の LangGraph 風状態グラフとして表します。これは 2 つ目のランタイムオーケストレーターではありません。Python のフック/ワーカーは引き続きホスト I/O を担当し、Rust はノード/エッジ語彙とグラフ形状テストを所有します。
 
 ---
 
@@ -251,7 +265,9 @@ make readiness
 | `make ollama` | Ollama 実行確認（必要ならバックグラウンド起動） |
 | `make verify-llm` | provider 到達性、ロード済みモデル id、実際の embedding 次元を確認 |
 | `make doctor` | スタック、フック、最終取り込み、Codex ワーカー/キュー状態を診断 |
+| `make codex-status-strict` | 自己検証用の Codex ワーカー/マーカー readiness ステップ |
 | `make readiness` | ブリーフィング前の strict ゲート。モデル/埋め込み、hook、container、worker、stale marker、freshness finding があれば失敗 |
+| `make self-verify-cycle` | 自己検証の 1 cycle を実行し、`summary.tsv` の証拠行を追記 |
 | `make self-verify-check` | ライブ自己検証サマリーを現在の段階契約で評価 |
 | `make ask Q="..."` | recall + 要約を一度に実行 |
 | `make sync` | vault の再取り込み |
@@ -264,7 +280,8 @@ make readiness
 | `make smoke` | end-to-end smoke test |
 | `make logs` | エンジンログ |
 | `make events [N=20]` | エンジン DB の最近のワークフローイベントを表示。失敗時はローカルスプールに fallback |
-| `make guard` | fmt + clippy + test + Python py-compile |
+| `make recent-events [N=20]` | 自己検証用の recent-events ステップ。DB 優先/ファイル fallback の view は同じ |
+| `make guard` | スタック不要の構造ゲート: Rust、Python、シェルのガードレール、vault 衛生 dry-run |
 | `make quality` | リリース受け入れ drift ゲート |
 | `make down` | コンテナ停止 |
 
@@ -308,7 +325,7 @@ curl -s -X POST http://localhost:7700/stalled \
   -d '{"project":"omb","older_than_days":7}' | jq .
 ```
 
-Hermes cron はブリーフィングスクリプトの stdout を Slack `mrkdwn` テキストとして送信します。`make eval` の fixture ノートはゲート実行中は検索に使われますが、終了後に prune され、recency/claim ブリーフィング surface からも除外されるため、日次/週次ブリーフィングには混ざりません。
+Hermes cron はブリーフィングスクリプトの stdout を Slack `mrkdwn` テキストとして送信します。`make eval` の fixture ノートはゲート実行中は検索に使われますが、終了後に prune され、recency/claim ブリーフィング面からも除外されるため、日次/週次ブリーフィングには混ざりません。スケジューラが書く `daily-brief-*.md` ファイルは生成された出力物として `vault/wiki` に残りますが、`daily-brief` タグにより readiness/health の source-corpus チェック、recall、vector/claim ブリーフィング面、重複候補、DB 取り込みから除外され、要約が次の要約の原文にならないようにします。
 
 ### PII / 機密データゲート
 
@@ -373,6 +390,7 @@ curl -s -X POST http://localhost:7700/mcp \
 | アダプター | パス | 消費主体 | エントリポイント | 役割 |
 |---|---|---|---|---|
 | Claude Code | `agents/claude-code/distill-session.py` | `SessionEnd` / `Stop` hook | セッションを要約し `remember` を呼び出す |
+| Claude Code | `agents/claude-code/session-start-recall.py` | `SessionStart` hook | 最初のターン前に構造化コンテキスト（`/context`）を読み込む |
 | Claude Code | `agents/claude-code/recall.py` | `UserPromptSubmit` hook | 関連 snippet を取得しプロンプト context に注入 |
 | Kimi Code | `agents/kimi/distill-session.py` | `SessionEnd` hook | Kimi セッションを要約し `remember` を呼び出す |
 | Kimi Code | `agents/kimi/recall.py` | `UserPromptSubmit` hook | 関連 snippet を取得しプロンプト context に注入 |
@@ -384,12 +402,30 @@ curl -s -X POST http://localhost:7700/mcp \
 | shared | `agents/shared/boring_config.py` | アダプター import | `boring.json` ポリシーローダー |
 | shared | `agents/shared/agent_wiring.py` | `install.sh` | 有効なエージェントの hook/MCP 設定を idempotent に構成 |
 
+### 消費エンドポイント
+
+メモリは HTTP endpoint または MCP サーバー（`http://localhost:7700/mcp`）から利用できます:
+
+| Endpoint / MCP tool | 目的 | Vector backend |
+|---|---|---|
+| `POST /context` / `context` | 構造化コンテキストカード: decisions, risks, facts, glossary, next_actions | 不要 |
+| `POST /next_actions` / `next_actions` | 次アクションレジスタ: 明示的な次ステップ + アクティブなブロッカー | 必要 |
+| `POST /stalled` / `stalled` | 停滞レジスタ: 古い次ステップとブロッカー | 必要 |
+| `POST /status` / `project_status` | 30日間のプロジェクト状態（Done/Next/Blocked/Decisions/Risks） | 必要 |
+| `POST /weekly` / `weekly_brief` | 直近7日間の全プロジェクトブリーフィング | 必要 |
+| `POST /decisions` / `decisions` | プロジェクトの decision claim | 必要 |
+| `POST /risks` / `risks` | risk/assumption/blocked claim | 必要 |
+| `POST /ask` / `ask` | メモリに基づく直接質問応答 | 不要 |
+| `POST /search` / `recall` | 生のメモリ excerpt | 不要; semantic search は vector 使用可 |
+| `/remember` / `remember` | 整理済みノートを保存 | - |
+
 ### トークン予算
 
 自動検索はエージェントの context window を爆発させる可能性があるため、検索面は予算を意識しています。
 
-- MCP `recall` は `max_tokens`、`max_results` を受け取ります。
-- HTTP `/search` は `max_tokens`、`max_results` を受け取ります。
+- MCP `recall` と HTTP `/search` は `max_tokens`、`max_results`、`project`、`since_hours` を受け取ります。
+- MCP `ask` と HTTP `/ask` は `project`、`since_hours` で検索範囲を絞れます。
+- `/context` はセクションごとの `max_items`（デフォルト 5）で自動注入サイズを制限し、vector search を必要としません。
 - `recall.py` は `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS` で注入 context を制限します。
 - `ask`/`brief` 合成は取得した context を固定文字数上限以下に保ちます。
 
@@ -419,7 +455,7 @@ MCP に対応したエージェントならどれも ohmyboring を利用でき�
 - `decisions` *(`BORING_VECTOR=on` が必要)* — 決定レジスタ: 最近の `decision` claim。
 - `risks` *(`BORING_VECTOR=on` が必要)* — リスクレジスタ: 最近の `risk`・`assumption`・`blocked` claim。
 - `neighbors` *(`BORING_VECTOR=on` が必要)* — トピックからのグラフ走査: クエリを埋め込み、最も近いノート 1 件を取り、その 1-hop ラベルを返します（`{hit, graph_neighbors, semantic_neighbors}` JSON）。`hit` はマッチしたノートのパス、`graph_neighbors` はその project/topic ラベル、`semantic_neighbors` は共有する tool/concept ラベルで、いずれもノートパスではなくフラットな文字列です。
-- `claims` *(`BORING_VECTOR=on` が必要)* — クエリ近傍の現在（未置換）の `{subject, predicate, value}` 決定の top-k。
+- `claims` *(`BORING_VECTOR=on` が必要)* — クエリ近傍の現在（未置換）の `{subject, predicate, value, kind, confidence, source_path}` クレーム top-k と根拠ファイルの出所。`project` と `kinds` で任意に絞り込めます。
 - `corpus_status` *(`BORING_VECTOR=on` が必要)* — KB ヘルスのスナップショット（ファイル/チャンク数、origin/kind/project 別、汚染度、graph/semantic のノード+エッジ）。
 - `events` *(`BORING_VECTOR=on` が必要)* — DB に OpenTelemetry 形式で保存された最近の workflow/adapter イベントを返します。component、event、status、run_id、workflow、since_hours でフィルタできます。
 - `ask` / `brief` / `weekly_brief` / `project_status` / `decisions` / `risks` / `next_actions` / `stalled` — LLM を実行する tool: `ask` は出典を引用して質問に答え（wiki-first モードで動作）、残りは recency/claim レジスタで `BORING_VECTOR=on` が必要です。
@@ -469,7 +505,7 @@ curl -s -X POST http://localhost:7700/mcp \
 ## 開発 · ガードレール
 
 - SSOT ドキュメント: `drudge/{PHILOSOPHY,RUST-STYLE,ENFORCEMENT}.md`
-- `make guard` = `rustfmt --check` + `clippy -D warnings` + `cargo test`
+- `make guard` = スタック不要の構造ゲート: rustfmt、clippy、Rust テスト、Python コンパイル/単体テスト、シェルのガードレール、vault 衛生 dry-run
 - `make quality` = MCP tool、vector モード文書、削除済み危険 surface のリリース受け入れ drift ゲート
 - CI: `rust-gate` · `quality-gate` · `gitleaks` · `cargo-deny` · `trivy`
 - `unsafe_code = "forbid"`
