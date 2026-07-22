@@ -153,7 +153,7 @@ flowchart LR
 | `llm.embed_model` / `llm.embed_dim` | 임베딩 모델 + 그 벡터 차원(커널의 유일한 모델) |
 | `llm.bootstrap` | `auto` = 부트스트랩이 기동/pull 가능 · `manual` = 헬스체크만(서버는 사용자 소유) |
 | `repos[]` | 경로/remote 규칙 → `origin=personal/company/mirror/community` |
-| `agents[]` | vector mode ingest source |
+| `agents[]` | 에이전트 세션 대화 기록·어댑터 설정(원시 저장소·코드베이스 적재 아님) |
 
 **LLM 백엔드 전환**은 config 블록 하나로 끝납니다. `make up`은 `scripts/llm-providers/<provider>.sh` 로 디스패치합니다.
 

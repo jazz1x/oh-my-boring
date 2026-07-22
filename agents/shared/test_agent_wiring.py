@@ -9,10 +9,11 @@ Guards the installer surface that is otherwise only exercised at install time:
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest import mock
+from unittest import TestCase, mock
 
 # Import the module under test the same way the installed script does.
 HERE = Path(__file__).resolve().parent
@@ -120,7 +121,7 @@ def test_wire_claude_code_adds_session_start():
 
 
 def test_wire_hermes_adds_hint_and_weekly():
-    """hermes wiring installs hint + weekly script and updates config.yaml."""
+    """Fresh Hermes wiring installs importable briefing scripts and config."""
     with tempfile.TemporaryDirectory() as d, mock.patch.object(
         agent_wiring, "_sync_hermes_cron_jobs", return_value={"changed": False, "jobs_count": 3}
     ) as mock_cron:
@@ -136,9 +137,18 @@ def test_wire_hermes_adds_hint_and_weekly():
         home = Path(d) / "omb"
         scripts = home / "agents" / "hermes"
         scripts.mkdir(parents=True)
-        (scripts / "briefing.py").write_text("# stub", encoding="utf-8")
+        (scripts / "briefing.py").write_text(
+            "import slack_briefing\nDEPENDENCY_PATH = slack_briefing.__file__\n",
+            encoding="utf-8",
+        )
+        (scripts / "slack_briefing.py").write_text(
+            'BRIEFING_DEPENDENCY = "installed"\n', encoding="utf-8"
+        )
         (scripts / "weekly-briefing.py").write_text("# stub", encoding="utf-8")
         (scripts / "codex-collect-sessions.py").write_text("# stub", encoding="utf-8")
+        installed_scripts = fake_home / ".hermes" / "scripts"
+        installed_slack_briefing = installed_scripts / "slack_briefing.py"
+        assert not installed_scripts.exists()
         cfg = Path(d) / "config.yaml"
         with mock.patch.object(agent_wiring.os.path, "expanduser", side_effect=fake_expanduser):
             result = agent_wiring.wire_hermes(cfg, boring_home=str(home))
@@ -146,9 +156,82 @@ def test_wire_hermes_adds_hint_and_weekly():
         text = cfg.read_text(encoding="utf-8")
         assert "environment_hint:" in text
         assert "ohmyboring/context" in text
+        assert installed_slack_briefing.exists()
+        imported = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import sys; sys.path.insert(0, sys.argv[1]); import briefing; "
+                "print(briefing.DEPENDENCY_PATH)",
+                str(installed_scripts),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert imported.returncode == 0, imported.stderr
+        assert imported.stderr == ""
+        assert Path(imported.stdout.strip()).resolve() == installed_slack_briefing.resolve()
         assert (fake_home / ".hermes" / "scripts" / "weekly-briefing.py").exists()
         assert (fake_home / ".hermes" / "scripts" / "codex-collect-sessions.py").exists()
         assert mock_cron.called is True
+
+
+def test_install_hermes_briefing_backs_up_existing_scripts():
+    """Briefing installation preserves the prior scripts as backups."""
+    with tempfile.TemporaryDirectory() as d:
+        fake_home = Path(d) / "home"
+        source_dir = Path(d) / "omb" / "agents" / "hermes"
+        source_dir.mkdir(parents=True)
+        for name in agent_wiring._HERMES_BRIEFING_SOURCE_NAMES:
+            (source_dir / name).write_text(f"# new {name}\n", encoding="utf-8")
+
+        installed_scripts = fake_home / ".hermes" / "scripts"
+        installed_scripts.mkdir(parents=True)
+        for name in agent_wiring._HERMES_BRIEFING_SOURCE_NAMES:
+            (installed_scripts / name).write_text(f"# old {name}\n", encoding="utf-8")
+
+        def fake_expanduser(value):
+            if value.startswith("~/"):
+                return str(fake_home / value[2:])
+            return value
+
+        sources = agent_wiring._hermes_briefing_sources(str(Path(d) / "omb"))
+        with mock.patch.object(agent_wiring.os.path, "expanduser", side_effect=fake_expanduser):
+            agent_wiring._install_hermes_briefing(sources)
+
+        for name in agent_wiring._HERMES_BRIEFING_SOURCE_NAMES:
+            installed = installed_scripts / name
+            assert installed.read_text(encoding="utf-8") == f"# new {name}\n"
+            assert Path(str(installed) + ".omb-bak").read_text(
+                encoding="utf-8"
+            ) == f"# old {name}\n"
+
+
+def test_wire_hermes_missing_slack_briefing_has_no_side_effects():
+    """Missing slack_briefing aborts before config backup or script installation."""
+    with tempfile.TemporaryDirectory() as d:
+        fake_home = Path(d) / "home"
+        source_dir = Path(d) / "omb" / "agents" / "hermes"
+        source_dir.mkdir(parents=True)
+        (source_dir / "briefing.py").write_text("# briefing\n", encoding="utf-8")
+        cfg = Path(d) / "config.yaml"
+        original = b"agent:\n  environment_hint: 'keep exactly'\n"
+        cfg.write_bytes(original)
+
+        def fake_expanduser(value):
+            if value.startswith("~/"):
+                return str(fake_home / value[2:])
+            return value
+
+        with mock.patch.object(
+            agent_wiring.os.path, "expanduser", side_effect=fake_expanduser
+        ), TestCase().assertRaisesRegex(FileNotFoundError, "slack_briefing.py"):
+            agent_wiring.wire_hermes(cfg, boring_home=str(Path(d) / "omb"))
+
+        assert cfg.read_bytes() == original
+        assert not Path(str(cfg) + ".omb-bak").exists()
+        assert not (fake_home / ".hermes" / "scripts").exists()
 
 
 def test_install_hermes_skills_removes_legacy_nested_duplicate():
@@ -264,9 +347,10 @@ if __name__ == "__main__":
     test_default_path_when_no_override()
     test_wire_claude_code_adds_session_start()
     test_wire_hermes_adds_hint_and_weekly()
+    test_install_hermes_briefing_backs_up_existing_scripts()
+    test_wire_hermes_missing_slack_briefing_has_no_side_effects()
     test_install_hermes_skills_removes_legacy_nested_duplicate()
     test_install_codex_host_worker_macos_writes_launch_agent()
     test_next_cron_run_finds_next_monday()
     test_sync_hermes_cron_jobs_adds_managed_job()
-    test_wire_hermes_adds_hint_and_weekly()
     print("ok - agent_wiring failure propagation + hermes wiring + settings_path")

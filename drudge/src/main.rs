@@ -3,6 +3,18 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use drudge::{ask, audit, config, frontmatter, graph, ingest, llm, retrieve, serve, store, vault};
+use std::path::PathBuf;
+
+fn vault_wiki_dir(vault_dir: Option<&str>, home_dir: Option<&str>) -> Result<String> {
+    let vault_root = match vault_dir {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(
+            home_dir.context("BORING_VAULT_DIR and HOME are unset; cannot locate vault/wiki")?,
+        )
+        .join("oh-my-boring/vault"),
+    };
+    Ok(vault_root.join("wiki").to_string_lossy().into_owned())
+}
 
 #[derive(Parser)]
 #[command(
@@ -20,7 +32,7 @@ enum Cmd {
     Selftest,
     /// Number of stored documents
     Stats,
-    /// source → frontmatter → chunking → embedding → ingest (idempotent, excludes example-company)
+    /// Compatibility re-ingest of curated vault/wiki notes (not session sources or raw code)
     Ingest,
     /// Ingestion audit — origin/kind/project distribution + quality warnings
     Audit,
@@ -172,9 +184,11 @@ async fn main() -> Result<()> {
         Cmd::Ingest => {
             let store = store.as_ref().context(VEC_OFF)?;
             let ol = llm::Llm::from_config(&cfg);
-            let source_dirs = cfg.source_dirs();
-            println!("sources: {source_dirs:?}");
-            let s = ingest::run(store, &ol, &cfg, &source_dirs).await?;
+            let vault_dir = config::env_set("BORING_VAULT_DIR");
+            let home_dir = config::env_set("HOME");
+            let corpus = [vault_wiki_dir(vault_dir.as_deref(), home_dir.as_deref())?];
+            println!("sources: {corpus:?}");
+            let s = ingest::run(store, &ol, &cfg, &corpus).await?;
             println!(
                 "scanned={} new={} updated={} unchanged={} deleted={} skipped={} chunks={}",
                 s.scanned, s.new, s.updated, s.unchanged, s.deleted, s.skipped, s.chunks
@@ -220,16 +234,10 @@ async fn main() -> Result<()> {
             let store = store.as_ref().context(VEC_OFF)?;
             let ol = llm::Llm::from_config(&cfg);
             // Kernel A corpus = the vault's wiki dir (agent-written notes), not raw transcripts.
-            let vault_wiki = config::env_set("BORING_VAULT_DIR").map_or_else(
-                || {
-                    format!(
-                        "{}/oh-my-boring/vault/wiki",
-                        std::env::var("HOME").unwrap_or_default()
-                    )
-                },
-                |v| format!("{v}/wiki"),
-            );
-            let is = ingest::run(store, &ol, &cfg, &[vault_wiki]).await?;
+            let vault_dir = config::env_set("BORING_VAULT_DIR");
+            let home_dir = config::env_set("HOME");
+            let corpus = [vault_wiki_dir(vault_dir.as_deref(), home_dir.as_deref())?];
+            let is = ingest::run(store, &ol, &cfg, &corpus).await?;
             println!(
                 "sync: ingest(new={} updated={} deleted={} chunks={}) graph(tools={} concepts={} claims={} edges={})",
                 is.new,
@@ -335,4 +343,32 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::vault_wiki_dir;
+
+    #[test]
+    fn vault_wiki_dir_prefers_explicit_vault() {
+        let path = vault_wiki_dir(Some("/srv/boring-vault"), Some("/home/user")).unwrap();
+        assert_eq!(path, "/srv/boring-vault/wiki");
+    }
+
+    #[test]
+    fn vault_wiki_dir_uses_home_default() {
+        let path = vault_wiki_dir(None, Some("/home/user")).unwrap();
+        assert_eq!(path, "/home/user/oh-my-boring/vault/wiki");
+    }
+
+    #[test]
+    fn vault_wiki_dir_requires_vault_or_home() {
+        let error = vault_wiki_dir(None, None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "BORING_VAULT_DIR and HOME are unset; cannot locate vault/wiki"
+        );
+    }
 }

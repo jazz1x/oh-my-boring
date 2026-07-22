@@ -405,17 +405,28 @@ def _upsert_mcp_block(lines: list[str], mcp_idx: int, server_name: str, url: str
     return lines[:mcp_idx] + new_block + lines[end_idx:], True
 
 
-def _install_hermes_briefing(boring_home: str | None = None) -> None:
-    """Install the canonical briefing.py template into ~/.hermes/scripts/."""
+_HERMES_BRIEFING_SOURCE_NAMES = ("briefing.py", "slack_briefing.py")
+
+
+def _hermes_briefing_sources(boring_home: str | None = None) -> tuple[Path, ...]:
+    """Resolve and validate the canonical Hermes briefing sources."""
     home = boring_home if boring_home is not None else BORING_HOME
-    src = Path(home) / "agents" / "hermes" / "briefing.py"
-    if not src.exists():
-        raise FileNotFoundError(f"briefing template not found: {src}")
+    src_dir = Path(home) / "agents" / "hermes"
+    sources = tuple(src_dir / name for name in _HERMES_BRIEFING_SOURCE_NAMES)
+    for src in sources:
+        if not src.exists():
+            raise FileNotFoundError(f"briefing template not found: {src}")
+    return sources
+
+
+def _install_hermes_briefing(sources: tuple[Path, ...]) -> None:
+    """Install the validated briefing sources into ~/.hermes/scripts/."""
     dst_dir = Path(os.path.expanduser("~/.hermes/scripts"))
-    dst = dst_dir / "briefing.py"
     dst_dir.mkdir(parents=True, exist_ok=True)
-    _backup(dst)
-    shutil.copy2(src, dst)
+    for src in sources:
+        dst = dst_dir / src.name
+        _backup(dst)
+        shutil.copy2(src, dst)
 
 
 def _install_hermes_weekly_briefing(boring_home: str | None = None) -> None:
@@ -800,8 +811,9 @@ def wire_hermes(path: Path | None = None, boring_home: str | None = None) -> dic
     """Idempotently wire ohmyboring into hermes-agent.
 
     - Adds/updates mcp_servers.ohmyboring in ~/.hermes/config.yaml
-    - Installs the canonical briefing.py into ~/.hermes/scripts/briefing.py
+    - Installs the canonical briefing.py and slack_briefing.py into ~/.hermes/scripts/
     """
+    briefing_sources = _hermes_briefing_sources(boring_home)
     path = path if path is not None else _agent_path("hermes-agent")
     _backup(path)
 
@@ -820,7 +832,7 @@ def wire_hermes(path: Path | None = None, boring_home: str | None = None) -> dic
             f"  environment_hint: {_HERMES_HINT!r}\n"
         )
         _write_text_atomic(path, body)
-        _install_hermes_briefing(boring_home)
+        _install_hermes_briefing(briefing_sources)
         _install_hermes_weekly_briefing(boring_home)
         _install_hermes_codex_collector(boring_home)
         _install_hermes_skills(boring_home)
@@ -857,7 +869,7 @@ def wire_hermes(path: Path | None = None, boring_home: str | None = None) -> dic
     changed = changed or hint_changed
 
     _write_text_atomic(path, "\n".join(lines) + "\n")
-    _install_hermes_briefing(boring_home)
+    _install_hermes_briefing(briefing_sources)
     _install_hermes_weekly_briefing(boring_home)
     _install_hermes_codex_collector(boring_home)
     _install_hermes_skills(boring_home)

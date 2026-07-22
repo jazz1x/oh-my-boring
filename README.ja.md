@@ -153,7 +153,7 @@ flowchart LR
 | `llm.embed_model` / `llm.embed_dim` | 埋め込みモデル + そのベクトル次元（カーネル唯一のモデル） |
 | `llm.bootstrap` | `auto` = ブートストラップが起動/pull 可能 · `manual` = ヘルスチェックのみ（サーバーはユーザー所有） |
 | `repos[]` | パス/remote ルール → `origin=personal/company/mirror/community` |
-| `agents[]` | vector mode の ingest source |
+| `agents[]` | エージェントのセッション対話記録・アダプター設定（生のリポジトリ・コードベース取り込み用ではない） |
 
 **LLM バックエンドの切り替え**は config ブロック 1 つで完結します。`make up` は `scripts/llm-providers/<provider>.sh` にディスパッチします。
 
