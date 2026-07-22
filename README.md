@@ -153,7 +153,10 @@ Policy lives in **`boring.json`** (created from `boring.example.json` by `make u
 | `llm.embed_model` / `llm.embed_dim` | embedding model + its vector dimension (kernel's only model) |
 | `llm.bootstrap` | `auto` = bootstrap may start/pull · `manual` = health-check only (you own the server) |
 | `repos[]` | path/remote rules → `origin=personal/company/mirror/community` |
+| `code_index.sources[]` | explicit source roots for the separate AST code corpus; currently Rust/Tree-sitter, disabled unless opted in |
 | `agents[]` | agent session transcript and adapter configuration; not raw repository/codebase ingestion |
+
+Code is never copied into `vault/wiki`. After enabling a source from `boring.example.json`, run `cargo run --manifest-path drudge/Cargo.toml -- code-sync --repository <id>` and inspect it with `code-status` or the `code_search`, `code_symbol`, and `code_index_status` MCP tools. Tree-sitter records syntax and parse errors; call/import/reference target text remains unresolved until a semantic resolver is added.
 
 **Switching LLM backend** is one config block. `make up` dispatches to `scripts/llm-providers/<provider>.sh` for the right bootstrap.
 
@@ -459,9 +462,9 @@ For other agents, copy the root `.mcp.json` to the appropriate location (e.g. `~
 
 (VS Code Copilot uses `.vscode/mcp.json` with the root key `servers`. CLI alt: `claude mcp add --transport http --scope project ohmyboring http://localhost:7700/mcp`. Compose siblings reach it at `http://boring-drudge:7700/mcp`.)
 
-Available tools (19): `recall`, `neighbors`, `claims` (retrieval) · `ask`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled` (generative — run the LLM) · `context`, `corpus_status`, `events`, `config_get` (structured / introspection) · `remember`, `forget`, `classify_repo`, `sync` (write / maintain).
+Available tools (22): `recall`, `neighbors`, `claims` (memory retrieval) · `code_search`, `code_symbol`, `code_index_status` (separate AST code corpus) · `ask`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled` (generative — run the LLM) · `context`, `corpus_status`, `events`, `config_get` (structured / introspection) · `remember`, `forget`, `classify_repo`, `sync` (write / maintain).
 
-In the default wiki-first mode (`BORING_VECTOR=off`), tools that rely on recency/vector ordering, the graph, or the local event DB return JSON-RPC `-32603` until you set `BORING_VECTOR=on`: `neighbors`, `claims`, `corpus_status`, `events`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`. `recall` and `ask` read `vault/wiki` directly; `context` is callable but returns an empty claim card without the store; `remember`, `forget`, `sync`, `config_get`, and `classify_repo` do not require vector mode.
+In the default wiki-first mode (`BORING_VECTOR=off`), tools that rely on recency/vector ordering, the graph, or the local event DB return JSON-RPC `-32603` until you set `BORING_VECTOR=on`: `neighbors`, `claims`, `corpus_status`, `events`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`. `recall` and `ask` read `vault/wiki` directly; `context` is callable but returns an empty claim card without the store; `remember`, `forget`, `sync`, `config_get`, `classify_repo`, `code_search`, `code_symbol`, and `code_index_status` do not require vector mode. The three code tools require an enabled `code_index` source and a prior `code-sync`.
 
 - `next_actions` *(requires `BORING_VECTOR=on`)* — next-action register: recent `next` claims and active `blocked` claims synthesized into a short todo/blocker list. Optionally filter by project.
 - `stalled` *(requires `BORING_VECTOR=on`)* — stalled register: `next` and `blocked` claims older than `older_than_days` (default 7).
@@ -474,7 +477,7 @@ In the default wiki-first mode (`BORING_VECTOR=off`), tools that rely on recency
 - `ask` / `brief` / `weekly_brief` / `project_status` / `decisions` / `risks` / `next_actions` / `stalled` — LLM-running tools: `ask` answers a question with cited sources (works in wiki-first mode); the rest are recency/claim registers that require `BORING_VECTOR=on`.
 - `forget` — delete a note by wiki id or exact title. Removes the wiki file and, in vector mode, also purges embeddings, graph edges, and claims.
 
-Structured tools (`neighbors`, `claims`, `corpus_status`, `events`, `config_get`, `ask`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`, `context`) return native `structuredContent` (JSON) alongside the text block; prose/ack tools (`recall`, `remember`, `forget`, `sync`, `classify_repo`) return text.
+Structured tools (`neighbors`, `claims`, `corpus_status`, `events`, `config_get`, `code_search`, `code_symbol`, `code_index_status`, `ask`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`, `context`) return native `structuredContent` (JSON) alongside the text block; prose/ack tools (`recall`, `remember`, `forget`, `sync`, `classify_repo`) return text.
 
 Example MCP call (raw JSON-RPC over HTTP):
 

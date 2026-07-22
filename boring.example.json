@@ -15,6 +15,17 @@
     {"match": "your-company", "origin": "company", "name": "work"},
     {"match": "your-name/code", "origin": "personal", "name": "personal"}
   ],
+  "code_index": {
+    "sources": [
+      {
+        "id": "oh-my-boring",
+        "name": "oh-my-boring",
+        "root": "/absolute/path/to/oh-my-boring",
+        "language": "rust",
+        "enabled": false
+      }
+    ]
+  },
   "agents": [
     {
       "id": "claude-code",

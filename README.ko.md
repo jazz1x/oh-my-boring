@@ -153,7 +153,10 @@ flowchart LR
 | `llm.embed_model` / `llm.embed_dim` | 임베딩 모델 + 그 벡터 차원(커널의 유일한 모델) |
 | `llm.bootstrap` | `auto` = 부트스트랩이 기동/pull 가능 · `manual` = 헬스체크만(서버는 사용자 소유) |
 | `repos[]` | 경로/remote 규칙 → `origin=personal/company/mirror/community` |
+| `code_index.sources[]` | 별도 AST 코드 코퍼스에 명시적으로 넣을 소스 루트. 현재 Rust/Tree-sitter만 지원하며 opt-in 전에는 비활성 |
 | `agents[]` | 에이전트 세션 대화 기록·어댑터 설정(원시 저장소·코드베이스 적재 아님) |
+
+코드는 `vault/wiki`에 복사하지 않습니다. `boring.example.json`을 참고해 source를 활성화한 뒤 `cargo run --manifest-path drudge/Cargo.toml -- code-sync --repository <id>`로 적재하고, `code-status` 또는 MCP의 `code_search`, `code_symbol`, `code_index_status`로 조회합니다. Tree-sitter는 구문과 파싱 오류만 기록하며, 호출·import·reference의 대상 문자열은 semantic resolver를 붙이기 전까지 미해결 상태로 둡니다.
 
 **LLM 백엔드 전환**은 config 블록 하나로 끝납니다. `make up`은 `scripts/llm-providers/<provider>.sh` 로 디스패치합니다.
 
@@ -440,9 +443,9 @@ MCP를 지원하는 어떤 에이전트도 ohmyboring를 사용할 수 있습니
 
 (VS Code Copilot은 root key `servers`를 쓰는 `.vscode/mcp.json`을 사용합니다. CLI 대안: `claude mcp add --transport http --scope project ohmyboring http://localhost:7700/mcp`. compose sibling 컨테이너는 `http://boring-drudge:7700/mcp`로 접근합니다.)
 
-사용 가능한 tools (19개): `recall` · `neighbors` · `claims`(검색) · `ask` · `brief` · `weekly_brief` · `project_status` · `decisions` · `risks` · `next_actions` · `stalled`(생성 — LLM 실행) · `context` · `corpus_status` · `events` · `config_get`(구조화 / introspection) · `remember` · `forget` · `classify_repo` · `sync`(쓰기 / 유지보수).
+사용 가능한 tools (22개): `recall` · `neighbors` · `claims`(기억 검색) · `code_search` · `code_symbol` · `code_index_status`(별도 AST 코드 코퍼스) · `ask` · `brief` · `weekly_brief` · `project_status` · `decisions` · `risks` · `next_actions` · `stalled`(생성 — LLM 실행) · `context` · `corpus_status` · `events` · `config_get`(구조화 / introspection) · `remember` · `forget` · `classify_repo` · `sync`(쓰기 / 유지보수).
 
-기본 wiki-first 모드(`BORING_VECTOR=off`)에서는 recency/vector 순서, 그래프, 로컬 이벤트 DB에 의존하는 tool이 pgvector 백엔드를 필요로 하며, `BORING_VECTOR=on`을 설정하기 전까지 JSON-RPC `-32603`을 반환합니다: `neighbors`, `claims`, `corpus_status`, `events`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`. `recall`과 `ask`는 `vault/wiki`를 직접 읽고, `context`는 호출 가능하지만 store가 없으면 빈 claim 카드를 반환합니다. `remember`, `forget`, `sync`, `config_get`, `classify_repo`는 vector 모드가 필요 없습니다.
+기본 wiki-first 모드(`BORING_VECTOR=off`)에서는 recency/vector 순서, 그래프, 로컬 이벤트 DB에 의존하는 tool이 pgvector 백엔드를 필요로 하며, `BORING_VECTOR=on`을 설정하기 전까지 JSON-RPC `-32603`을 반환합니다: `neighbors`, `claims`, `corpus_status`, `events`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`. `recall`과 `ask`는 `vault/wiki`를 직접 읽고, `context`는 호출 가능하지만 store가 없으면 빈 claim 카드를 반환합니다. `remember`, `forget`, `sync`, `config_get`, `classify_repo`, `code_search`, `code_symbol`, `code_index_status`는 vector 모드가 필요 없습니다. 세 코드 tool은 활성화된 `code_index` source와 선행 `code-sync`가 필요합니다.
 
 - `next_actions` *(`BORING_VECTOR=on` 필요)* — 다음 행동 레지스터: 최근 `next` claim과 활성 `blocked` claim을 짧은 할 일/차단 목록으로 요약합니다. 프로젝트 필터 optional.
 - `stalled` *(`BORING_VECTOR=on` 필요)* — 정체 레지스터: `older_than_days`(기본 7)보다 오래된 `next`, `blocked` claim을 보여줍니다.
@@ -455,7 +458,7 @@ MCP를 지원하는 어떤 에이전트도 ohmyboring를 사용할 수 있습니
 - `ask` / `brief` / `weekly_brief` / `project_status` / `decisions` / `risks` / `next_actions` / `stalled` — LLM을 실행하는 tool: `ask`는 출처를 인용해 질문에 답하고(wiki-first 모드에서 동작), 나머지는 recency/claim 레지스터이며 `BORING_VECTOR=on`이 필요합니다.
 - `forget` — wiki id나 정확한 제목으로 노트를 삭제합니다. wiki 파일을 제거하고, vector 모드에서는 임베딩·그래프 엣지·claim도 함께 정리합니다.
 
-구조화 tool(`neighbors`, `claims`, `corpus_status`, `events`, `config_get`, `ask`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`, `context`)은 텍스트 블록과 함께 네이티브 `structuredContent`(JSON)를 반환하고, 산문/ack tool(`recall`, `remember`, `forget`, `sync`, `classify_repo`)은 텍스트를 반환합니다.
+구조화 tool(`neighbors`, `claims`, `corpus_status`, `events`, `config_get`, `code_search`, `code_symbol`, `code_index_status`, `ask`, `brief`, `weekly_brief`, `project_status`, `decisions`, `risks`, `next_actions`, `stalled`, `context`)은 텍스트 블록과 함께 네이티브 `structuredContent`(JSON)를 반환하고, 산문/ack tool(`recall`, `remember`, `forget`, `sync`, `classify_repo`)은 텍스트를 반환합니다.
 
 MCP 호출 예시 (HTTP 위의 raw JSON-RPC):
 

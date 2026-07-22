@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 // v2: added the `llm` block (provider/base_url/model/api_key_env/bootstrap + optional embed model).
 // v1 configs still load (top-level embed_model/embed_dim resolved into the llm block at parse time).
@@ -24,9 +24,11 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "embed_dim",
     "allow_company_origin",
     "llm",
+    "code_index",
 ];
 /// Default embedder (bge-m3 = 1024-dim) — the kernel's sole model dependency.
 const DEFAULT_EMBED_MODEL: &str = "bge-m3";
+const DEFAULT_PG_DSN: &str = "postgresql://boring:boring@localhost:5432/boring";
 const DEFAULT_EMBED_DIM: u32 = 1024;
 /// Default OpenAI-compatible endpoint = host Ollama `/v1` as seen from inside the container
 /// (`host.docker.internal` resolves to the host). boring.json (bind-mounted) is the SSOT; compose no
@@ -45,6 +47,11 @@ const DEFAULT_API_KEY_ENV: &str = "BORING_LLM_API_KEY";
 #[must_use]
 pub fn env_set(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+#[must_use]
+pub fn pg_dsn() -> String {
+    std::env::var("PG_DSN").unwrap_or_else(|_| DEFAULT_PG_DSN.to_owned())
 }
 
 /// Personal memory policy configuration.
@@ -71,6 +78,9 @@ pub struct BoringConfig {
     /// `Llm::from_config`). embed_model/embed_dim here are authoritative when set (v2 SSOT); they are
     /// resolved into the top-level fields at parse time so the rest of the kernel reads one place.
     pub llm: LlmConfig,
+    /// Explicit code corpus. This is intentionally separate from `repos`, which only classifies
+    /// session-memory origin and never authorizes source-code ingestion.
+    pub code_index: CodeIndexConfig,
 }
 
 impl Default for BoringConfig {
@@ -84,6 +94,194 @@ impl Default for BoringConfig {
             embed_dim: DEFAULT_EMBED_DIM,
             allow_company_origin: false,
             llm: LlmConfig::default(),
+            code_index: CodeIndexConfig::default(),
+        }
+    }
+}
+
+/// Explicitly enabled source-code repositories. An empty list disables code indexing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct CodeIndexConfig {
+    pub sources: Vec<CodeIndexSource>,
+}
+
+/// One repository owned by the code index. `id` is the stable persistence identity; `name` is its
+/// human-facing label. Neither field participates in memory-origin classification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeIndexSource {
+    id: RepositoryId,
+    name: RepositoryDisplayName,
+    root: AbsoluteRepositoryRoot,
+    language: CodeLanguage,
+    #[serde(default)]
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+struct RepositoryId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct RepositoryDisplayName(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct AbsoluteRepositoryRoot(PathBuf);
+
+impl<'de> Deserialize<'de> for RepositoryId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.trim().is_empty() {
+            return Err(de::Error::custom("code_index source id must not be empty"));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for RepositoryDisplayName {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.trim().is_empty() {
+            return Err(de::Error::custom(
+                "code_index source display name must not be empty",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for AbsoluteRepositoryRoot {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = PathBuf::deserialize(deserializer)?;
+        if !value.is_absolute() {
+            return Err(de::Error::custom(
+                "code_index source root must be an absolute path",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for CodeIndexConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct RawCodeIndexConfig {
+            sources: Vec<CodeIndexSource>,
+        }
+
+        let raw = RawCodeIndexConfig::deserialize(deserializer)?;
+        let mut ids = HashSet::new();
+        for source in &raw.sources {
+            if !ids.insert(source.id.as_str()) {
+                return Err(de::Error::custom(format!(
+                    "duplicate code_index source id: {}",
+                    source.id.as_str()
+                )));
+            }
+        }
+        Ok(Self {
+            sources: raw.sources,
+        })
+    }
+}
+
+impl CodeIndexSource {
+    /// Construct a source while preserving the same invariants as JSON deserialization.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        root: PathBuf,
+        language: CodeLanguage,
+        enabled: bool,
+    ) -> Result<Self> {
+        let id = id.into();
+        anyhow::ensure!(
+            !id.trim().is_empty(),
+            "code_index source id must not be empty"
+        );
+        let name = name.into();
+        anyhow::ensure!(
+            !name.trim().is_empty(),
+            "code_index source display name must not be empty"
+        );
+        anyhow::ensure!(
+            root.is_absolute(),
+            "code_index source root must be an absolute path"
+        );
+        Ok(Self {
+            id: RepositoryId(id),
+            name: RepositoryDisplayName(name),
+            root: AbsoluteRepositoryRoot(root),
+            language,
+            enabled,
+        })
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root.0
+    }
+
+    #[must_use]
+    pub const fn language(&self) -> CodeLanguage {
+        self.language
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl RepositoryId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl RepositoryDisplayName {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Languages accepted at the config boundary. Unknown values are serde parse errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeLanguage {
+    Rust,
+}
+
+impl CodeLanguage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
         }
     }
 }
@@ -600,8 +798,11 @@ fn derive_name_from_match(matcher: &str, cwd: &str, remote_url: Option<&str>) ->
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use std::path::Path;
+
     use super::{
-        Adapter, AgentSource, Bootstrap, BoringConfig, NoteLang, Origin, Provider, RepoRule,
+        Adapter, AgentSource, Bootstrap, BoringConfig, CodeIndexConfig, CodeLanguage, NoteLang,
+        Origin, Provider, RepoRule,
     };
 
     #[test]
@@ -762,6 +963,68 @@ mod tests {
         assert_eq!(cfg.agents.len(), 1);
         assert!(cfg.agents[0].enabled);
         assert_eq!(cfg.agents[0].adapter, Adapter::SessionEnd);
+    }
+
+    #[test]
+    fn code_index_sources_are_explicit_and_separate_from_repo_rules() {
+        let cfg = BoringConfig::from_str(
+            r#"{
+                "schema_version": 2,
+                "repos": [{"match": "acme", "origin": "company", "name": "work"}],
+                "code_index": {"sources": [{
+                    "id": "widget",
+                    "name": "Widget",
+                    "root": "/src/widget",
+                    "language": "rust",
+                    "enabled": true
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.repos.len(), 1);
+        assert_eq!(cfg.code_index.sources.len(), 1);
+        assert_eq!(cfg.code_index.sources[0].id(), "widget");
+        assert_eq!(cfg.code_index.sources[0].name(), "Widget");
+        assert_eq!(cfg.code_index.sources[0].root(), Path::new("/src/widget"));
+        assert_eq!(cfg.code_index.sources[0].language(), CodeLanguage::Rust);
+        assert!(cfg.code_index.sources[0].enabled());
+    }
+
+    #[test]
+    fn code_index_rejects_unsupported_language_and_duplicate_identity() {
+        let unsupported = BoringConfig::from_str(
+            r#"{"schema_version":2,"code_index":{"sources":[{"id":"x","name":"X","root":"/x","language":"python","enabled":true}]}}"#,
+        );
+        assert!(unsupported.is_err());
+
+        let duplicate = BoringConfig::from_str(
+            r#"{"schema_version":2,"code_index":{"sources":[
+                {"id":"x","name":"X","root":"/x","language":"rust"},
+                {"id":"x","name":"Other","root":"/other","language":"rust"}
+            ]}}"#,
+        );
+        assert!(duplicate.is_err());
+
+        let empty_id = BoringConfig::from_str(
+            r#"{"schema_version":2,"code_index":{"sources":[{"id":" ","name":"X","root":"/x","language":"rust"}]}}"#,
+        );
+        assert!(empty_id.is_err());
+
+        let relative_root = BoringConfig::from_str(
+            r#"{"schema_version":2,"code_index":{"sources":[{"id":"x","name":"X","root":"relative/path","language":"rust"}]}}"#,
+        );
+        assert!(relative_root.is_err());
+    }
+
+    #[test]
+    fn typed_code_index_config_rejects_duplicate_repository_ids() {
+        let duplicate = serde_json::from_str::<CodeIndexConfig>(
+            r#"{"sources":[
+                {"id":"x","name":"X","root":"/x","language":"rust"},
+                {"id":"x","name":"Other","root":"/other","language":"rust"}
+            ]}"#,
+        );
+        assert!(duplicate.is_err());
     }
 
     #[test]

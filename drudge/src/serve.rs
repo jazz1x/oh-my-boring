@@ -20,6 +20,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::code_index::CodeIndexStore;
 use crate::config;
 use crate::llm::Llm;
 use crate::pii;
@@ -37,6 +38,8 @@ pub struct AppState {
     /// pgvector backend. If `None`, `BORING_VECTOR=off` — retrieval is direct vault/wiki reads (wiki_recall),
     /// and remember writes the wiki note as first-class memory (no embed/graph). Vector/graph-dependent endpoints reject explicitly.
     pub(crate) store: Option<Arc<Store>>,
+    /// Explicit source-code corpus. It is never backed by the vault/wiki or memory tables.
+    pub(crate) code_index: Option<Arc<CodeIndexStore>>,
     pub(crate) llm: Arc<Llm>,
     /// vault root (`BORING_VAULT_DIR`). The remember target (`<vault>/wiki/wiki-NNNN.md`) + the relates_to projection root.
     pub(crate) vault_dir: Arc<Option<PathBuf>>,
@@ -444,8 +447,20 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
         .map(|vd| crate::pii::PiiScanner::load_from_vault(vd))
         .transpose()?
         .flatten();
+    let code_index = if cfg
+        .code_index
+        .sources
+        .iter()
+        .any(config::CodeIndexSource::enabled)
+    {
+        let dsn = config::pg_dsn();
+        Some(Arc::new(CodeIndexStore::connect(&dsn).await?))
+    } else {
+        None
+    };
     let state = AppState {
         store: store.map(Arc::new),
+        code_index,
         llm: Arc::new(llm),
         vault_dir: Arc::new(vault_dir),
         pii: Arc::new(pii),

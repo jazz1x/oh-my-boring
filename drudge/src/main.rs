@@ -2,7 +2,9 @@
 //! First milestone: embed → store → vector search round-trip proof (selftest).
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use drudge::{ask, audit, config, frontmatter, graph, ingest, llm, retrieve, serve, store, vault};
+use drudge::{
+    ask, audit, code_index, config, frontmatter, graph, ingest, llm, retrieve, serve, store, vault,
+};
 use std::path::PathBuf;
 
 fn vault_wiki_dir(vault_dir: Option<&str>, home_dir: Option<&str>) -> Result<String> {
@@ -46,6 +48,18 @@ enum Cmd {
     Graph { query: String },
     /// Deterministic re-ingest: walk → embed → upsert → graph (from frontmatter) → relations
     Sync,
+    /// Synchronize explicitly enabled source-code repositories into the isolated code_index corpus
+    CodeSync {
+        /// Stable repository id (default: every enabled code_index source)
+        #[arg(long)]
+        repository: Option<String>,
+    },
+    /// Inspect the isolated source-code corpus
+    CodeStatus {
+        /// Stable repository id (default: every indexed repository)
+        #[arg(long)]
+        repository: Option<String>,
+    },
     /// Delete orphan semantic nodes (remove edge-unreferenced legacy remnants)
     Gc,
     /// Show loaded boring.json config (for debugging / migration verification)
@@ -105,18 +119,84 @@ async fn main() -> Result<()> {
     // unset/off → don't open Store → start engine/CLI without Postgres. (aligned with the wiki-primary trend)
     let cfg = config::BoringConfig::load(None)?;
 
+    let cmd = match cli.cmd {
+        Cmd::CodeSync { repository } => {
+            let selected: Vec<_> = cfg
+                .code_index
+                .sources
+                .iter()
+                .filter(|source| source.enabled())
+                .filter(|source| {
+                    repository
+                        .as_deref()
+                        .is_none_or(|requested| requested == source.id())
+                })
+                .collect();
+            anyhow::ensure!(
+                !selected.is_empty(),
+                "no enabled code_index source matched{}",
+                repository
+                    .as_deref()
+                    .map_or_else(String::new, |id| format!(" repository '{id}'"))
+            );
+            let dsn = config::pg_dsn();
+            let mut code_store = code_index::CodeIndexStore::connect(&dsn).await?;
+            code_store.initialize().await?;
+            for source in selected {
+                let report = code_index::sync_repository(&mut code_store, source).await?;
+                println!(
+                    "code-sync {}: scanned={} changed={} unchanged={} deleted={} parse_errors={}",
+                    report.repository_id,
+                    report.scanned,
+                    report.changed,
+                    report.unchanged,
+                    report.deleted,
+                    report.parse_errors
+                );
+            }
+            return Ok(());
+        }
+        Cmd::CodeStatus { repository } => {
+            let dsn = config::pg_dsn();
+            let code_store = code_index::CodeIndexStore::connect(&dsn).await?;
+            let statuses = code_store.status(repository.as_deref()).await?;
+            if let Some(requested) = repository.as_deref() {
+                anyhow::ensure!(
+                    !statuses.is_empty(),
+                    "repository '{requested}' is not present in the code index"
+                );
+            }
+            for status in statuses {
+                println!(
+                    "{} ({}) language={} root={} files={} symbols={} relations={} error_files={} parse_errors={} synced={:?}",
+                    status.repository_id,
+                    status.name,
+                    status.language,
+                    status.root_path,
+                    status.files,
+                    status.symbols,
+                    status.relations,
+                    status.files_with_errors,
+                    status.parse_errors,
+                    status.last_synced_at
+                );
+            }
+            return Ok(());
+        }
+        command => command,
+    };
+
     let vector_on = config::env_set("BORING_VECTOR")
         .is_some_and(|v| matches!(v.to_lowercase().as_str(), "on" | "1" | "true" | "yes"));
     let store: Option<store::Store> = if vector_on {
-        let dsn = std::env::var("PG_DSN")
-            .unwrap_or_else(|_| "postgresql://boring:boring@localhost:5432/boring".to_owned());
+        let dsn = config::pg_dsn();
         // embed_dim (boring.json) sizes the vector columns — the kernel's only model knob.
         Some(store::Store::open(&dsn, cfg.embed_dim as usize).await?)
     } else {
         None
     };
 
-    match cli.cmd {
+    match cmd {
         Cmd::Selftest => {
             let store = store.as_ref().context(VEC_OFF)?;
             let ol = llm::Llm::from_config(&cfg);
@@ -255,6 +335,7 @@ async fn main() -> Result<()> {
                 ss.tools, ss.concepts, ss.uses, ss.about
             );
         }
+        Cmd::CodeSync { .. } | Cmd::CodeStatus { .. } => {}
         Cmd::Link { vault } => {
             let store = store.as_ref().context(VEC_OFF)?;
             let vault_root = vault
@@ -349,7 +430,21 @@ async fn main() -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::vault_wiki_dir;
+    use clap::Parser;
+
+    use super::{Cli, Cmd, vault_wiki_dir};
+
+    #[test]
+    fn code_index_subcommands_parse_repository_selection() {
+        let sync = Cli::try_parse_from(["drudge", "code-sync", "--repository", "widget"]).unwrap();
+        assert!(matches!(
+            sync.cmd,
+            Cmd::CodeSync { repository } if repository.as_deref() == Some("widget")
+        ));
+
+        let status = Cli::try_parse_from(["drudge", "code-status"]).unwrap();
+        assert!(matches!(status.cmd, Cmd::CodeStatus { repository: None }));
+    }
 
     #[test]
     fn vault_wiki_dir_prefers_explicit_vault() {
