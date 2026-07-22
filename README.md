@@ -153,7 +153,7 @@ Policy lives in **`boring.json`** (created from `boring.example.json` by `make u
 | `llm.embed_model` / `llm.embed_dim` | embedding model + its vector dimension (kernel's only model) |
 | `llm.bootstrap` | `auto` = bootstrap may start/pull · `manual` = health-check only (you own the server) |
 | `repos[]` | path/remote rules → `origin=personal/company/mirror/community` |
-| `agents[]` | ingest sources for vector mode |
+| `agents[]` | agent session transcript and adapter configuration; not raw repository/codebase ingestion |
 
 **Switching LLM backend** is one config block. `make up` dispatches to `scripts/llm-providers/<provider>.sh` for the right bootstrap.
 

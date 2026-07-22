@@ -10,7 +10,7 @@ use anyhow::Result;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
@@ -430,42 +430,38 @@ pub async fn run_with<C: Chunker, G: GraphExtractor>(
     let mut seen: HashSet<String> = HashSet::new();
 
     let exclude: Vec<String> = NOISE_SUBSTR.iter().map(|s| (*s).to_owned()).collect();
+    let target_paths = collect_target_paths(dirs, &exclude)?;
+    let managed_dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
 
-    for dir in dirs {
-        for entry in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || !is_target(entry.path(), &exclude) {
-                continue;
-            }
-            let pstr = entry.path().to_string_lossy().into_owned();
-            stats.scanned += 1;
-            seen.insert(pstr.clone());
-            // Resilient-by-default: a malformed note must NEVER abort the whole re-ingest. First try an
-            // autonomous repair (quote unsafe scalar frontmatter, e.g. an unquoted `title: [FEDEV-97] …`
-            // that YAML reads as a sequence) and re-ingest; only if THAT still fails do we skip + log.
-            // Either way the rest of the corpus keeps syncing.
-            if let Err(e) = ingest_file_with::<C, G>(store, llm, cfg, &pstr, &mut stats).await {
-                if let Some(fixed) = std::fs::read_to_string(&pstr)
-                    .ok()
-                    .and_then(|c| crate::vault::repair_note_frontmatter(&c))
-                    && frontmatter::parse(&fixed, &pstr, cfg).is_ok()
-                    && std::fs::write(&pstr, &fixed).is_ok()
-                    && ingest_file_with::<C, G>(store, llm, cfg, &pstr, &mut stats)
-                        .await
-                        .is_ok()
-                {
-                    eprintln!("[ingest] auto-repaired malformed frontmatter + re-ingested {pstr}");
-                    stats.repaired += 1;
-                } else {
-                    eprintln!("[ingest] skipped malformed note {pstr}: {e:#}");
-                    stats.failed += 1;
-                }
+    for pstr in target_paths {
+        stats.scanned += 1;
+        seen.insert(pstr.clone());
+        // Resilient-by-default: a malformed note must NEVER abort the whole re-ingest. First try an
+        // autonomous repair (quote unsafe scalar frontmatter, e.g. an unquoted `title: [FEDEV-97] …`
+        // that YAML reads as a sequence) and re-ingest; only if THAT still fails do we skip + log.
+        // Either way the rest of the corpus keeps syncing.
+        if let Err(e) = ingest_file_with::<C, G>(store, llm, cfg, &pstr, &mut stats).await {
+            if let Some(fixed) = std::fs::read_to_string(&pstr)
+                .ok()
+                .and_then(|c| crate::vault::repair_note_frontmatter(&c))
+                && frontmatter::parse(&fixed, &pstr, cfg).is_ok()
+                && std::fs::write(&pstr, &fixed).is_ok()
+                && ingest_file_with::<C, G>(store, llm, cfg, &pstr, &mut stats)
+                    .await
+                    .is_ok()
+            {
+                eprintln!("[ingest] auto-repaired malformed frontmatter + re-ingested {pstr}");
+                stats.repaired += 1;
+            } else {
+                eprintln!("[ingest] skipped malformed note {pstr}: {e:#}");
+                stats.failed += 1;
             }
         }
     }
 
     // prune: vanished files → remove document node + edges + chunks
     for p in store.all_doc_paths().await? {
-        if !seen.contains(&p) {
+        if is_managed_path(Path::new(&p), &managed_dirs) && !seen.contains(&p) {
             store.delete_document(&p).await?;
             stats.deleted += 1;
         }
@@ -473,10 +469,28 @@ pub async fn run_with<C: Chunker, G: GraphExtractor>(
     Ok(stats)
 }
 
+fn collect_target_paths(dirs: &[String], exclude: &[String]) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for dir in dirs {
+        for entry in WalkDir::new(dir) {
+            let entry = entry?;
+            if entry.file_type().is_file() && is_target(entry.path(), exclude) {
+                paths.push(entry.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn is_managed_path(path: &Path, managed_dirs: &[PathBuf]) -> bool {
+    managed_dirs.iter().any(|dir| path.starts_with(dir))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use super::{canon, has_han, slugify, strip_nul};
+    use super::{canon, collect_target_paths, has_han, is_managed_path, slugify, strip_nul};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn strip_nul_removes_null_bytes() {
@@ -505,5 +519,21 @@ mod tests {
     #[test]
     fn canon_normalizes() {
         assert_eq!(canon("  OH-my  Boring  DB "), "oh-my boring db");
+    }
+
+    #[test]
+    fn missing_source_returns_walk_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing").to_string_lossy().into_owned();
+
+        assert!(collect_target_paths(&[missing], &[]).is_err());
+    }
+
+    #[test]
+    fn managed_path_ownership_excludes_sibling_prefixes() {
+        let managed = vec![PathBuf::from("/foo/bar")];
+
+        assert!(is_managed_path(Path::new("/foo/bar/note.md"), &managed));
+        assert!(!is_managed_path(Path::new("/foo/barley/note.md"), &managed));
     }
 }
