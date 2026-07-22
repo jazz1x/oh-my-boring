@@ -99,6 +99,30 @@
         "additionalProperties": false
       }
     },
+    "code_index": {
+      "type": "object",
+      "default": {"sources": []},
+      "description": "Explicit source-code corpus. This is separate from repos, which classifies memory origin.",
+      "properties": {
+        "sources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["id", "name", "root", "language"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1, "description": "Stable repository persistence id."},
+              "name": {"type": "string", "minLength": 1, "description": "Stable human-facing repository name."},
+              "root": {"type": "string", "minLength": 1, "description": "Repository root path."},
+              "language": {"type": "string", "enum": ["rust"]},
+              "enabled": {"type": "boolean", "default": false}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "hermes_cron_jobs": {
       "type": "object",
       "default": {

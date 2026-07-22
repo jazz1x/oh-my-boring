@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! ohmyboring personal RAG — library surface.
 //!
 //! The binary (`src/main.rs`) uses this library. Integration tests under
@@ -5,6 +7,7 @@
 //! other kernel contracts directly against a live Postgres backend.
 pub mod ask;
 pub mod audit;
+pub mod code_index;
 pub mod config;
 pub mod frontmatter;
 pub mod graph;

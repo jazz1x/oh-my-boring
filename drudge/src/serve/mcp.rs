@@ -214,6 +214,39 @@ fn mcp_tools_list() -> Value {
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
+            "name": "code_search",
+            "description": "Search the isolated AST code index by symbol name, qualified name, or file path. Results are lexical syntax facts, not memory and not inferred compiler semantics.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "literal symbol or path fragment"},
+                    "repository": {"type": "string", "description": "optional configured code_index source id"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "code_symbol",
+            "description": "Read one indexed symbol and its syntax-derived outgoing relations. Calls/imports/references expose unresolved target text unless a relation is proven structurally.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "stable symbol id returned by code_search"}
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "code_index_status",
+            "description": "Inspect the separate AST code corpus: repositories, files, symbols, relations, and explicit parse errors. This never reports vault/wiki memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "optional configured code_index source id"}
+                }
+            }
+        },
+        {
             "name": "events",
             "description": "Read recent local workflow/adapter events stored in the DB as OpenTelemetry-shaped log records. \
                             Use to inspect ingestion, collector, readiness, guard, and resolution-quality timelines without raw transcripts. \
@@ -396,6 +429,9 @@ async fn mcp_call(s: &AppState, req: &Value) -> Result<Value, (i32, String)> {
         ),
         "neighbors" => ToolOut::Structured(mcp_neighbors(s, args).await?),
         "corpus_status" => ToolOut::Structured(mcp_corpus_status(s).await?),
+        "code_search" => ToolOut::Structured(mcp_code_search(s, args).await?),
+        "code_symbol" => ToolOut::Structured(mcp_code_symbol(s, args).await?),
+        "code_index_status" => ToolOut::Structured(mcp_code_index_status(s, args).await?),
         "events" => ToolOut::Structured(mcp_events(s, args).await?),
         "claims" => ToolOut::Structured(mcp_claims(s, args).await?),
         "ask" => ToolOut::Structured(mcp_ask(s, args).await?),
@@ -410,6 +446,66 @@ async fn mcp_call(s: &AppState, req: &Value) -> Result<Value, (i32, String)> {
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
     Ok(out.into_result())
+}
+
+fn code_index_store(s: &AppState) -> Result<&crate::code_index::CodeIndexStore, (i32, String)> {
+    s.code_index.as_deref().ok_or_else(|| {
+        (
+            -32603,
+            "code_index is disabled — configure at least one enabled code_index source and run code-sync"
+                .to_owned(),
+        )
+    })
+}
+
+async fn mcp_code_search(s: &AppState, args: Option<&Value>) -> Result<Value, (i32, String)> {
+    let query = args
+        .and_then(|value| value.get("query"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if query.is_empty() {
+        return Err((-32602, "missing argument: query".to_owned()));
+    }
+    let repository = args
+        .and_then(|value| value.get("repository"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let hits = code_index_store(s)?
+        .search(query, repository)
+        .await
+        .map_err(|error| (-32603, format!("code search: {error}")))?;
+    Ok(json!({"hits": hits}))
+}
+
+async fn mcp_code_symbol(s: &AppState, args: Option<&Value>) -> Result<Value, (i32, String)> {
+    let id = args
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if id.is_empty() {
+        return Err((-32602, "missing argument: id".to_owned()));
+    }
+    let symbol = code_index_store(s)?
+        .symbol(id)
+        .await
+        .map_err(|error| (-32603, format!("code symbol: {error}")))?;
+    Ok(json!({"result": symbol}))
+}
+
+async fn mcp_code_index_status(s: &AppState, args: Option<&Value>) -> Result<Value, (i32, String)> {
+    let repository = args
+        .and_then(|value| value.get("repository"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repositories = code_index_store(s)?
+        .status(repository)
+        .await
+        .map_err(|error| (-32603, format!("code index status: {error}")))?;
+    Ok(json!({"repositories": repositories}))
 }
 
 /// `recall` — vector+graph retrieval. Returns relevant excerpts within an agent-supplied token budget.
@@ -1641,11 +1737,14 @@ mod tests {
     use crate::frontmatter::FrontMatter;
     use serde_json::json;
 
-    const MCP_TOOL_NAMES: [&str; 19] = [
+    const MCP_TOOL_NAMES: [&str; 22] = [
         "ask",
         "brief",
         "claims",
         "classify_repo",
+        "code_index_status",
+        "code_search",
+        "code_symbol",
         "config_get",
         "context",
         "corpus_status",
@@ -1677,7 +1776,7 @@ mod tests {
         "stalled",
     ];
 
-    const VECTOR_FREE_TOOLS: [&str; 8] = [
+    const VECTOR_FREE_TOOLS: [&str; 11] = [
         "recall",
         "ask",
         "context",
@@ -1686,6 +1785,9 @@ mod tests {
         "sync",
         "config_get",
         "classify_repo",
+        "code_index_status",
+        "code_search",
+        "code_symbol",
     ];
 
     fn repo_file(relative: &str) -> String {
