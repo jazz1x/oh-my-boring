@@ -9,6 +9,7 @@
 //! - Error propagation: `AppError` → explicit HTTP status + JSON body.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tokio::sync::Mutex;
 
@@ -58,6 +59,29 @@ pub struct AppState {
     pub(crate) wiki_index: Arc<std::sync::Mutex<wiki_recall::WikiIndex>>,
     /// Last successful compact time, shared with scheduler so manual `/compact` resets the window.
     pub(crate) last_compact: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Last observed DB liveness state used by `/health` to log state transitions only.
+    pub(crate) db_healthy: Arc<AtomicBool>,
+}
+
+/// Logs a DB liveness transition and returns whether a transition actually occurred.
+/// Called by the `/health` handler so that repeated failures/recoveries stay silent
+/// and only state flips emit a single diagnostic line to stderr.
+pub(crate) fn log_db_health_transition(
+    prev: bool,
+    next: bool,
+    err: Option<&anyhow::Error>,
+) -> bool {
+    if prev == next {
+        return false;
+    }
+    if next {
+        eprintln!("[health] postgres recovered — db_healthy=true");
+    } else if let Some(e) = err {
+        eprintln!("[health] postgres unreachable — {e:#}");
+    } else {
+        eprintln!("[health] postgres unreachable");
+    }
+    true
 }
 
 impl AppState {
@@ -580,6 +604,7 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
         sync_lock: Arc::new(Mutex::new(())),
         last_compact: Arc::clone(&last_compact),
         wiki_index: Arc::new(std::sync::Mutex::new(wiki_recall::WikiIndex::default())),
+        db_healthy: Arc::new(AtomicBool::new(true)),
     };
 
     scheduler::spawn_scheduler(
@@ -636,8 +661,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        CHARS_PER_TOKEN_ESTIMATE, count_wiki_notes, optional_project, parse_exclude_origins,
-        recall_max_chars,
+        CHARS_PER_TOKEN_ESTIMATE, count_wiki_notes, log_db_health_transition, optional_project,
+        parse_exclude_origins, recall_max_chars,
     };
     use crate::frontmatter::GENERATED_BRIEF_TAG;
 
@@ -709,5 +734,18 @@ mod tests {
         std::fs::write(dir.path().join("scratch.txt"), "not wiki").unwrap();
 
         assert_eq!(count_wiki_notes(dir.path()), Some(1));
+    }
+
+    #[test]
+    fn db_health_transition_same_state_returns_false() {
+        assert!(!log_db_health_transition(true, true, None));
+        assert!(!log_db_health_transition(false, false, None));
+    }
+
+    #[test]
+    fn db_health_transition_detects_failure_and_recovery() {
+        let err = anyhow::anyhow!("connection refused");
+        assert!(log_db_health_transition(true, false, Some(&err)));
+        assert!(log_db_health_transition(false, true, None));
     }
 }

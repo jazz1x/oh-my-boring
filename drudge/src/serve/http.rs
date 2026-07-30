@@ -13,13 +13,15 @@ use crate::ask::STALLED_DEFAULT_OLDER_THAN_DAYS;
 use crate::audit;
 use crate::graph;
 use crate::retrieve;
+use std::sync::atomic::Ordering;
+
 use crate::serve::{
     AppError, AppState, AskReq, AskResp, CODE_SEARCH_MAX_SYMBOLS, CONTEXT_MAX_ITEMS, CodeNoteHit,
     CodeSearchReq, CodeSearchResp, CodeSymbolHit, CompactResp, EventIngestResp, EventLogEntry,
     EventLogReq, EventLogResp, GraphReq, GraphResp, HealthResp, MCP_MAX_RESULTS, MCP_MAX_TOKENS,
     QueryLogEntry, QueryLogInput, QueryLogReq, QueryLogResp, SearchHit, SearchResp, StalledReq,
-    SyncResp, SyncState, count_wiki_notes, optional_project, parse_exclude_origins,
-    recall_max_chars, spawn_query_log, vector_disabled,
+    SyncResp, SyncState, count_wiki_notes, log_db_health_transition, optional_project,
+    parse_exclude_origins, recall_max_chars, spawn_query_log, vector_disabled,
 };
 use crate::store::EventLogFilter;
 
@@ -41,7 +43,18 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResp> {
     };
 
     let db_healthy = if let Some(store) = state.store.as_ref() {
-        Some(store.liveness_probe().await.is_ok())
+        match store.liveness_probe().await {
+            Ok(()) => {
+                let prev = state.db_healthy.swap(true, Ordering::SeqCst);
+                log_db_health_transition(prev, true, None);
+                Some(true)
+            }
+            Err(e) => {
+                let prev = state.db_healthy.swap(false, Ordering::SeqCst);
+                log_db_health_transition(prev, false, Some(&e));
+                Some(false)
+            }
+        }
     } else {
         None
     };

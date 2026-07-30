@@ -7,8 +7,12 @@
 # An explicit BORING_VECTOR (if exported) still forces the mode.
 # Note: /bin/sh (dash) has no pipefail → check each step's result explicitly.
 set -eu
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 URL="${BORING_URL:-http://localhost:7700}"
 fail() { echo "FAIL: $1"; exit 1; }
+
+# shellcheck source=scripts/lib/drudge_health_readiness.sh
+. "$ROOT/scripts/lib/drudge_health_readiness.sh"
 
 # Resolve mode: honor an explicit BORING_VECTOR, else ask the live engine.
 case "$(printf '%s' "${BORING_VECTOR:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -42,6 +46,7 @@ printf '%s\n' "$ps" | grep -E 'postgres|boring-drudge|agent' || true
 
 echo "2) engine /health…"
 [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$URL/health")" = "200" ] || fail "/health != 200"
+check_drudge_db_healthy "$URL" || fail "/health reports db_healthy=false"
 
 echo "3) engine /sync (deterministic baseline; waits for startup sync to finish)…"
 sync=$(curl -sf -m600 -X POST "$URL/sync" 2>/dev/null) || fail "/sync failed"

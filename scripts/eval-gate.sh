@@ -6,6 +6,9 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# shellcheck source=scripts/lib/drudge_health_readiness.sh
+. "$ROOT/scripts/lib/drudge_health_readiness.sh"
+
 URL="${BORING_URL:-http://localhost:7700}"
 EVENT_LOG="$ROOT/agents/shared/event_log.py"
 eval_run_id="eval-$(date +%Y%m%dT%H%M%S)-$$"
@@ -51,6 +54,10 @@ trap finish_eval_event EXIT
 
 if ! curl -s -m3 "$URL/health" >/dev/null 2>&1; then
   echo "engine not running ($URL). Run 'make up' first."
+  exit 1
+fi
+if ! check_drudge_db_healthy "$URL"; then
+  echo "engine /health reports db_healthy=false ($URL). Postgres is degraded."
   exit 1
 fi
 

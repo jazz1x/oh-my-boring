@@ -2435,7 +2435,10 @@ async fn mcp_sync(s: &AppState) -> Result<String, (i32, String)> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, atomic::AtomicBool},
+    };
 
     use super::{
         DuplicateMatch, DuplicateReason, MCP_EVENTS_DEFAULT_LIMIT, MCP_EVENTS_MAX_LIMIT,
@@ -2899,6 +2902,7 @@ mod tests {
                 crate::wiki_recall::WikiIndex::default(),
             )),
             last_compact: Arc::new(tokio::sync::Mutex::new(None)),
+            db_healthy: Arc::new(AtomicBool::new(true)),
         };
 
         let card = mcp_context(&state, Some(&json!({"max_items": 999})))
@@ -3900,6 +3904,7 @@ mod tests {
                 crate::wiki_recall::WikiIndex::default(),
             )),
             last_compact: Arc::new(tokio::sync::Mutex::new(None)),
+            db_healthy: Arc::new(AtomicBool::new(true)),
         };
         let args = json!({
             "title": "MCP ingestion hardening",
@@ -3962,6 +3967,7 @@ mod tests {
                 crate::wiki_recall::WikiIndex::default(),
             )),
             last_compact: Arc::new(tokio::sync::Mutex::new(None)),
+            db_healthy: Arc::new(AtomicBool::new(true)),
         }
     }
 

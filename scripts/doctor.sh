@@ -21,6 +21,9 @@ OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 BORING_HOME="${BORING_HOME:-$HOME/oh-my-boring}"
 MARK_DIR="${HOME}/.cache/boring-distill"
 
+# shellcheck source=scripts/lib/drudge_health_readiness.sh
+. "$BORING_HOME/scripts/lib/drudge_health_readiness.sh"
+
 # host.docker.internal resolves only inside containers; from the host it must be localhost,
 # or this host-side reachability check fails even when Ollama is healthy. dash has no
 # ${VAR/a/b} substitution, so rewrite via sed (same approach as scripts/ensure-ollama.sh).
@@ -207,7 +210,12 @@ fi
 
 # (a2) engine /health — the deterministic write gate the hook POSTs `remember` to.
 if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$BORING_URL/health" 2>/dev/null)" = "200" ]; then
-    ok "engine /health 200 ($BORING_URL) — write door reachable"
+    if check_drudge_db_healthy "$BORING_URL"; then
+        ok "engine /health 200 ($BORING_URL) — write door reachable"
+    else
+        bad "engine /health 200 but postgres is degraded ($BORING_URL) — writes will fail"; failed_engine=1
+        drudge_down=1
+    fi
 else
     bad "engine /health unreachable ($BORING_URL) — distilled sessions are being DROPPED"; failed_engine=1
     drudge_down=1

@@ -15,6 +15,14 @@ make_fake_path() {
 #!/bin/sh
 case " $* " in
   *" -w %{http_code} "*) printf 200 ;;
+  *)
+    if [ -n "${DOCTOR_HEALTH_BODY:-}" ]; then
+      printf '%s' "$DOCTOR_HEALTH_BODY"
+    else
+      printf '{"status":"%s","vector":true,"sync":"idle","corpus_count":1,"db_healthy":%s}' \
+        "${DOCTOR_HEALTH_STATUS:-ok}" "${DOCTOR_HEALTH_DB_HEALTHY:-true}"
+    fi
+    ;;
 esac
 exit 0
 SH
@@ -41,6 +49,16 @@ SH
 case "${2:-}" in
   '.llm.provider // "ollama"') echo ollama ;;
   '.llm.base_url // "http://host.docker.internal:11434/v1"') echo "http://localhost:11434/v1" ;;
+  'if has("db_healthy") then .db_healthy else "" end')
+    if [ -n "${DOCTOR_HEALTH_DB_HEALTHY+set}" ]; then
+      printf '%s' "$DOCTOR_HEALTH_DB_HEALTHY"
+    else
+      printf 'true'
+    fi
+    ;;
+  '.status')
+    printf '%s' "${DOCTOR_HEALTH_STATUS:-ok}"
+    ;;
   *) exit 1 ;;
 esac
 SH
@@ -82,10 +100,11 @@ make_case() {
     home="$case_dir/home"
     boring="$case_dir/boring"
 
-    mkdir -p "$home/.claude" "$home/.cache/boring-distill" "$boring/vault/wiki" "$boring/agents/codex" "$boring/agents/shared" "$boring/scripts"
+    mkdir -p "$home/.claude" "$home/.cache/boring-distill" "$boring/vault/wiki" "$boring/agents/codex" "$boring/agents/shared" "$boring/scripts/lib"
     touch "$boring/agents/codex/collect-sessions.py"
     touch "$boring/agents/shared/event_log.py"
     cp "$ROOT/scripts/dedup-wiki.py" "$boring/scripts/dedup-wiki.py"
+    cp "$ROOT/scripts/lib/drudge_health_readiness.sh" "$boring/scripts/lib/drudge_health_readiness.sh"
     touch "$home/.cache/boring-distill/session.ts"
     [ "$with_note" = yes ] && touch "$boring/vault/wiki/wiki-0001.md"
     printf 'DRUDGE_TOKEN=local\n' >"$boring/.env"
@@ -308,5 +327,39 @@ case "$(cat "$TMP/invalid-recent-hours.out")" in
     exit 1
     ;;
 esac
+
+make_case "$TMP/db-degraded" yes
+if DOCTOR_HEALTH_DB_HEALTHY=false DOCTOR_HEALTH_STATUS=degraded run_strict "$TMP/db-degraded" "$TMP/db-degraded.out"; then
+    cat "$TMP/db-degraded.out"
+    echo "FAIL: strict doctor should fail when db_healthy=false" >&2
+    exit 1
+fi
+case "$(cat "$TMP/db-degraded.out")" in
+  *"postgres is degraded"*) ;;
+  *)
+    cat "$TMP/db-degraded.out"
+    echo "FAIL: strict doctor did not report postgres degraded" >&2
+    exit 1
+    ;;
+esac
+unset DOCTOR_HEALTH_DB_HEALTHY DOCTOR_HEALTH_STATUS
+
+make_case "$TMP/vector-off" yes
+if DOCTOR_HEALTH_DB_HEALTHY='' run_strict "$TMP/vector-off" "$TMP/vector-off.out"; then
+    :
+else
+    cat "$TMP/vector-off.out"
+    echo "FAIL: strict doctor should pass when db_healthy is absent (vector off)" >&2
+    exit 1
+fi
+case "$(cat "$TMP/vector-off.out")" in
+  *"engine /health 200"*"write door reachable"*) ;;
+  *)
+    cat "$TMP/vector-off.out"
+    echo "FAIL: strict doctor did not report healthy engine for vector-off response" >&2
+    exit 1
+    ;;
+esac
+unset DOCTOR_HEALTH_DB_HEALTHY
 
 echo "doctor strict gate tests passed"

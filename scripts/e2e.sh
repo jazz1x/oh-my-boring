@@ -16,10 +16,14 @@
 # anything. If the stack is down it SKIPS (exit 0), never failing CI on a missing
 # engine.
 set -eu
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 URL="${BORING_URL:-http://localhost:7700}"
 
 fail() { echo "FAIL: $1"; exit 1; }
 skip() { echo "SKIP: $1"; exit 0; }
+
+# shellcheck source=scripts/lib/drudge_health_readiness.sh
+. "$ROOT/scripts/lib/drudge_health_readiness.sh"
 
 command -v curl >/dev/null 2>&1 || fail "curl not found"
 command -v jq   >/dev/null 2>&1 || skip "jq not found — install: brew install jq / apt-get install jq"
@@ -28,6 +32,9 @@ command -v jq   >/dev/null 2>&1 || skip "jq not found — install: brew install 
 echo "0) stack up? (engine /health)…"
 if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$URL/health" 2>/dev/null)" != "200" ]; then
   skip "engine not up at $URL (run: make up) — e2e needs a live stack"
+fi
+if ! check_drudge_db_healthy "$URL"; then
+  fail "engine is up but postgres is degraded at $URL — e2e needs a writable stack"
 fi
 
 # --- mode check ----------------------------------------------------------------
