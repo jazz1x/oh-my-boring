@@ -1,4 +1,4 @@
-.PHONY: help up down build logs agent-logs events ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality self-verify-check deny eval bench-llm psql reset
+.PHONY: help up down build logs agent-logs events recent-events codex-status-strict ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality self-verify-cycle self-verify-check deny eval bench-llm psql reset
 
 # Some Docker Desktop installs have a broken `docker compose` plugin while the
 # standalone `docker-compose` binary works. Fall back transparently.
@@ -39,8 +39,14 @@ agent-logs: ## boring-agent (hermes) logs (MCP connection diagnostics)
 events: ## Show recent workflow events (engine DB first, file fallback)
 	@python3 agents/shared/event_log.py --tail --max "$${N:-20}"
 
-models: ## Pull Ollama models (DRUDGE_LLM_MODEL + DRUDGE_EMBED_MODEL, defaults gemma4:12b + bge-m3)
-	ollama pull "${DRUDGE_LLM_MODEL:-gemma4:12b}" && ollama pull "${DRUDGE_EMBED_MODEL:-bge-m3}"
+recent-events: ## Self-verify step: recent workflow events (engine DB first, file fallback)
+	@python3 agents/shared/event_log.py --tail --max "$${N:-20}"
+
+codex-status-strict: ## Self-verify step: strict Codex worker/marker readiness check
+	@python3 agents/codex/collect-sessions.py --status --strict
+
+models: ## Pull Ollama models (DRUDGE_LLM_MODEL + DRUDGE_EMBED_MODEL, defaults qwen3:14b + bge-m3)
+	ollama pull "${DRUDGE_LLM_MODEL:-qwen3:14b}" && ollama pull "${DRUDGE_EMBED_MODEL:-bge-m3}"
 
 verify-llm: ## Verify boring.json LLM config (reachability, model presence, embed_dim)
 	./scripts/verify-llm.sh
@@ -58,6 +64,14 @@ ask: ## Single query   make ask Q="question"
 sync: ## Deterministic re-ingest of the vault (vault/wiki → embed → graph → relates_to)
 	@command -v jq >/dev/null 2>&1 || { echo 'jq not found — install: brew install jq / apt-get install jq'; exit 1; }
 	@curl -s -m600 -X POST "$${BORING_URL:-http://127.0.0.1:7700}/sync" | jq .
+
+code-index: ## Full-refresh the AST code graph from current sources (Rust/Python/TS/Kotlin; requires BORING_VECTOR=on)
+	@docker exec boring-drudge drudge code-index --root /host/oh-my-boring 2>&1 || \
+	  (cd drudge && cargo run --release -- code-index --root ..)
+
+code-hotspots: ## Repeated code queries from query_log — what the agent keeps forgetting (requires BORING_VECTOR=on)
+	@docker exec boring-drudge drudge code-hotspots 2>&1 || \
+	  (cd drudge && cargo run --release -- code-hotspots)
 
 remember: ## Save + ingest a note immediately   make remember M="content" [T="title"]
 	@command -v jq >/dev/null 2>&1 || { echo 'jq not found — install: brew install jq / apt-get install jq'; exit 1; }
@@ -91,7 +105,7 @@ readiness: ## Strict briefing/readiness gate (fails on any doctor finding)
 heal: ## Auto-fix common doctor findings (env perms, hooks, engine, Ollama, containers)
 	./scripts/doctor.sh --fix
 
-maintenance: ## Run unattended housekeeping now (data-steward + retention)
+maintenance: ## Run unattended housekeeping now (backup-first vault cleanup + retention --apply --yes)
 	./scripts/schedule-maintenance.sh run
 
 maintenance-install: ## Register daily housekeeping (macOS launchd / Linux cron)
@@ -115,28 +129,46 @@ vault-cleanup-check: ## Verify vault cleanup contract without rewriting notes
 vault-cleanup-fix: ## Backup vault/wiki, apply safe steward repairs, then verify
 	@python3 scripts/vault-cleanup-gate.py --fix --vault "$${BORING_VAULT_DIR:-$(PWD)/vault}"
 
-retention: ## Show raw session retention plan (dry-run)
+retention: ## Show raw session/raw-witness retention plan (dry-run)
 	@python3 scripts/retention.py
 
-retention-apply: ## Apply raw session retention (archive old transcripts, delete ancient archives)
+retention-apply: ## Apply raw session/raw-witness retention
 	@python3 scripts/retention.py --apply
 
-guard: ## Structural gate (fmt+clippy+test+py-compile+py-unit-tests) + vault data hygiene dry-run
+guard: ## Full structural gate (Rust/Python/shell) + vault data hygiene dry-run
+	cd drudge && cargo build --release
 	./scripts/guard.sh
-	@echo "7) data-steward dry-run …"
+	@echo "data-steward dry-run …"
 	@python3 scripts/data-steward.py --vault "$(PWD)/vault"
 
 quality: ## Release acceptance gate (MCP contract + docs drift + removed dangerous surface)
 	cd drudge && cargo test --quiet quality_gate
 
-self-verify-check: ## Check self-verification stage contract: make self-verify-check [STAGE=bootstrap] [SUMMARY=/path/summary.tsv]
-	@python3 scripts/self-verify-contract.py --stage "$${STAGE:-bootstrap}" $${SUMMARY:+--summary "$$SUMMARY"}
+self-verify-cycle: ## Run the next self-verification cycle: make self-verify-cycle [CYCLE=<expected-next>] [SUMMARY=/path/summary.tsv]
+	@if [ -n "$$CYCLE" ]; then \
+		python3 scripts/self-verify-cycle.py --cycle "$$CYCLE" $${SUMMARY:+--summary "$$SUMMARY"}; \
+	else \
+		python3 scripts/self-verify-cycle.py $${SUMMARY:+--summary "$$SUMMARY"}; \
+	fi
+
+self-verify-check: ## Check self-verification stage contract: make self-verify-check [STAGE=<cursor>] [SUMMARY=/path/summary.tsv]
+	@if [ -n "$$STAGE" ]; then \
+		python3 scripts/self-verify-contract.py --stage "$$STAGE" $${SUMMARY:+--summary "$$SUMMARY"}; \
+	else \
+		python3 scripts/self-verify-contract.py $${SUMMARY:+--summary "$$SUMMARY"}; \
+	fi
 
 deny: ## Supply-chain gate (cargo-deny: vulnerabilities, licenses, duplicate versions)
 	cd drudge && cargo deny check
 
 eval: ## Behavioral regression gate (stack needed; runs data/eval/run_eval.py when present)
 	./scripts/eval-gate.sh
+
+eval-graphrag: ## GraphRAG contribution gate (stack needed; vector vs vector+graph+claim A/B)
+	./scripts/eval-graphrag-gate.sh
+
+eval-code: ## Code-lane behavioral gate (stack needed; /code-search golden fixtures)
+	./scripts/eval-code-gate.sh
 
 bench-llm: ## Compare LLM distillation quality (default tier: 16gb)
 	@python3 scripts/bench-llm.py --tier 16gb

@@ -52,7 +52,9 @@ The live self-verification loop writes a TSV summary with one row per step.
 | `soak-2h` | 6 | 2 | every cycle has status/readiness/quality/events; cycle 1 and 6 include guard | Pass -> `day` |
 | `day` | 72 | 13 | every cycle has status/readiness/quality/events; guard at cycle 1 and every 6 cycles | Pass -> release-candidate briefing confidence |
 
-No stage may advance with a failed row in the evaluated summary.
+No stage may advance with a failed, malformed, unknown-step, timestamp-invalid, out-of-order,
+duplicate `(cycle, step)` row, missing step-log evidence, or empty step-log evidence in the
+evaluated summary.
 
 ## Graph Contract
 
@@ -94,7 +96,18 @@ The active one-day loop is expected to produce:
 The check command is:
 
 ```sh
+make self-verify-cycle CYCLE=1 SUMMARY=/private/tmp/omb-self-verify/manual/summary.tsv
 make self-verify-check STAGE=bootstrap
 make self-verify-check STAGE=soak-2h
 make self-verify-check STAGE=day
 ```
+
+If `SUMMARY` is omitted, cycle 1 opens a new run under `/private/tmp/omb-self-verify`;
+cycle 2 and later append to the newest existing run. Cycle 2+ fails if no existing
+summary is present. Any attempt to write a cycle that already exists in the summary
+fails before running steps. Per-step stdout/stderr evidence is streamed under the
+same run's `logs/` directory, and each log starts with execution metadata.
+
+Cycle execution is serialized through a per-summary advisory lock and committed
+to `summary.tsv` only after every scheduled step for that cycle has finished, so
+an interrupted or overlapping run does not leave a partial cycle as proof.

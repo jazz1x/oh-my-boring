@@ -2,8 +2,13 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "boring.json",
   "type": "object",
-  "required": ["schema_version"],
+  "required": [
+    "schema_version"
+  ],
   "properties": {
+    "$schema": {
+      "type": "string"
+    },
     "schema_version": {
       "type": "integer",
       "minimum": 1,
@@ -11,7 +16,11 @@
     },
     "note_lang": {
       "type": "string",
-      "enum": ["auto", "ko", "en"],
+      "enum": [
+        "auto",
+        "ko",
+        "en"
+      ],
       "default": "auto",
       "description": "Output language for distilled notes (ko/en/auto)."
     },
@@ -21,7 +30,11 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["ollama", "lmstudio", "openai-compatible"],
+          "enum": [
+            "ollama",
+            "lmstudio",
+            "openai-compatible"
+          ],
           "default": "ollama",
           "description": "ollama = ensure serve + pull models. lmstudio = OpenAI /v1, models loaded via its UI/`lms` (no pull). openai-compatible = vLLM/llama.cpp/remote OpenAI (no pull)."
         },
@@ -32,7 +45,7 @@
         },
         "model": {
           "type": "string",
-          "default": "gemma4:12b",
+          "default": "qwen3:14b",
           "description": "Chat/synthesis model — used only by the ask/brief generation path."
         },
         "embed_model": {
@@ -53,7 +66,10 @@
         },
         "bootstrap": {
           "type": "string",
-          "enum": ["auto", "manual"],
+          "enum": [
+            "auto",
+            "manual"
+          ],
           "default": "auto",
           "description": "auto = bootstrap may start a daemon / pull models. manual = health-check only, never serve/pull (user owns the server, e.g. LM Studio)."
         }
@@ -81,7 +97,10 @@
       "default": [],
       "items": {
         "type": "object",
-        "required": ["match", "origin"],
+        "required": [
+          "match",
+          "origin"
+        ],
         "properties": {
           "match": {
             "type": "string",
@@ -89,7 +108,12 @@
           },
           "origin": {
             "type": "string",
-            "enum": ["personal", "company", "mirror", "community"]
+            "enum": [
+              "personal",
+              "company",
+              "mirror",
+              "community"
+            ]
           },
           "name": {
             "type": "string",
@@ -112,9 +136,16 @@
       "patternProperties": {
         "^[a-z0-9-]+$": {
           "type": "object",
-          "required": ["enabled", "schedule", "script"],
+          "required": [
+            "enabled",
+            "schedule",
+            "script"
+          ],
           "properties": {
-            "enabled": { "type": "boolean", "default": true },
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
             "schedule": {
               "type": "string",
               "default": "0 9 * * 1",
@@ -136,7 +167,10 @@
       "default": [],
       "items": {
         "type": "object",
-        "required": ["id", "enabled"],
+        "required": [
+          "id",
+          "enabled"
+        ],
         "properties": {
           "id": {
             "type": "string",
@@ -150,11 +184,18 @@
               "kimi"
             ]
           },
-          "enabled": { "type": "boolean", "default": true },
-          "format": { "type": "string" },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "format": {
+            "type": "string"
+          },
           "paths": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
           "settings_path": {
             "type": "string",
@@ -162,11 +203,81 @@
           },
           "adapter": {
             "type": "string",
-            "enum": ["session-end", "prompt-submit", "mcp-only", "cron"],
+            "enum": [
+              "session-end",
+              "prompt-submit",
+              "mcp-only",
+              "cron"
+            ],
             "description": "How this agent is wired. Inferred when omitted."
           }
         },
         "additionalProperties": false
+      }
+    },
+    "code_index": {
+      "type": "object",
+      "default": {
+        "enabled": false,
+        "languages": [
+          "rust",
+          "python",
+          "typescript",
+          "kotlin"
+        ],
+        "max_symbols_per_file": 200,
+        "exclude_paths": [
+          "target",
+          "node_modules",
+          "__pycache__",
+          ".git"
+        ]
+      },
+      "description": "AST code-graph indexer (tree-sitter). When enabled, `make code-index` parses Rust/Python sources and upserts code symbols/relations into the graph store (requires BORING_VECTOR=on).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Master switch. When false, code indexing is skipped entirely."
+        },
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "rust",
+              "python",
+              "typescript",
+              "kotlin"
+            ]
+          },
+          "default": [
+            "rust",
+            "python",
+            "typescript",
+            "kotlin"
+          ],
+          "description": "Languages to index. Empty = all supported languages."
+        },
+        "max_symbols_per_file": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 200,
+          "description": "Cap on symbols per file to keep the graph bounded."
+        },
+        "exclude_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "target",
+            "node_modules",
+            "__pycache__",
+            ".git"
+          ],
+          "description": "Excluded from indexing. Entries without '/' match any path component at any depth; entries with '/' are root-relative prefixes."
+        }
       }
     }
   },

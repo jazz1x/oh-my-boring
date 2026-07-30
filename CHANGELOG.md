@@ -5,12 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning per [
 
 ## [Unreleased]
 
+### Added
+- **Local workflow event DB** — workflow events from collectors, workers, guard, readiness, and eval are now stored in the local engine DB, and event logging is DB-primary with the NDJSON spool as fallback; `make events` / `make recent-events` read DB-first.
+- **Slack briefing template renderer** — new `agents/hermes/slack_briefing.py` owns Block Kit rendering for daily/weekly briefings, replacing the ad-hoc payload assembly that lived in `briefing.py` / `weekly-briefing.py`.
+
 ### Changed
+- **Briefing deduplication with preserved evidence** — repeated bullets across briefing surfaces are deduplicated while their evidence excerpts stay attached, in both the engine (`drudge/src/ask.rs`) and the Slack renderer.
 - **Project name resolution is now git-first** — distillation and ingestion derive the canonical repo slug from `git remote.origin.url` (walking up to the git root first), falling back to the working-directory folder name only when no remote exists. `boring.json` repo rules also match remote URL before cwd, so a checkout folder name never overrides the repository's configured origin.
 - **Briefing readability** — daily/weekly Slack digests are now grouped by priority (Blocked → Next → Stalled → Risks → Decisions → Done) with a short summary count, and Block Kit payloads no longer double-escape section text.
+- **Provider/vector/graph/runbook contract alignment** — README EN/KO/JA now state that `openai-compatible` endpoints work but are not officially supported, matching `boring.schema.json`, `scripts/verify-llm.sh`, and the provider bootstrap scripts. New structural guards in `scripts/test_guard_contract.py` pin the provider endpoint/transform contract, vector-only MCP tool gating, graph projection lane order/caps, and the LM Studio runbook checkpoints.
 
 ### Fixed
 - `agents/hermes/ingest-worker.py` now reuses the same git-first repo-slug logic as the session hooks instead of reading only the cwd basename.
+- **Docker stack runtime decay** — Recurring `RuntimeError: Session is closed` in `boring-agent` (Slack Bolt/aiohttp) was cleared by rebuilding `boring-drudge`/`hermes-agent` images and recreating the containers; health, readiness, and `make guard` now pass.
+- **Hermes briefing cron dependency** — `agents/shared/agent_wiring.py` now installs `slack_briefing.py` alongside `briefing.py` and `weekly-briefing.py` into `~/.hermes/scripts/`, fixing the `ModuleNotFoundError` that caused the morning-briefing and weekly-briefing cron jobs to fail.
+- **data-steward typo crash** — a typo in `scripts/data-steward.py` crashed steward runs; fixed alongside briefing-quality improvements in the same change.
 
 ## [0.1.0] - 2026-06-30
 
@@ -77,13 +86,31 @@ multi-agent adapters, local LLM provider checks, and release/readiness gates.
     `weekly-briefing.py` cron script.
 - **`project` filter on recency retrieval** — `recent_docs`, `recent_claims`, and `current_claims` now
   accept an optional project slug, enabling the new project-scoped consumption tools.
-- **Remember deduplication gate** — `mcp_remember` now skips a note when:
-  - the same `omb_session_id` is already stored,
-  - an exact title match exists, or
-  - the title+body embedding is within cosine distance 0.07 (similarity ≥ 0.93) of an existing document.
-- **`scripts/dedup-wiki.py`** — one-time cleanup tool that clusters existing wiki notes by embedding
-  similarity, archives the older duplicates, and calls `ohmyboring/forget`. Used locally to remove
-  51 duplicate notes (10 clusters) caused by repeated SessionEnd distillation of the same work.
+  - **Remember deduplication gate** — `mcp_remember` now treats the vector index as a candidate
+    finder only: same-session, probable-note, exact-title, and embedding-near matches must still be
+    corroborated by wiki title/body/claim evidence before a note is skipped or replaced. Manual and
+    exact-title candidates with conflicting claim-axis values now stay distinct even when titles or
+    bodies overlap.
+  - **`scripts/dedup-wiki.py`** — one-time cleanup tool that clusters existing wiki notes only when
+    embedding similarity is corroborated by title/body/claim evidence, then archives older duplicates
+    after an apply confirmation and calls `ohmyboring/forget`.
+  - **Multilingual claim continuity** — claim ingest now preserves CJK claim subjects/predicates/values
+    for temporal authority and `relates_to` projection; the Han drift filter remains scoped to
+    tool/concept slugs.
+  - **Evidence-gated semantic links** — `relates_to` semantic fallback now treats embeddings as
+    candidates only; visible links require the same project or shared deterministic graph/claim evidence.
+  - **Briefing coalescer preserves status labels** — repeated bullet surfaces are deduplicated within
+    each label, so `Done: X` and `Next: X` no longer collapse into whichever label appeared first;
+    nested project headings and separator-only bullet variants are normalized too. The Slack renderer
+    follows the same label/separator/bullet contract and preserves merged project names for duplicate
+    bullets across projects.
+  - **Deterministic duplicate target selection** — `remember` now ranks all duplicate candidates by
+    reason strength, existing-note richness, then path instead of returning the first filesystem hit.
+  - **Vector duplicate fallback checks multiple candidates** — embedding similarity now returns a small
+    ordered candidate set; `remember` inspects each candidate against wiki evidence instead of trusting
+    only the nearest embedding hit.
+  - **Self-guidance inventory alignment** — the local ohmyboring Skill now lists the current 19 MCP
+    tools and their vector-mode requirements, and `guard` checks that it matches the MCP surface contract.
 - **More specific distillation titles** — the session-distillation prompt now requires
   `project + concrete action + scope/date` titles and forbids generic titles like "기능 개선".
 - **Adversarial regression tests** — prompt-injection header spoofing, redaction fuzz
@@ -262,3 +289,6 @@ wiki and recalled on demand. Zero cloud, 100% local.
 - Naming: engine = `drudge`, project/containers = `ohmyboring`/`boring-*`
   (`omb` was rejected to avoid clashing with an existing internal `omb` CLI).
 - READMEs in English (default), Korean, Japanese.
+
+[Unreleased]: https://github.com/jazz1x/ohmyboring/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jazz1x/ohmyboring/releases/tag/v0.1.0

@@ -11,6 +11,14 @@
     "api_key_env": "BORING_LLM_API_KEY",
     "bootstrap": "auto"
   },
+  "allow_company_origin": false,
+  "hermes_cron_jobs": {
+    "weekly-briefing": {
+      "enabled": true,
+      "schedule": "0 9 * * 1",
+      "script": "weekly-briefing.py"
+    }
+  },
   "repos": [
     {"match": "your-company", "origin": "company", "name": "work"},
     {"match": "your-name/code", "origin": "personal", "name": "personal"}
@@ -21,7 +29,8 @@
       "enabled": true,
       "adapter": "session-end",
       "format": "claude-json",
-      "paths": ["~/.claude/projects"]
+      "paths": ["~/.claude/projects"],
+      "settings_path": "~/.claude/settings.json"
     },
     {
       "id": "cursor",
@@ -32,6 +41,24 @@
       "id": "codex",
       "enabled": true,
       "adapter": "mcp-only"
+    },
+    {
+      "id": "kimi",
+      "enabled": true,
+      "adapter": "session-end",
+      "format": "kimi-wire",
+      "paths": ["~/.kimi-code/sessions"]
+    },
+    {
+      "id": "hermes-agent",
+      "enabled": true,
+      "adapter": "cron"
     }
-  ]
+  ],
+  "code_index": {
+    "enabled": false,
+    "languages": ["rust", "python", "typescript", "kotlin"],
+    "max_symbols_per_file": 200,
+    "exclude_paths": ["target", "node_modules", "__pycache__", ".git"]
+  }
 }

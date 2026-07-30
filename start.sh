@@ -25,7 +25,7 @@ set -a; . .env; set +a
 PROVIDER=$(jq -r '.llm.provider // "ollama"' boring.json 2>/dev/null || echo ollama)
 BOOTSTRAP=$(jq -r '.llm.bootstrap // "auto"' boring.json 2>/dev/null || echo auto)
 CFG_BASE=$(jq -r '.llm.base_url // "http://host.docker.internal:11434/v1"' boring.json 2>/dev/null || echo "http://host.docker.internal:11434/v1")
-CFG_CHAT=$(jq -r '.llm.model // "gemma4:12b"' boring.json 2>/dev/null || echo gemma4:12b)
+CFG_CHAT=$(jq -r '.llm.model // "qwen3:14b"' boring.json 2>/dev/null || echo qwen3:14b)
 CFG_EMB=$(jq -r '.llm.embed_model // .embed_model // "bge-m3"' boring.json 2>/dev/null || echo bge-m3)
 
 LLM_URL="${BORING_LLM_BASE_URL:-$CFG_BASE}"

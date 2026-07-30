@@ -33,8 +33,16 @@ make ask Q="docker build cache の問題、どう直したっけ？"
 
 **ローカル LLM バックエンドを選ぶ:**
 
-- **Ollama** — `llm.provider` が `ollama` の場合、`make up` が自動的にサーバーを起動し、必要なモデルを pull します。手動で確認/起動するには `make ollama` を実行してください。
-- **LM Studio** — ローカルサーバーを起動し、チャットモデル 1 つと埋め込みモデル 1 つをロードしてから、`llm.provider` を `lmstudio` に変更し `make verify-llm` を実行してください。ohmyboring は正確なモデル id と埋め込み次元を確認してから、その設定を信頼します。
+- **Ollama** — `llm.provider` を `ollama` に設定してください。`make up` は `ollama serve` が動作していることを確認し、`llm.model` と `llm.embed_model` が欠けていれば pull します。`make verify-llm` はモデルの存在、到達性、embedding 次元が `llm.embed_dim` と一致することを確認します。
+- **LM Studio** — `llm.provider` を `lmstudio` に設定してください。ローカルサーバーを起動し、チャットモデルと埋め込みモデルを手動で 1 つずつロードしてください。`make verify-llm` は `/v1/models` で正確な model id を確認し、`/v1/embeddings` で `llm.embed_dim` を確認します。自動 pull はありません。
+- **OpenAI-compatible** — vLLM、llama.cpp、リモート OpenAI エンドポイントなどには `llm.provider` を `openai-compatible` に設定してください。`make verify-llm` は `/v1/models` と embedding 次元を確認します。自動 pull はありません。
+
+すべての provider に同じ契約が適用されます: チャットと埋め込みは別サービスです; `llm.embed_dim` は埋め込みモデルが実際に返すベクトル次元と一致している必要があります; 埋め込みモデルを変更する場合は `llm.embed_dim` を更新し `make reset` を実行してください。Provider 別チェックリストは [Ollama ランブック](docs/runbooks/ollama.ja.md)と [LM Studio ランブック](docs/runbooks/lmstudio.ja.md)に、vector/graph 契約は [GraphRAG & Vector 契約ランブック](docs/runbooks/graphrag.ja.md)にあります。
+
+**メモリバックエンドを選ぶ:**
+
+- **`BORING_VECTOR=off` (デフォルト)** — wiki-first. `vault/wiki` を直接読みます。`/ask`、`/search`、`recall`、`context` は Postgres なしで動作し、recency/claim/graph エンドポイント（`brief`、`weekly_brief`、`project_status`、`decisions`、`risks`、`next_actions`、`stalled`、`neighbors`、`claims`、`events`、`corpus_status`）は vector モードが有効になるまで明示的なエラーを返します。
+- **`BORING_VECTOR=on`** — pgvector が意味検索、グラフ（node/edge テーブル + recursive CTE）、claim レジスタ、ローカルイベント/クエリログを加速します。`make sync` は `vault/wiki` を embedding と graph edge に再取り込みします。
 
 初回実行の成功条件:
 
@@ -60,12 +68,19 @@ ohmyboring は会話ログを積み上げる道具ではなく、記憶が嘘を
 | 契約 | 保証すること |
 | --- | --- |
 | **チャンク** | ノート本文は 1,500 文字単位、200 文字の重なりで分割されます。短いノートは 1 つのチャンクのままです。各チャンクは独立して埋め込まれ、`source_path#chunk_idx` として保存されるため、長いセッションでも近い文脈を失わず検索できます。 |
-| **スライス** | 読み取り面は、エージェントへ渡す前に記憶を絞ります。MCP `recall` は `max_results`、`max_tokens`、`project`、`since_hours` で制限され、合成プロンプトには固定の文脈上限があり、ブリーフィング/状態経路は最近の元ノート、現在のクレーム、上限付きの関連文脈を優先します。生成済み daily brief は元メモリのスライスから除外され、eval fixture はブリーフィング面から除去または絞り込みされます。 |
-| **取り込み** | ファイル単位のパイプラインは一方向です: ファイル読み取り、`frontmatter` 解釈、チャンク分割、埋め込み、`upsert`、`prune`、リンク投影。`sha` が同じなら再埋め込みをスキップし、変更されたファイルは新しいチャンクを先に `upsert` してから古い末尾チャンクだけ `prune` します。生成ブリーフは取り込み対象外なので、要約が元の記憶になりません。 |
-| **クレーム** | クレームは時間軸上の事実です。`(subject, predicate)` が識別子、`value` が現在状態、`kind`/`confidence` が利用文脈です（`fact`、`decision`、`assumption`、`risk`、`blocked`、`goal`、`term`、`next`）。より新しい `value` が古い row を置き換え、出典は `source_path` に残るため、ブリーフィングは古い本文記述より最新の決定、リスク、ブロッカー、次アクションを優先できます。 |
-| **グラフ** | グラフは決定論的です。`tool`、`concept`、`claim` は `drudge` 内部の追加 LLM 抽出ではなく、エージェントが整えた `frontmatter` から来ます。Obsidian `relates_to` はクレームの連続性、正確な道具/概念の重なり、証拠のある意味的な隣接、小さな同一プロジェクトの新しさ補完の順で投影され、ハブノートが過剰な網目にならないよう上限がかかります。 |
+| **スライス** | 読み取り面は、エージェントへ渡す前に記憶を絞ります。MCP `recall` は `max_results`、`max_tokens`、`project`、`since_hours` で制限され、wiki-first recall は同点結果を `source_path` で決定的に並べ、合成プロンプトには 6,000 文字の固定文脈上限があります。`ask` の source list は、その上限内のプロンプトに実際に入った hit と注入された graph/claim 証拠だけを指します。ブリーフィング/状態経路は最近の元ノートと現在のクレームを優先し、単一 project のブリーフィング slice では注入する現在/停滞クレームをその project に絞り、ブリーフィング関連文脈は seed 元ノート 4 件、関連文書 3 件、関連記録 1 件あたり 1,000 文字に制限されます。生成済み daily brief と eval fixture は元メモリのスライスから除外され、eval fixture はブリーフィング面からも除去または絞り込みされます。 |
+| **取り込み** | ファイル単位のパイプラインは一方向です: ファイル読み取り、`frontmatter` 解釈、チャンク分割、埋め込み、`upsert`、`prune`、リンク投影。YAML に古い `source_path` があっても document/chunk `source_path` の権威は実際のファイルパスで、原本証拠ポインタは `sources` に置きます。frontmatter の識別フィールド（`origin`、`project`、`kind`）は DB filter や relation lane に入る前に parse boundary で空白を整えます。`sha` が同じなら再埋め込みをスキップし、変更されたファイルは新しいチャンクを先に `upsert` してから古い末尾チャンクだけ `prune` します。生成ブリーフは取り込み対象外なので、要約が元の記憶になりません。 |
+| **原本証拠** | セッション要約はまず元トランスクリプトを git 追跡外のローカル証拠ファイル（`data/raw-witness/`）へコピーし、そのスナップショットから抽出して要約します。ノートにはローカルの `raw-witness/...#sha256=...` 出典ポインタだけを保存するため、生の会話ログを RAG コーパスへ入れずに出所を監査できます。原本証拠スナップショットは公開前に fsync され、公開失敗時は以前の対象と temp なしの状態を残します。ローカルのバイト列が保持ポリシーで整理されたあとも `#sha256` フラグメントは必須です。バイト列の欠落は保持警告であり、出所契約を弱める理由ではありません。容量は隠れた無制限キャッシュではなく、明示的な保持契約です: 想定フットプリントはおおよそ 1 日あたりの平均原本トランスクリプト bytes × `BORING_RETENTION_RAW_WITNESS_DAYS`（デフォルト `90` 日）です。`make retention` は原本証拠の総容量（実際の件数と bytes）を表示し、古いスナップショットの整理や `BORING_RAW_WITNESS_DIR` による保存先変更を可能にします。 |
+| **クレーム** | クレームは時間軸上の事実です。正規化済みの `(subject, predicate)` が識別子、`value` が現在状態、`kind`/`confidence` が利用文脈です（`fact`、`decision`、`assumption`、`risk`、`blocked`、`goal`、`term`、`next`）。大文字小文字や区切り記号の表記揺れは保存前に同じ軸へ畳み込まれるため、より新しい `value` が古い行を置き換え、出典は `source_path` に残り、ブリーフィングは古い本文記述より最新の決定、リスク、ブロッカー、次アクションを優先できます。 |
+| **グラフ** | グラフは決定論的です。`tool`、`concept`、`claim` は `drudge` 内部の追加 LLM 抽出ではなく、エージェントが整えた `frontmatter` から来ます。Obsidian `relates_to` はクレームの連続性、正確な道具/概念の重なり、証拠のある意味的な隣接、小さな同一プロジェクトの新しさ補完の順で投影され、ハブノートが過剰な網目にならないよう上限がかかります。`Graph-linked` 文脈は共有グラフノード根拠（`shares N graph nodes: ...`）を渡し、ブリーフィングの関連文脈はクレーム軸の根拠（`shares N claim axes: ...`）も渡せるため、関連記録は埋め込みだけの推測ではなく、なぜつながったのか説明できる項目として残ります。GraphRAG 本文文脈の経路はより厳密です: 共有された道具/概念グラフノードだけを使い、クレーム軸の連続性は別の関連/クレーム権威経路に残すため、状態履歴が追加の GraphRAG 根拠に見えることはありません。1つの関連文書が複数の seed 記録、またはグラフノードとクレーム軸の両方から到達された場合、関連記録を重複させず、見出しで seed 経路と理由を結合します。同じ種類の根拠ノードは、件数を表示する前に重複除去され、統合根拠が強い候補は関連文書上限の適用前に先へ並び、完全な同点は `source_path` で決定的に並べられ、呼び出し側が別 project を明示しない限りブリーフィング関連文脈は各 seed 記録の project 内に留まります。ブリーフィング後処理は漏れた relation metadata bullet を落とし、関係理由が action item にならないようにします。`remember` がノートを書いた時点で、そのノートの `relates_to` 投影は即時更新されますが、隣接ノート側の backlink は次の `sync` / 全体 `project_links` で整合します。そのため recall は即時で、Obsidian link だけが eventual consistency です。 |
 
-これらの契約が表す哲学は明確です: `vault/wiki` が本当の記憶で、DB は再構築できる加速器です。境界は推測せず、知っていることだけを言うべきです。元セッションは書き込み口で一度だけ整え、読み取り口は速く、制限され、ローカルで、説明可能であるべきです。
+### GraphRAG 実装ノート
+
+`BORING_VECTOR=on` のとき `/ask` はローカル GraphRAG を実行します。まず vector 類似度と BM25 full-text 検索で候補プールを作り RRF で統合したあと、共有する `uses`/`about` 道具/概念グラフノードを辿る設定可能な **multi-hop 走査**（デフォルト深さは文書間 2 hop）で近傍を拡張します。軽量な **グラフ reranker** は上位 vector hit をアンカーとして維持しつつ、残りを共有グラフノード、共有クレーム軸、グラフ次数、新しさの減衰で再スコアリングします。上位の関連文書はそれぞれ上限を設けたまま合成プロンプトに注入され、文脈予算は bounded に保たれます。`/search` は外部 recall 契約として元の RRF 順位をそのまま維持するため、`make eval-graphrag` が `data/eval/graph-golden.json` で vector-only 検索と完全な GraphRAG 経路を A/B 比較し、Recall@3 と graph-only rescue をレポートできます。クエリテレメトリはすべての `/ask` 呼び出しの `graph_context_chars` と `graph_source_count` を記録し、グラフレーンを観測可能にします。完全な契約、現在の制限、観測可能性については [GraphRAG & Vector 契約ランブック](docs/runbooks/graphrag.ja.md) を参照してください。
+
+まだ実装していないのは neural グラフ reranker と `uses`/`about` 以外の任意の edge-kind 拡張です。現在の決定論的 feature ベース mixer は bounded で安価であり、個人メモリ規模に十分です。将来の eval で、より深い、あるいは学習された reranking で埋められる recall ギャップが見つかった場合、スキーマは既に k-hop recursive CTE をサポートしており、API 契約を変えずに graph DB へ移行できます。
+
+これらの契約が表す哲学は明確です: `vault/wiki` が本当の記憶で、原本証拠はローカルの証拠、DB は再構築できる加速器です。境界は推測せず、知っていることだけを言うべきです。元セッションは書き込み口で一度だけ整え、読み取り口は速く、制限され、ローカルで、説明可能であるべきです。
 
 ---
 
@@ -76,7 +91,7 @@ ohmyboring は会話ログを積み上げる道具ではなく、記憶が嘘を
 | 方法 | コマンド | タイミング |
 | --- | --- | --- |
 | **自動（セッション終了時）** | SessionEnd フック（`install.sh` が設定） | すべての Claude Code / Kimi セッション — `hooks/distill-session.py` がトランスクリプトを蒸留し `remember` します。対になる `UserPromptSubmit` フック（`recall.py`）が関連する過去のメモリを新しいプロンプトへ自動注入します。 |
-| **自動（Codex ワーカー）** | ホスト launchd/cron ワーカー（`install.sh` が設定） | Codex には SessionEnd フックがありません。ホストワーカーが 20 分ごとに `~/.codex/sessions/**/*.jsonl` をスキャンし、まだ書き込み中のトランスクリプトと実際の subagent rollout はスキップし、取り込み可能なトランスクリプトを同じ `remember` 経路で保存します。`hermes-agent` が有効なら `codex-memory-ingest-worker` も設定されます。どちらも `make doctor` で確認します。 |
+| **自動（Codex ワーカー）** | ホスト launchd/cron ワーカー（`install.sh` が設定） | Codex には SessionEnd フックがありません。標準の書き込み経路はホストワーカーです。このワーカーが 20 分ごとに `~/.codex/sessions/**/*.jsonl` をスキャンし、まだ書き込み中のトランスクリプトと実際の subagent rollout はスキップし、取り込み可能なトランスクリプトを同じ `remember` 経路で保存します。`hermes-agent` が有効なら重複する `codex-memory-ingest-worker` も動く場合があります。ホストワーカーが正常なとき、`make doctor` はこの任意ワーカーの問題を notice として報告します。 |
 | **過去セッションのバックフィル** | `make collect [N=20]` | インストール直後、空の vault を `~/.claude/projects` の履歴で埋めるとき。新しい順・冪等（セッションごとのマーカーで蒸留済みはスキップ）、1 回に `N` 件だけ処理し CPU を占有しません。 |
 | **今すぐ（セッションを終えずに）** | `make distill-now` · `make remember M="…"` | セッションを終了せずに即座に取り込みたいとき。`distill-now` は**現在の**トランスクリプトをその都度再蒸留し、マーカーを残さないため、セッション終了時の通常の取り込みもそのまま動作します（初期ノート + 最終ノートの両方ができる場合あり）。`remember` は自分で書いたノートを保存します。 |
 
@@ -96,7 +111,7 @@ python3 agents/shared/agent_wiring.py --install \
 
 ## メモリを見る
 
-ノートはただのマークダウンなので、**`vault/` フォルダを [Obsidian](https://obsidian.md) のvault（保管庫）として開く** だけで、グラフビュー・バックリンク・タグ・全文検索がそのまま使えます。コンパイル済みノートには Obsidian-safe な `tags` と `[[wiki-NNNN]]` の `relates_to` リンクが既に入っているため、グラフビューがメモリのつながりをそのまま描画します（`BORING_VECTOR=on` のとき GraphRAG グラフがこのリンクに投影され最も豊かになります）。専用 UI を作る必要はありません。Obsidian が作る `.obsidian/` ワークスペースフォルダは gitignore されているので、レイアウトはローカルに留まり git に漏れません。
+ノートはただのマークダウンなので、**`vault/` フォルダを [Obsidian](https://obsidian.md) のvault（保管庫）として開く** だけで、グラフビュー・バックリンク・タグ・全文検索がそのまま使えます。コンパイル済みノートには Obsidian-safe な `tags` と `[[wiki-NNNN]]` の `relates_to` リンクが既に入っているため、グラフビューがメモリのつながりをそのまま描画します（`BORING_VECTOR=on` のとき GraphRAG グラフがこのリンクに投影され最も豊かになります）。`remember` 直後は新ノート側のリンクが先に見え、隣接ノートの backlink は次回 `sync` で追いつきます。専用 UI を作る必要はありません。Obsidian が作る `.obsidian/` ワークスペースフォルダは gitignore されているので、レイアウトはローカルに留まり git に漏れません。
 
 ---
 
@@ -121,9 +136,10 @@ flowchart LR
   PG -. accelerate .-> RD
 ```
 
-- **Read door** — 高速、LLM 不要。`make ask`、`recall.py`、MCP `recall` が `vault/wiki` を直接読みます。
+- **Read door** — ローカルで上限付き。`recall.py` と MCP `recall` は LLM 合成なしで `vault/wiki` を直接読み、`make ask` / HTTP `/ask` は vector off 時に同じ wiki-first 検索を使ったうえでローカル合成モデルを実行します。
 - **Write door** — gated。`distill-session.py` がローカル LLM を呼び出し、ohmyboring の `remember` MCP tool で書き込みます。
-- **Duplicate gate** — 重複ノートは通常スキップします。同じセッション、または強いロールアウト/手動重複から、より内容の濃いノートが来た場合は、`remember` が同じ `wiki-NNNN.md` を書き換えて再取り込みします。セッション ID がない重複は、単なるトピックの重なりではなく、保守的な識別信号と project 互換性を必要とします。
+- **Duplicate gate** — 重複ノートは通常スキップします。同じセッション、または強いロールアウト/手動重複から、より内容の濃いノートが来た場合は、`remember` が同じ `wiki-NNNN.md` を書き換えて再取り込みします。セッション ID がない重複は、単なるトピックの重なりではなく、保守的な識別信号と project および origin の互換性を必要とします。欠落または空の project frontmatter は互換性チェック前に欠落として扱い、ファイルパスから導出します。
+- **Write-maintenance lock** — vector mode の `sync`、`compact`、`remember`、`forget` は、DB-backed graph/relation 状態を書き換えるとき同じ `sync_lock` を共有します。bulk write は全体 link projection と interleave せず待機し、`/health` はこの lane を `sync: running` として表示します。
 
 ### ワークフローグラフ契約
 
@@ -169,11 +185,13 @@ flowchart LR
 | `repos[]` | パス/remote ルール → `origin=personal/company/mirror/community` |
 | `agents[]` | vector mode の ingest source |
 
+MCP ツール `classify_repo` はこのファイルを直接更新します。書き込み前に不正な `origin` を拒否し、編集後の JSON は同じディレクトリのアトミック書き込み境界を通して反映します。
+
 **LLM バックエンドの切り替え**は config ブロック 1 つで完結します。`make up` は `scripts/llm-providers/<provider>.sh` にディスパッチします。
 
 ### ローカル LLM バックエンド
 
-ohmyboring は OpenAI-compatible `/v1` サーバーであればどこにでも接続できます。公式にサポートするバックエンドは **Ollama** と **LM Studio** の 2 つです。
+ohmyboring は OpenAI-compatible `/v1` サーバーであればどこにでも接続できます。公式にサポートするバックエンドは **Ollama** と **LM Studio** の 2 つです。vLLM、llama.cpp、リモートの OpenAI-compatible サーバーなどは `llm.provider` を `openai-compatible` に設定して動作させられますが、公式サポートではありません。
 
 #### Ollama
 
@@ -215,7 +233,7 @@ make doctor
 make readiness
 ```
 
-モデル id は LM Studio が返す値と完全に一致している必要があります。`make verify-llm` は `/v1/embeddings` も直接呼び、実際のベクトル長が `llm.embed_dim` と一致するか確認します。現在の 1024d リリース経路では、LM Studio が `bge-m3` を提供できる場合だけ vector-ready です。`text-embedding-nomic-embed-text-v1.5` は別の 768d reset/re-index 経路です。全体の手順は [LM Studio ランブック](docs/runbooks/lmstudio.ja.md) を参照してください。
+モデル id は LM Studio が返す値と完全に一致している必要があります。`make verify-llm` は `/v1/embeddings` も直接呼び、実際のベクトル長が `llm.embed_dim` と一致するか確認します。現在の 1024d リリース経路では、LM Studio が `bge-m3` を提供できる場合だけ vector-ready です。`text-embedding-nomic-embed-text-v1.5` は別の 768d reset/re-index 経路です。全体の手順は [LM Studio ランブック](docs/runbooks/lmstudio.ja.md)、[Ollama ランブック](docs/runbooks/ollama.ja.md)、[GraphRAG & Vector 契約ランブック](docs/runbooks/graphrag.ja.md) を参照してください。
 
 `.env` はシークレット + ランタイムオーバーライド専用になりました：
 
@@ -225,21 +243,24 @@ make readiness
 | `BORING_LLM_BASE_URL` / `BORING_LLM_MODEL` | `llm.base_url` / `llm.model` のランタイムオーバーライド（オプション）。`drudge` バイナリをホストで直接実行する場合は `BORING_LLM_BASE_URL=http://localhost:11434/v1` を設定 |
 | `BORING_LLM_API_KEY` | `llm.api_key_env` がここを指す場合の API キー（認証 provider） |
 | `DOCKER_BIN` | GUI/launchd 環境の `PATH` に Docker がない場合に使う任意の Docker CLI パス |
-| `BORING_DISTILL_RESOLUTION` | 取り込み解像度の契約: `compact`, `standard`, `evidence`（デフォルト）, `forensic`; 検証失敗時は 1 回だけ補強し、それでも失敗したら `remember` をブロック |
-| `DISTILL_CLAMP` | 直接 SessionEnd hook がローカル LLM に送る最大文字数。ローカルモデルの timeout を避けるためデフォルトは `2000`。Hermes worker offer は引き続き `INGEST_CLAMP`（`4000`）を使用 |
-| `CODEX_DISTILL_CLAMP` | Codex セッションから抽出して distill LLM に送る最大文字数。デフォルトは `INGEST_CLAMP`、次に `4000`。大きい rollout transcript も Hermes worker の予算内で処理しつつ、前後の根拠を残します |
+| `BORING_DISTILL_RESOLUTION` | 取り込み解像度の契約: `compact`, `standard`, `evidence`（デフォルト）, `forensic`; 不正な値は蒸留開始前に失敗; 検証失敗時は 1 回だけ補強し、それでも失敗したら `remember` をブロック |
+| `BORING_RAW_WITNESS_DIR` | 元トランスクリプトの証拠スナップショット保存先の任意指定。デフォルトは `BORING_HOME` 配下の git 追跡外 `data/raw-witness` |
+| `BORING_RETENTION_RAW_WITNESS_DAYS` | `make retention` が原本証拠スナップショットを保持する期間。デフォルトは `90` 日 |
+| `DISTILL_CLAMP` | Claude/Kimi の直接 SessionEnd hook がローカル LLM に送る最大文字数。ローカルモデルの timeout を避けるためデフォルトは `2000`。`0` は clamp 無効化、不正値や負数は蒸留前に失敗します。Hermes worker offer は同じ clamp 契約を `INGEST_CLAMP`（`4000`）で使用 |
+| `CODEX_DISTILL_CLAMP` | Codex セッションから抽出して distill LLM に送る最大文字数。デフォルトは `INGEST_CLAMP`、次に `4000`。`0` は clamp 無効化、不正値や負数は蒸留開始前に失敗します |
 | `BORING_EVENT_LOG` | ローカル NDJSON fallback スプール。デフォルトは `~/.cache/oh-my-boring/events.ndjson` |
 | `BORING_EVENT_SINK` | イベント sink モード: `db`(デフォルト)、`spool`、`both`。`db` はエンジン DB に先に書き、失敗時だけスプールします |
 | `BORING_EVENT_SPOOL` | fallback スプールポリシー: `on_failure`(DB 利用時のデフォルト)、`always`、`off` |
 | `BORING_EVENT_SINK_URL` | 任意の DB イベント endpoint。デフォルトは `$BORING_URL/events` |
+| `BORING_EVENT_SINK_TIMEOUT` | イベント sink DB 呼び出し用の正数の HTTP timeout（秒）。デフォルトは `0.5`、不正値や 0 以下はイベント sink I/O 前に失敗 |
 | `BORING_EVENT_DB_MIRROR` | legacy 互換 alias。`0`/`false`/`off` は `BORING_EVENT_SINK=spool`、`1`/`true`/`on` は `both` |
-| `BORING_EVENT_RECENT_HOURS` | `make readiness` が見る最近イベントの範囲。デフォルトは `24` |
+| `BORING_EVENT_RECENT_HOURS` | `make readiness` が見る最近イベントの範囲。正の整数の時間窓で、デフォルトは `24`、不正値や 0 以下は最近イベント読み取り前に失敗 |
 | `BORING_READINESS_NOTE_MAX_HOURS` | ブリーフィング readiness が許容する最新ノート freshness 範囲。デフォルトは `48` |
 | `BORING_READINESS_PENDING_TTL` | readiness で stale `.pending` とみなす閾値。`INGEST_PENDING_TTL`、次に `1800` 秒へフォールバック |
 | `BORING_READINESS_RETRY_TTL` | readiness で stale `.retry` とみなす閾値。`INGEST_RETRY_TTL`、次に pending 閾値へフォールバック |
 | `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` | オプション Slack assistant |
 
-構造化イベントは distill、collector/worker、`doctor`/`readiness`、`guard`、`eval` から記録されます。memory-ingest イベントには Rust ワークフローグラフ契約に沿った `workflow=memory_ingest`、`workflow_node`、`workflow_outcome` フィールドが付きます。イベントはまず OpenTelemetry 形式のログレコードとしてローカルエンジン DB に保存されます。NDJSON ファイルはエンジン停止時の fallback スプールで、`BORING_EVENT_SINK=spool` または `both` を選んだ場合だけ意図的にファイル中心/同時記録になります。DB view は HTTP `/events`（`/otel-events` alias も同じ）または MCP `events`、`make events` は DB を先に読み、失敗時はファイルスプールを読みます。
+構造化イベントは distill、collector/worker、`doctor`/`readiness`、`guard`、`eval` から記録されます。memory-ingest イベントには Rust ワークフローグラフ契約に沿った `workflow=memory_ingest`、`workflow_node`、`workflow_outcome` フィールドが付きます。イベントはまず OpenTelemetry 形式のログレコードとしてローカルエンジン DB に保存されます。NDJSON ファイルはエンジン停止時の fallback スプールで、`BORING_EVENT_SINK=spool` または `both` を選んだ場合だけ意図的にファイル中心/同時記録になります。fallback スプールは完成した NDJSON 1 行を fsync 付き append で記録し、append-only の意味を保ちます。DB view は HTTP `/events`（`/otel-events` alias も同じ）または MCP `events`、`make events` は DB を先に読み、失敗時はファイルスプールを読みます。
 
 > **埋め込みモデルを変えるとベクトルの次元が変わります。** 合成モデル（`llm.model`）は自由に差し替えられますが、`llm.embed_model` を変えるとサイズの異なるベクトルが出力されるため、`llm.embed_dim` を一致させ、**かつ** `make reset` を実行する必要があります — そうしないと旧形状のベクトルへの upsert が失敗します。よくある次元: `bge-m3` = 1024 · OpenAI `text-embedding-3-small` = 1536 · `nomic-embed-text` = 768。
 
@@ -265,14 +286,18 @@ make readiness
 | `make ollama` | Ollama 実行確認（必要ならバックグラウンド起動） |
 | `make verify-llm` | provider 到達性、ロード済みモデル id、実際の embedding 次元を確認 |
 | `make doctor` | スタック、フック、最終取り込み、Codex ワーカー/キュー状態を診断 |
+| `make heal` | `doctor --fix` で安全な機械的修復だけを実行: env 権限、hook、engine/Ollama/container 再起動。reset/restore はしない |
 | `make codex-status-strict` | 自己検証用の Codex ワーカー/マーカー readiness ステップ |
-| `make readiness` | ブリーフィング前の strict ゲート。モデル/埋め込み、hook、container、worker、stale marker、freshness finding があれば失敗 |
-| `make self-verify-cycle` | 自己検証の 1 cycle を実行し、`summary.tsv` の証拠行を追記 |
-| `make self-verify-check` | ライブ自己検証サマリーを現在の段階契約で評価 |
+| `make readiness` | ブリーフィング前の strict ゲート。モデル/埋め込み、hook、container、必須 worker、stale marker、freshness finding があれば失敗 |
+| `make self-verify-cycle` | 次の自己検証 cycle を実行し、`summary.tsv` の証拠行を追記。`CYCLE` は期待される次の cycle を明示し、重複・非連続 cycle は失敗 |
+| `make self-verify-check` | ライブ自己検証サマリーを `stage.txt` の段階カーソルで評価。`STAGE` 指定で上書き |
 | `make ask Q="..."` | recall + 要約を一度に実行 |
 | `make sync` | vault の再取り込み |
-| `make vault-cleanup-check` | ノートを書き換えずに vault cleanup 契約を検証 |
-| `make vault-cleanup-fix` | `vault/wiki` をバックアップし、安全な steward 修正を適用して再検証 |
+| `make vault-cleanup-check` | ノートを書き換えずに vault cleanup 契約を検証し、アトミック report を書き込み |
+| `make vault-cleanup-fix` | `vault/wiki` の fsync tar backup 後、安全なアトミック steward 修正を適用し、アトミック report を書いて再検証 |
+| `make steward` | vault データ衛生を検査（project 表記ゆれ、placeholder タグ、欠落 sources） |
+| `make steward-fix` | backup-first cleanup ゲート経由で安全な data-steward 修正を適用 |
+| `make retention` | 元セッションと原本証拠の保持ポリシーを計画/適用。gzip archive は元トランスクリプト削除前に fsync されます |
 | `make remember M="text"` | 1 行ノートを書き込み |
 | `make collect [N=1]` | 過去 Claude Code セッションの lazy バックフィル |
 | `make collect-kimi [N=1]` | 過去 Kimi Code セッションの lazy バックフィル |
@@ -281,9 +306,19 @@ make readiness
 | `make logs` | エンジンログ |
 | `make events [N=20]` | エンジン DB の最近のワークフローイベントを表示。失敗時はローカルスプールに fallback |
 | `make recent-events [N=20]` | 自己検証用の recent-events ステップ。DB 優先/ファイル fallback の view は同じ |
-| `make guard` | スタック不要の構造ゲート: Rust、Python、シェルのガードレール、vault 衛生 dry-run |
+| `make code-index` | 現在のソースから AST コードグラフを full-refresh（tree-sitter; Rust/Python/TS/Kotlin）。`remember_code` のノートエッジは refresh 後も保持（`BORING_VECTOR=on` + `code_index.enabled` が必要） |
+| `make code-hotspots` | query_log から繰り返しのコード系クエリをマイニング — エージェントが忘れ続けているもの |
+| `make eval` | recall/answer 品質の行動回帰ゲート (live stack; `data/eval/golden.json` Recall@3 floor) |
+| `make eval-graphrag` | GraphRAG 貢献ゲート: `/search`(vector-only) と `/ask`(vector + graph + claim + LLM) を A/B 比較し graph-only rescue をレポート |
+| `make eval-code` | コードレーン行動ゲート: `/code-search` が `data/eval/code-fixtures/` の全 golden シンボルを見つけること |
+| `make guard` | スタック不要の構造ゲート: Rust、Python、シェルのガードレール、vault 衛生 dry-run、一時スプールされた guard イベント |
 | `make quality` | リリース受け入れ drift ゲート |
+| `make maintenance` | 無人 housekeeping を実行 (backup-first vault cleanup + retention --apply --yes) |
 | `make down` | コンテナ停止 |
+
+### 自己検証ループ契約
+
+`make self-verify-cycle` は `/private/tmp/omb-self-verify/<run>/summary.tsv` に証拠行を記録し、step ごとの stdout/stderr ログを `/private/tmp/omb-self-verify/<run>/logs/` 配下へ実行中にストリームし、子 step のイベントを `/private/tmp/omb-self-verify/<run>/events.ndjson` に書き、段階カーソルは同じディレクトリの `/private/tmp/omb-self-verify/<run>/stage.txt` に置きます。summary の追記は fsync 後にアトミック置換され、parent directory fsync まで行い、段階カーソルも同じ durable publish 境界を使うため、読み手は truncate-then-write の半端な状態を観測しません。各 step ログは、一致する cycle、step、run-local のイベントログパス、その summary 行の時間枠内にあるヘッダー timestamp を含む重複のない `key=value` 実行メタデータから始まり、cycle、step、exit code、終了 timestamp を持つ重複のない `key=value` completion footer を fsync して終わります。子イベントレコードも self-verify summary、イベントログ、cycle、step の provenance を持ちます。producer は一部だけ、または正の cycle でない self-verify provenance を書き込み前に拒否し、self-verify はデフォルトの DB-first イベント sink に頼らず、子イベント書き込みをこの run-local スプールへ固定します。`CYCLE` 指定がない場合、新しい run では cycle 1 を作り、その後は最新 run に次の連続 cycle を追記します。`CYCLE` を指定しても、その値は期待される次の cycle でなければならず、重複または非連続 cycle は失敗します。すべての cycle は `codex-status-strict`、`readiness`、`quality`、`recent-events` を実行し、1 回目の cycle と以後 6 回ごとに `guard` も実行します。`make self-verify-check` は `STAGE` 指定がない場合 `stage.txt` を読み書きし、`STAGE` 指定は読み取り専用の一時評価で、`bootstrap`、`soak-2h`、`day`、`release-candidate` のいずれかを使えます。段階は、行の順序が正しく、cycle の欠落がなく、重複 step 行がなく、すべての step が成功し、ヘッダー timestamp が summary 行の時間枠内にあり completion footer が summary 行と一致する空でない step ログ証拠と、一致する self-verify provenance、期待される step イベント形状、参照先 step の時間枠内 timestamp、イベントを出す step（`codex-status-strict`、`readiness`、予定された `guard`）の網羅を持つ解析可能で空でないイベントスプールが存在し、段階ごとの基準を満たしたときだけ次へ進みます: `bootstrap` = cycle 1 回 + guard 1 回、`soak-2h` = cycle 6 回 + guard 2 回、`day` = cycle 72 回 + guard 13 回。重複 step 行は不完全 cycle ではなく `duplicate_step_rows` として報告されます。`release-candidate` は終端段階ですが例外ではなく、完全な `day` 基準を引き続き再検証します。通過すると段階カーソルは `bootstrap` → `soak-2h` → `day` → `release-candidate` へ進み、失敗すると `next` は現在の段階のままで、失敗 step はログパスを証拠として出力します。
 
 ---
 
@@ -298,7 +333,7 @@ make collect N=20
 # Kimi Code
 make collect-kimi N=20
 
-# GitHub Codex（通常は Hermes ワーカーが処理）
+# GitHub Codex（通常はホストワーカーが処理）
 make doctor
 COLLECT_LIMIT=20 python3 agents/codex/collect-sessions.py
 ```
@@ -311,10 +346,16 @@ curl -s -X POST http://localhost:7700/context \
   -H 'content-type: application/json' \
   -d '{"project":"omb","max_items":5}' | jq .
 
-# 週次ブリーフィング（BORING_VECTOR=on が必要）
+# 朝のブリーフィング — 直近24時間（BORING_VECTOR=on が必要）
+curl -s -X POST http://localhost:7700/brief \
+  -H 'content-type: application/json' \
+  -d '{"project":"omb","since_hours":24}' | jq .
+
+# 週次ブリーフィング — 直近7日間（BORING_VECTOR=on が必要）
+# `since_hours` を省略するとデフォルトの7日間ウィンドウになり、値を指定すると上書きします。
 curl -s -X POST http://localhost:7700/weekly \
   -H 'content-type: application/json' \
-  -d '{"project":"omb"}' | jq .
+  -d '{"project":"omb","since_hours":168}' | jq .
 
 # Slack に送られる朝のブリーフィング本文をプレビュー
 BORING_URL=http://127.0.0.1:7700 python3 agents/hermes/briefing.py
@@ -325,7 +366,7 @@ curl -s -X POST http://localhost:7700/stalled \
   -d '{"project":"omb","older_than_days":7}' | jq .
 ```
 
-Hermes cron はブリーフィングスクリプトの stdout を Slack `mrkdwn` テキストとして送信します。`make eval` の fixture ノートはゲート実行中は検索に使われますが、終了後に prune され、recency/claim ブリーフィング面からも除外されるため、日次/週次ブリーフィングには混ざりません。スケジューラが書く `daily-brief-*.md` ファイルは生成された出力物として `vault/wiki` に残りますが、`daily-brief` タグにより readiness/health の source-corpus チェック、recall、vector/claim ブリーフィング面、重複候補、DB 取り込みから除外され、要約が次の要約の原文にならないようにします。
+Hermes cron はブリーフィングスクリプトの stdout を Slack `mrkdwn` テキストとして送信します。`make eval` の fixture ノートはゲート実行中は検索に使われますが、終了後に prune され、recency/claim ブリーフィング面からも除外されるため、日次/週次ブリーフィングには混ざりません。スケジューラが書く `daily-brief-*.md` ファイルは生成された出力物として `vault/wiki` に残りますが、`daily-brief` タグにより readiness/health の source-corpus チェック、recall、vector/claim ブリーフィング面、重複候補、ingest 確認マーカー、Obsidian relation projection、DB 取り込みから除外され、要約が次の要約の原文にならないようにします。
 
 ### PII / 機密データゲート
 
@@ -389,18 +430,18 @@ curl -s -X POST http://localhost:7700/mcp \
 
 | アダプター | パス | 消費主体 | エントリポイント | 役割 |
 |---|---|---|---|---|
-| Claude Code | `agents/claude-code/distill-session.py` | `SessionEnd` / `Stop` hook | セッションを要約し `remember` を呼び出す |
-| Claude Code | `agents/claude-code/session-start-recall.py` | `SessionStart` hook | 最初のターン前に構造化コンテキスト（`/context`）を読み込む |
-| Claude Code | `agents/claude-code/recall.py` | `UserPromptSubmit` hook | 関連 snippet を取得しプロンプト context に注入 |
-| Kimi Code | `agents/kimi/distill-session.py` | `SessionEnd` hook | Kimi セッションを要約し `remember` を呼び出す |
-| Kimi Code | `agents/kimi/recall.py` | `UserPromptSubmit` hook | 関連 snippet を取得しプロンプト context に注入 |
+| Claude Code | `agents/claude-code/distill-session.py` | `SessionEnd` / `Stop` hook | `~/.claude/settings.json` | セッションを要約し `remember` を呼び出す |
+| Claude Code | `agents/claude-code/session-start-recall.py` | `SessionStart` hook | `~/.claude/settings.json` | 最初のターン前に構造化コンテキスト（`/context`）を読み込む |
+| Claude Code | `agents/claude-code/recall.py` | `UserPromptSubmit` hook | `~/.claude/settings.json` | 関連 snippet を取得しプロンプト context に注入 |
+| Kimi Code | `agents/kimi/distill-session.py` | `SessionEnd` hook | `~/.kimi-code/config.toml` | Kimi セッションを要約し `remember` を呼び出す |
+| Kimi Code | `agents/kimi/recall.py` | `UserPromptSubmit` hook | `~/.kimi-code/config.toml` | 関連 snippet を取得しプロンプト context に注入 |
 | Cursor | `agents/cursor/README.md` | MCP only | `~/.cursor/mcp.json` | `ohmyboring` を MCP サーバーとして公開 |
 | Codex | `agents/codex/README.md` | MCP + ホストワーカーのバックフィル | `~/.codex/mcp.json` / launchd または cron / `collect-sessions.py` | `ohmyboring` を MCP サーバーとして公開し、取り込み可能な Codex セッションをバックフィル。設定済みワーカーは安定した rollout トランスクリプトを取り込み、実際の subagent はスキップ |
-| hermes-agent | `agents/hermes/ingest-worker.py` | `hermes cron --script` | Claude/Codex 取り込みワーカーと定期ブリーフィングを実行 |
-| scheduler | `agents/schedulers/collect-sessions.py` | cron / launchd / 手動 | 古い Claude Code セッションの lazy バックフィル |
-| scheduler | `agents/schedulers/collect-kimi-sessions.py` | cron / launchd / 手動 | 古い Kimi Code セッションの lazy バックフィル |
-| shared | `agents/shared/boring_config.py` | アダプター import | `boring.json` ポリシーローダー |
-| shared | `agents/shared/agent_wiring.py` | `install.sh` | 有効なエージェントの hook/MCP 設定を idempotent に構成 |
+| hermes-agent | `agents/hermes/` | `hermes cron --script` + MCP | `~/.hermes/cron/jobs.json` + `~/.hermes/scripts/` | 設定駆動 cron（`weekly-briefing`、`briefing`）+ 直列バックフィルワーカー（`ingest-worker.py`、Codex collector） |
+| scheduler | `agents/schedulers/collect-sessions.py` | cron / launchd / 手動 | user crontab / launchd plist（`install.sh` が設定） | 古い Claude Code セッションの lazy バックフィル |
+| scheduler | `agents/schedulers/collect-kimi-sessions.py` | cron / launchd / 手動 | user crontab / launchd plist（`install.sh` が設定） | 古い Kimi Code セッションの lazy バックフィル |
+| shared | `agents/shared/boring_config.py` | アダプター import | `boring.json` | `boring.json` ポリシーローダー |
+| shared | `agents/shared/agent_wiring.py` | `install.sh` | `install.sh` | 有効なエージェントの hook/MCP 設定を idempotent に構成 |
 
 ### 消費エンドポイント
 
@@ -412,7 +453,7 @@ curl -s -X POST http://localhost:7700/mcp \
 | `POST /next_actions` / `next_actions` | 次アクションレジスタ: 明示的な次ステップ + アクティブなブロッカー | 必要 |
 | `POST /stalled` / `stalled` | 停滞レジスタ: 古い次ステップとブロッカー | 必要 |
 | `POST /status` / `project_status` | 30日間のプロジェクト状態（Done/Next/Blocked/Decisions/Risks） | 必要 |
-| `POST /weekly` / `weekly_brief` | 直近7日間の全プロジェクトブリーフィング | 必要 |
+| `POST /weekly` / `weekly_brief` | 直近7日間の全プロジェクトブリーフィング（`since_hours` で上書き可） | 必要 |
 | `POST /decisions` / `decisions` | プロジェクトの decision claim | 必要 |
 | `POST /risks` / `risks` | risk/assumption/blocked claim | 必要 |
 | `POST /ask` / `ask` | メモリに基づく直接質問応答 | 不要 |
@@ -425,8 +466,9 @@ curl -s -X POST http://localhost:7700/mcp \
 
 - MCP `recall` と HTTP `/search` は `max_tokens`、`max_results`、`project`、`since_hours` を受け取ります。
 - MCP `ask` と HTTP `/ask` は `project`、`since_hours` で検索範囲を絞れます。
+- `since_hours`、`older_than_days` などの時間窓の値は 0 以上の整数で、負数は入力境界で失敗します。
 - `/context` はセクションごとの `max_items`（デフォルト 5）で自動注入サイズを制限し、vector search を必要としません。
-- `recall.py` は `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS` で注入 context を制限します。
+- `recall.py` は `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS` で注入 context を制限します。context 上限と timeout は正数である必要があり、retry/session throttle は `0` を許容しますが負数は拒否します。
 - `ask`/`brief` 合成は取得した context を固定文字数上限以下に保ちます。
 
 ### その他のエージェント
@@ -446,9 +488,9 @@ MCP に対応したエージェントならどれも ohmyboring を利用でき�
 
 （VS Code Copilot は root key `servers` を使う `.vscode/mcp.json` を使用します。CLI 代替: `claude mcp add --transport http --scope project ohmyboring http://localhost:7700/mcp`。compose の sibling コンテナは `http://boring-drudge:7700/mcp` でアクセスします。）
 
-利用可能な tools（19個）: `recall` · `neighbors` · `claims`（検索）· `ask` · `brief` · `weekly_brief` · `project_status` · `decisions` · `risks` · `next_actions` · `stalled`（生成 — LLM 実行）· `context` · `corpus_status` · `events` · `config_get`（構造化 / introspection）· `remember` · `forget` · `classify_repo` · `sync`（書き込み / メンテナンス）。
+利用可能な tools（20個）: `recall` · `neighbors` · `claims`（検索）· `ask` · `brief` · `weekly_brief` · `project_status` · `decisions` · `risks` · `next_actions` · `stalled`（生成 — LLM 実行）· `context` · `corpus_status` · `events` · `config_get`（構造化 / introspection）· `remember` · `remember_code` · `forget` · `classify_repo` · `sync`（書き込み / メンテナンス）。
 
-デフォルトの wiki-first モード（`BORING_VECTOR=off`）では、recency/vector 順序、グラフ、ローカルイベント DB に依存する tool が pgvector バックエンドを必要とし、`BORING_VECTOR=on` を設定するまで JSON-RPC `-32603` を返します: `neighbors`、`claims`、`corpus_status`、`events`、`brief`、`weekly_brief`、`project_status`、`decisions`、`risks`、`next_actions`、`stalled`。`recall` と `ask` は `vault/wiki` を直接読み、`context` は呼び出し可能ですが store がない場合は空の claim card を返します。`remember`、`forget`、`sync`、`config_get`、`classify_repo` は vector モードを必要としません。
+デフォルトの wiki-first モード（`BORING_VECTOR=off`）では、recency/vector 順序、グラフ、ローカルイベント DB に依存する tool が pgvector バックエンドを必要とし、`BORING_VECTOR=on` を設定するまで JSON-RPC `-32603` を返します: `neighbors`、`claims`、`corpus_status`、`events`、`brief`、`weekly_brief`、`project_status`、`decisions`、`risks`、`next_actions`、`stalled`。`recall` と `ask` は `vault/wiki` を直接読み、`context` は呼び出し可能ですが store がない場合は空の claim card を返します。`remember`、`remember_code`、`forget`、`sync`、`config_get`、`classify_repo` は vector モードを必要としません。
 
 - `next_actions` *(`BORING_VECTOR=on` が必要)* — 次のアクション レジスタ: 最近の `next` claim とアクティブな `blocked` claim を短い ToDo/ブロッカー リストにまとめます。プロジェクト フィルタは optional。
 - `stalled` *(`BORING_VECTOR=on` が必要)* — 停滞レジスタ: `older_than_days`（デフォルト 7）より古い `next`、`blocked` claim を表示します。
@@ -459,7 +501,7 @@ MCP に対応したエージェントならどれも ohmyboring を利用でき�
 - `corpus_status` *(`BORING_VECTOR=on` が必要)* — KB ヘルスのスナップショット（ファイル/チャンク数、origin/kind/project 別、汚染度、graph/semantic のノード+エッジ）。
 - `events` *(`BORING_VECTOR=on` が必要)* — DB に OpenTelemetry 形式で保存された最近の workflow/adapter イベントを返します。component、event、status、run_id、workflow、since_hours でフィルタできます。
 - `ask` / `brief` / `weekly_brief` / `project_status` / `decisions` / `risks` / `next_actions` / `stalled` — LLM を実行する tool: `ask` は出典を引用して質問に答え（wiki-first モードで動作）、残りは recency/claim レジスタで `BORING_VECTOR=on` が必要です。
-- `forget` — wiki id または正確なタイトルでノートを削除します。wiki ファイルを削除し、vector モードでは embedding・graph edge・claim も同時に削除します。
+- `forget` — wiki id または正確なタイトルでノートを削除します。wiki ファイルを削除し、vector モードでは embedding・graph edge・claim も削除します。wiki 削除後に vector cleanup が失敗した場合、応答は partial と明示し、次の `sync` が派生 artifact を prune します。
 
 構造化 tool（`neighbors`、`claims`、`corpus_status`、`events`、`config_get`、`ask`、`brief`、`weekly_brief`、`project_status`、`decisions`、`risks`、`next_actions`、`stalled`、`context`）はテキストブロックと共にネイティブの `structuredContent`（JSON）を返し、プローズ/ack tool（`recall`、`remember`、`forget`、`sync`、`classify_repo`）はテキストを返します。
 
@@ -505,9 +547,9 @@ curl -s -X POST http://localhost:7700/mcp \
 ## 開発 · ガードレール
 
 - SSOT ドキュメント: `drudge/{PHILOSOPHY,RUST-STYLE,ENFORCEMENT}.md`
-- `make guard` = スタック不要の構造ゲート: rustfmt、clippy、Rust テスト、Python コンパイル/単体テスト、シェルのガードレール、vault 衛生 dry-run
+- `make guard` = スタック不要の構造ゲート: rustfmt、clippy、Rust テスト、Python コンパイル/単体テスト、シェルのガードレール、vault 衛生 dry-run、一時スプールされた guard イベント
 - `make quality` = MCP tool、vector モード文書、削除済み危険 surface のリリース受け入れ drift ゲート
-- CI: `rust-gate` · `quality-gate` · `gitleaks` · `cargo-deny` · `trivy`
+- CI: `rust-gate` · `quality-gate` · `gitleaks` · `cargo-deny` · `trivy` · `compose-config` · `docker-build` · `eval-gate`
 - `unsafe_code = "forbid"`
 
 ---
@@ -525,7 +567,7 @@ curl -s -X POST http://localhost:7700/mcp \
 | Linux: コンテナがホストの Ollama に到達できない | Linux では Ollama がデフォルトで `127.0.0.1` にバインドするため、`host.docker.internal` が解決できてもコンテナは閉じたポートに当たります。Ollama を全インターフェースにバインドし（`OLLAMA_HOST=0.0.0.0:11434` の後に再起動）、かつ/または ホストのファイアウォールで docker ブリッジを許可してください |
 | 正常か？ / 最後の distill は通ったか？ | `make doctor` — ヘルス + 最終取り込み + Codex ワーカー/キューの簡易チェック |
 | 明日の朝ブリーフィングを信頼できる？ | `make readiness` — strict ゲート。フック/モデル/コンテナ/取り込み finding がすべて通る必要があります |
-| `make readiness` が stale marker を報告する | `~/.cache/boring-distill` を確認してください。古い `.pending`、`.retry`、`.dead` marker は自律取り込みが止まった、または調整が必要という意味です。予約ブリーフィングを信頼する前に処理してください |
+| `make readiness` が stale marker を報告する | `~/.cache/boring-distill` を確認してください。marker ファイルはアトミックに公開され、ingest `.pending` ファイルは正確に `session_id`、chunk baseline、attempt count として解釈される必要があります。古い `.pending`、`.retry`、`.dead` marker は自律取り込みが止まった、または調整が必要という意味です。予約ブリーフィングを信頼する前に処理してください |
 | `make readiness` が最新ノート stale を報告する | ブリーフィング出力に頼る前に取り込みを実行または確認してください。`BORING_READINESS_NOTE_MAX_HOURS` はブリーフィング window を意図的に長くする場合だけ広げます |
 | 直近で何が失敗した？ | `make events` — raw transcript なしで最近の DB ワークフロータイムラインを確認 |
 

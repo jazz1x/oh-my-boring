@@ -10,10 +10,12 @@ page_id:
 sources:
   # Allowed prefixes for paths in the sources field.
   # raw/   = immutable evidence snapshots (distill notes, session narratives, etc.).
+  # raw-witness/ = gitignored local raw transcript witnesses under data/raw-witness/.
   # meta/  = meta information (when citing integrations/contracts).
   # .rules/ = when a governance page cites the guard itself as a source (meta-page exception).
   allowed_prefixes:
     - "raw/"
+    - "raw-witness/"
     - "meta/"
     - ".rules/"
 
@@ -24,6 +26,20 @@ required_frontmatter:
   - kind
   - origin
   - date
+
+# OKF v0.1 compatibility layer. `type` is the OKF-required field and maps from omb's `kind`.
+okf_required:
+  - type
+
+okf_recommended:
+  - description
+  - timestamp
+
+# Session metadata fields extracted by the distillation agent and surfaced for graph/retrieval.
+session_metadata:
+  - skills
+  - contracts
+  - incidents
 
 # Allowed values for kind / origin (parse-don't-validate: parse once at the boundary)
 kind:

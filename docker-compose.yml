@@ -65,6 +65,7 @@ services:
       - ${HOME}/.claude/projects:/host/.claude/projects:ro  # CC session transcripts (narrowed: drudge's source_dirs only reads ~/.claude/projects)
       - ./vault:/vault                    # self-augmentation vault (agent → remember → wiki)
       - ./boring.json:/app/boring.json:rw # policy config (language, repo rules, source dirs) — rw so the agent's classify_repo can persist rules
+      - .:/host/oh-my-boring:ro           # repo sources (read-only) for `drudge code-index --root /host/oh-my-boring`
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -101,6 +102,7 @@ services:
       - ./vault:/vault:ro                   # read-only vault so ingest-worker can verify session-id markers in wiki notes
       - ./boring.json:/host/boring.json:ro  # policy config for ingest-worker.py (note_lang, repo rules)
       - .:/host/oh-my-boring:ro             # repo root so hermes cron can run the canonical ingest-worker.py
+      - ./data/raw-witness:/host/oh-my-boring/data/raw-witness  # writable provenance snapshots under the read-only repo mount
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Mac: reach host Ollama (gemma4)
     command: ["gateway", "run"]

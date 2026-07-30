@@ -13,20 +13,41 @@
 |------|------|------|
 | `id` | string | Page ID. Matches the filename stem. Pattern `wiki-NNNN[N]` |
 | `title` | string | Page title. One line, clear |
-| `kind` | enum | `note` \| `memory` \| `session` \| `decision` |
+| `kind` | enum | `note` \| `memory` \| `session` \| `decision` \| `code` |
 | `origin` | enum | `personal` \| `company` |
 | `date` | string | Creation date `YYYY-MM-DD` |
+
+## OKF v0.1 compatibility fields
+
+oh-my-boring wiki notes are also [OKF v0.1](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) concepts.
+
+| Field | OKF status | Description |
+|------|------|------|
+| `type` | required | OKF concept type. Rendered from omb's `kind` (`note`/`memory`/`session`/`decision`/`code`). Legacy notes without `type` are tolerated during lint and can be made explicit with `drudge vault migrate-okf`. |
+| `description` | recommended | One-line summary. Rendered from `summary` or the first body line. |
+| `timestamp` | recommended | ISO-8601 UTC timestamp. Rendered from `date` as `<date>T00:00:00Z`. |
+| `okf_version` | optional | OKF dialect version, e.g. `"0.1"`. |
+
+Reserved OKF filenames (`index.md`, `log.md`) are skipped by `vault lint` because they are bundle metadata, not concept documents.
 
 ## Optional fields (optional)
 
 | Field | Type | Description |
 |------|------|------|
 | `project` | string | Project slug. Powers `project_status`, per-project recall filters, and `repo/<slug>` tag inference. Prefer the repo/org slug (e.g., `ohmyboring`, `kb-rag-bot`). |
-| `sources` | list[string] | Source file paths (prefix: `raw/`, `meta/`, `.rules/`) |
+| `sources` | list[string] | Source file paths (prefix: `raw/`, `raw-witness/`, `meta/`, `.rules/`). `raw-witness/` entries must include `#sha256=...` even when the local witness bytes have been pruned; `vault lint` verifies the local bytes when the witness file is present. |
 | `relates_to` | list[string] | List of related page IDs (`wiki-NNNN`) |
 | `tags` | list[string] | Classification tags (Obsidian-safe: spaces/special chars → `-`. Includes `repo/<slug>` nested tags) |
 | `superseded_by` | string | ID of the page that superseded this one (`wiki-NNNN`) |
-| `summary` | string | One-line summary (recommended under 200 chars) |
+| `summary` | string | One-line summary (recommended under 200 chars). Maps to OKF `description`. |
+
+## Session metadata fields (distilled from transcripts)
+
+| Field | Type | Description |
+|------|------|------|
+| `skills` | list[string] | Skills invoked during the session (e.g., `ohmyboring`, `pr-craft`, `writing-craft`). See `session-telemetry.md`. |
+| `contracts` | list[string] | Contracts referenced or established (e.g., `ollama`, `lm-studio`, `graph`, `vector`, `briefing`, `docker`, `okf`). See `session-telemetry.md`. |
+| `incidents` | list[string] | Failures, blockers, or repeated errors observed. Each incident is also surfaced as a `risk` claim. See `session-telemetry.md`. |
 
 ## Semantic fields (for recall & graph)
 
@@ -35,6 +56,7 @@
 | `tools` | list[string] | Concrete tools/commands used in this note |
 | `concepts` | list[string] | Recurring ideas/axes |
 | `claims` | list[{subject, predicate, value, kind, confidence}] | Durable facts/decisions/risks. Curated by the distillation agent; drudge stores them as temporal authority and graph nodes. |
+| `code_symbols` | list[string] | AST symbol refs (`path:symbol`) linking the note into the code graph. Written by `remember_code` on `kind: code` notes; the `code_uses` edge survives `make code-index` refreshes and the note surfaces in `/code-search` results. |
 
 ### Claims
 
