@@ -1,13 +1,13 @@
 #!/bin/sh
 # Register and run unattended housekeeping for oh-my-boring.
-# Combines data-steward (vault hygiene) and retention (raw transcript lifecycle) into a
+# Combines backup-first vault cleanup and retention (raw transcript lifecycle) into a
 # single daily job. On macOS it uses launchd; on Linux it uses the user's crontab.
 #
 #   ./scripts/schedule-maintenance.sh run       # execute now, unattended
 #   ./scripts/schedule-maintenance.sh install   # register daily job
 #   ./scripts/schedule-maintenance.sh uninstall # remove daily job
 #   ./scripts/schedule-maintenance.sh status    # show registration state
-set -u
+set -eu
 
 BORING_HOME="${BORING_HOME:-$HOME/oh-my-boring}"
 LABEL="com.ohmyboring.maintenance"
@@ -17,7 +17,7 @@ usage() {
     cat <<EOF
 Usage: $0 {run|install|uninstall|status}
 
-  run       Execute data-steward --fix --yes + retention --apply --yes now.
+  run       Execute backup-first vault cleanup + retention --apply --yes now.
   install   Register daily automatic maintenance (macOS launchd / Linux cron).
   uninstall Remove the registration.
   status    Show whether daily maintenance is registered.
@@ -27,8 +27,8 @@ EOF
 run_maintenance() {
     cd "$BORING_HOME" || { echo "✗ cannot cd to $BORING_HOME"; exit 1; }
     echo "=== oh-my-boring maintenance started at $(date) ==="
-    echo "--- data-steward ---"
-    python3 scripts/data-steward.py --fix --yes
+    echo "--- vault-cleanup ---"
+    python3 scripts/vault-cleanup-gate.py --fix --vault "${BORING_VAULT_DIR:-$BORING_HOME/vault}"
     echo "--- retention ---"
     python3 scripts/retention.py --apply --yes
     echo "=== maintenance finished at $(date) ==="

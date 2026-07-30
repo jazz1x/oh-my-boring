@@ -17,6 +17,19 @@ def clamp_text(text, limit):
     return text[:head] + "\n…(truncated)…\n" + text[-(limit - head) :], True
 
 
+def parse_clamp_limit(raw, label: str) -> int:
+    """Parse the non-negative clamp budget accepted by clamp_text."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        raise ValueError(f"{label} must be a non-negative integer, got {raw!r}")
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{label} must be a non-negative integer, got {raw!r}") from e
+    if value < 0:
+        raise ValueError(f"{label} must be a non-negative integer, got {raw!r}")
+    return value
+
+
 def _extract_claude_jsonl(path: str) -> str:
     """Extract user/assistant text from a Claude Code JSONL transcript."""
     out = []
@@ -119,9 +132,13 @@ _CODEX_USER_NOISE_MARKERS = (
     "<shell>",
     "<cwd>",
 )
+_CODEX_AGENT_NOISE_MESSAGES = (
+    "<EXTERNAL SESSION IMPORTED>",
+)
+CODEX_SHORT_EXTRACT_RETRY_MIN_ASSISTANT_CHARS = 500
 
 
-def _codex_content_text(role: str, content) -> str:
+def codex_content_text(role: str, content) -> str:
     """Extract speakable text from a Codex response_item content payload."""
     parts = []
     if isinstance(content, str):
@@ -142,6 +159,39 @@ def _codex_content_text(role: str, content) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
+def codex_agent_message_text(payload) -> str:
+    """Extract speakable assistant text from a Codex event_msg agent payload."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("last_agent_message", "message"):
+        text = payload.get(key)
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if text and text not in _CODEX_AGENT_NOISE_MESSAGES:
+            return text
+    return ""
+
+
+def codex_extractable_assistant_chars(path: str) -> int:
+    """Count assistant text chars that the Codex extractor can actually use."""
+    total = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = obj.get("payload") or {}
+            text = ""
+            if obj.get("type") == "response_item" and payload.get("role") == "assistant":
+                text = codex_content_text("assistant", payload.get("content"))
+            elif obj.get("type") == "event_msg" and payload.get("type") == "agent_message":
+                text = codex_agent_message_text(payload)
+            total += len(text.strip())
+    return total
+
+
 def _extract_codex_jsonl(path: str) -> str:
     """Extract user/assistant text from a GitHub Codex JSONL session transcript."""
     out = []
@@ -157,7 +207,7 @@ def _extract_codex_jsonl(path: str) -> str:
                 role = payload.get("role") or ""
                 if role not in ("user", "assistant"):
                     continue
-                text = _codex_content_text(role, payload.get("content"))
+                text = codex_content_text(role, payload.get("content"))
                 if text:
                     out.append(f"[{role}] {text}")
             elif t == "event_msg":
@@ -169,9 +219,9 @@ def _extract_codex_jsonl(path: str) -> str:
                             if text:
                                 out.append(f"[user] {text}")
                 elif ev_type == "agent_message":
-                    last = payload.get("last_agent_message")
-                    if isinstance(last, str) and last.strip():
-                        out.append(f"[assistant] {last.strip()}")
+                    text = codex_agent_message_text(payload)
+                    if text:
+                        out.append(f"[assistant] {text}")
     return "\n".join(out)
 
 

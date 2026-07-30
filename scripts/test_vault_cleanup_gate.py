@@ -17,10 +17,28 @@ gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
 
+class _FakeSteward:
+    FIXABLE_ISSUE_KINDS = {"placeholder_tag"}
+
+    @staticmethod
+    def fixable_note_names(report: dict) -> list[str]:
+        return list(report.get("fixable", []))
+
+
 def _write_note(wiki: Path, name: str, frontmatter: str, body: str = "body.\n") -> Path:
     path = wiki / name
     path.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
     return path
+
+
+def _base_report(wiki: Path) -> dict:
+    return {
+        "wiki_dir": str(wiki),
+        "note_count": 1,
+        "note_issues": {},
+        "claim_issues": [],
+        "fixable": [],
+    }
 
 
 def _args(root: Path, fix: bool) -> argparse.Namespace:
@@ -31,6 +49,123 @@ def _args(root: Path, fix: bool) -> argparse.Namespace:
         backup_dir=str(root / "backups"),
         report=str(root / "report.md"),
     )
+
+
+def _assert_raises(exc_type, fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+    except exc_type:
+        return
+    raise AssertionError(f"expected {exc_type.__name__}")
+
+
+def test_create_backup_publishes_complete_fsynced_archive_without_temp_leftover():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        wiki = root / "vault" / "wiki"
+        wiki.mkdir(parents=True)
+        _write_note(wiki, "wiki-0001.md", "id: wiki-0001\ntitle: t\nkind: note\norigin: personal\n")
+        seen_fsyncs = []
+        real_fsync = gate.os.fsync
+        gate.os.fsync = lambda fd: seen_fsyncs.append(fd)
+        try:
+            backup = gate._create_backup(wiki, root / "backups")
+        finally:
+            gate.os.fsync = real_fsync
+
+        assert seen_fsyncs
+        assert backup.exists()
+        with tarfile.open(backup, "r:gz") as tar:
+            names = tar.getnames()
+        assert "wiki/wiki-0001.md" in names
+        assert "manifest.json" in names
+        assert not list((root / "backups").glob(".vault-wiki-*.tmp-*"))
+
+
+def test_create_backup_preserves_existing_backup_on_publish_failure():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        wiki = root / "vault" / "wiki"
+        backup_dir = root / "backups"
+        wiki.mkdir(parents=True)
+        backup_dir.mkdir()
+        _write_note(wiki, "wiki-0001.md", "id: wiki-0001\ntitle: t\nkind: note\norigin: personal\n")
+        stamp = "20260102T030405Z"
+        backup = backup_dir / f"vault-wiki-{stamp}.tar.gz"
+        backup.write_bytes(b"old-backup")
+        real_stamp = gate._stamp
+        real_replace = gate.os.replace
+        gate._stamp = lambda: stamp
+        gate.os.replace = lambda src, dst: (_ for _ in ()).throw(OSError("denied"))
+        try:
+            _assert_raises(OSError, gate._create_backup, wiki, backup_dir)
+        finally:
+            gate._stamp = real_stamp
+            gate.os.replace = real_replace
+
+        assert backup.read_bytes() == b"old-backup"
+        assert not list(backup_dir.glob(".vault-wiki-*.tmp-*"))
+
+
+def test_write_report_uses_atomic_replace_without_temp_leftover():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        wiki = root / "vault" / "wiki"
+        wiki.mkdir(parents=True)
+        report = root / "reports" / "cleanup.md"
+        seen_fsyncs = []
+        real_fsync = gate.os.fsync
+        gate.os.fsync = lambda fd: seen_fsyncs.append(fd)
+        try:
+            gate._write_report(
+                report,
+                mode="check",
+                status="ok",
+                backup=None,
+                before=_base_report(wiki),
+                after=_base_report(wiki),
+                fixed=[],
+                issues=[],
+                data_steward=_FakeSteward(),
+            )
+        finally:
+            gate.os.fsync = real_fsync
+
+        text = report.read_text(encoding="utf-8")
+        assert seen_fsyncs
+        assert "status: `ok`" in text
+        assert "backup: `not-created`" in text
+        assert not list((root / "reports").glob(".cleanup.md.tmp-*"))
+
+
+def test_write_report_preserves_existing_report_on_publish_failure():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        wiki = root / "vault" / "wiki"
+        wiki.mkdir(parents=True)
+        report = root / "report.md"
+        report.write_text("old report\n", encoding="utf-8")
+        real_replace = gate.os.replace
+        gate.os.replace = lambda src, dst: (_ for _ in ()).throw(OSError("denied"))
+        try:
+            _assert_raises(
+                OSError,
+                gate._write_report,
+                report,
+                mode="check",
+                status="failed",
+                backup=None,
+                before=_base_report(wiki),
+                after=_base_report(wiki),
+                fixed=[],
+                issues=["boom"],
+                data_steward=_FakeSteward(),
+            )
+        finally:
+            gate.os.replace = real_replace
+
+        assert report.read_text(encoding="utf-8") == "old report\n"
+        assert not list(root.glob(".report.md.tmp-*"))
 
 
 def test_fix_creates_backup_and_clears_fixable_issues():

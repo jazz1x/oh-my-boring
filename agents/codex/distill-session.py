@@ -27,43 +27,19 @@ from distill_core import (  # noqa: F401
     git_remote_url,
     log_skip_event,
     repo_slug,
+    write_raw_witness,
 )
 
 TRANSCRIPT_FORMAT = "codex-jsonl"
-CLAMP = int(os.environ.get("CODEX_DISTILL_CLAMP") or os.environ.get("INGEST_CLAMP") or "4000")
+DEFAULT_CODEX_DISTILL_CLAMP = 4000
+CLAMP = None
 EXTERNAL_IMPORT_MESSAGE = "<EXTERNAL SESSION IMPORTED>"
+SHORT_EXTRACT_RETRY_MIN_ASSISTANT_CHARS = transcript.CODEX_SHORT_EXTRACT_RETRY_MIN_ASSISTANT_CHARS
 
 
 def extract(path):
     """Extract user/assistant text from a Codex JSONL session transcript."""
     return transcript.extract(path, TRANSCRIPT_FORMAT)
-
-
-def _has_substantive_assistant_turn(transcript_path: str) -> bool:
-    with open(transcript_path, encoding="utf-8") as f:
-        for line in f:
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = obj.get("payload") or {}
-            text = ""
-            if obj.get("type") == "response_item" and payload.get("role") == "assistant":
-                content = payload.get("content")
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    text = " ".join(
-                        part.get("text", "")
-                        for part in content
-                        if isinstance(part, dict) and part.get("type") == "output_text"
-                    )
-            elif obj.get("type") == "event_msg" and payload.get("type") == "agent_message":
-                text = payload.get("last_agent_message") or payload.get("message") or ""
-            text = text.strip()
-            if text and text != EXTERNAL_IMPORT_MESSAGE:
-                return True
-    return False
 
 
 def should_retry_short_extract(data: dict, transcript_path: str) -> bool:
@@ -74,13 +50,31 @@ def should_retry_short_extract(data: dict, transcript_path: str) -> bool:
     raw_bytes = data.get("raw_bytes")
     if raw_bytes is None:
         raw_bytes = os.path.getsize(transcript_path)
-    return int(raw_bytes) >= int(min_raw) and _has_substantive_assistant_turn(transcript_path)
+    return (
+        int(raw_bytes) >= int(min_raw)
+        and transcript.codex_extractable_assistant_chars(transcript_path)
+        >= SHORT_EXTRACT_RETRY_MIN_ASSISTANT_CHARS
+    )
+
+
+def _env_clamp_limit() -> int:
+    for name in ("CODEX_DISTILL_CLAMP", "INGEST_CLAMP"):
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip():
+            return transcript.parse_clamp_limit(raw, name)
+    return DEFAULT_CODEX_DISTILL_CLAMP
+
+
+def _default_clamp_limit() -> int:
+    if CLAMP is not None:
+        return transcript.parse_clamp_limit(CLAMP, "CLAMP")
+    return _env_clamp_limit()
 
 
 def _clamp_limit(data: dict) -> int:
     if "distill_clamp" in data and data["distill_clamp"] is not None:
-        return int(data["distill_clamp"])
-    return CLAMP
+        return transcript.parse_clamp_limit(data["distill_clamp"], "distill_clamp")
+    return _default_clamp_limit()
 
 
 def _raw_bytes(data: dict, transcript_path: str) -> int:
@@ -113,9 +107,10 @@ def main() -> int:
     remote_url = git_remote_url(cwd)
     origin, _rule = boring_config.classify(cwd, remote_url or None)
     repo = repo_slug(cwd)
-    text = extract(transcript_path)
+    witness = write_raw_witness(transcript_path, "codex", session_id)
+    text = extract(witness["path"])
     if len(text) < 500:
-        if should_retry_short_extract(data, transcript_path):
+        if should_retry_short_extract(data, witness["path"]):
             print(
                 "[omb-distill-codex] extracted text too short for large transcript; marked for retry",
                 file=sys.stderr,
@@ -138,14 +133,14 @@ def main() -> int:
         "input_budget",
         "ok",
         session_id=session_id,
-        raw_bytes=_raw_bytes(data, transcript_path),
+        raw_bytes=_raw_bytes(data, witness["path"]),
         source_chars=source_chars,
         emitted_chars=len(text),
         distill_clamp=clamp_limit,
         clamped=was_clamped,
     )
 
-    if distill_and_remember(text, origin, repo, session_id):
+    if distill_and_remember(text, origin, repo, session_id, sources=[witness["source"]]):
         _mark(session_id)
         print("[omb-distill-codex] remembered", file=sys.stderr)
         return 0
@@ -155,5 +150,13 @@ def main() -> int:
         return 1
 
 
+def run() -> int:
+    try:
+        return main()
+    except Exception as e:
+        print(f"[omb-distill-codex] crashed: {e}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

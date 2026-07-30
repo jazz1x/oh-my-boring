@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -60,6 +61,34 @@ ALLOWED_CLAIM_CONFIDENCES = {"certain", "likely", "assumption", "outdated"}
 FIXABLE_ISSUE_KINDS = {"project-variant", "placeholder-tags"}
 # The shipped sample note is allowed to be generic/empty; do not flag it as data rot.
 SEED_NOTE = "wiki-0000.md"
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Publish a complete replacement file without exposing truncate-then-write state."""
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                print(f"[warn] cleanup temp failed: {cleanup_error}", file=sys.stderr)
+        raise
 
 
 def _wiki_dir(args) -> Path:
@@ -290,7 +319,7 @@ def _fix_note(n, target_project: str):
     bak = n["path"].with_name(n["path"].name + ".bak")
     shutil.copy2(n["path"], bak)
     new_yaml = _rewrite_yaml_block(n["yaml_text"], target_project, new_tags)
-    n["path"].write_text("---\n" + new_yaml + "\n---\n" + n["body"], encoding="utf-8")
+    _write_text_atomic(n["path"], "---\n" + new_yaml + "\n---\n" + n["body"])
 
 
 def _build_report(wiki_dir: Path, notes: list[dict]) -> dict:

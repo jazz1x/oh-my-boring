@@ -10,6 +10,16 @@ cd "$ROOT"
 
 BACKUP_DIR="${BORING_BACKUP_DIR:-$ROOT/data/backups}"
 KEEP="${BORING_BACKUP_KEEP:-7}"
+case "$KEEP" in
+  ""|*[!0-9]*)
+    echo "[backup] ABORT: BORING_BACKUP_KEEP must be a positive integer, got '$KEEP'." >&2
+    exit 1
+    ;;
+esac
+if [ "$KEEP" -lt 1 ]; then
+  echo "[backup] ABORT: BORING_BACKUP_KEEP must be at least 1, got '$KEEP'." >&2
+  exit 1
+fi
 
 if docker compose version 2>&1 | grep -q "Docker Compose"; then
   COMPOSE="docker compose"

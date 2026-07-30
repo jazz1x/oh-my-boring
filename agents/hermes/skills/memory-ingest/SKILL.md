@@ -34,10 +34,12 @@ You are given (in the prompt):
    - `title` — ≤60 chars, specific. **Required.**
    - `body` — concise markdown: problem → what was tried → what worked → what's next. Keep durable facts/decisions.
    - `tags` — array of ≤6 lowercase topical tags.
-   - `tools` — array of ≤6 tool/library names.
-   - `concepts` — array of ≤6 patterns/concepts.
+   - `tools` — array of ≤6 concrete tool/command/library/model names.
+   - `concepts` — array of ≤6 recurring patterns/concepts.
+   - Association quality: `tools` and `concepts` become graph keys. Prefer stable proper nouns and canonical technical axes; avoid generic labels like `improvement`, `cleanup`, `work`, `bugfix`. Include the repo/project/tool/model/endpoint names that would help find related notes later.
    - `claims` — optional array of `{subject, predicate, value, kind, confidence}` facts/decisions/risks/next-steps.
      - `kind`: `fact`, `decision`, `assumption`, `risk`, `blocked`, `goal`, or `next`.
+     - Use stable subjects such as repo/project/tool/model names; never use vague subjects like `work`, `task`, `change`, or `this session`.
      - Use `next` for concrete follow-up actions still pending at the end of the session.
      - Use `blocked` only for active obstacles that prevent progress.
      - Example: `{"subject":"omb","predicate":"next-step","value":"add /next_actions endpoint","kind":"next","confidence":"certain"}`

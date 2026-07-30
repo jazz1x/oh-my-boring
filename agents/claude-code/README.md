@@ -6,7 +6,7 @@ This adapter wires oh-my-boring into Claude Code via hooks.
 
 | Hook | Script | What it does |
 |---|---|---|
-| `SessionStart` | `session-start-recall.py` | Calls `POST /context` and injects `{decisions, risks, facts, glossary}` as compact additional context. Falls back to recent work if no project is detected. |
+| `SessionStart` | `session-start-recall.py` | Calls `POST /context` and injects `{decisions, risks, facts, glossary, next_actions}` with evidence filenames as compact additional context. Falls back to recent work if no project is detected. |
 | `UserPromptSubmit` | `recall.py` | Pulls relevant memory excerpts on demand and prepends them to the user prompt (throttled to once per session). |
 | `SessionEnd` / `Stop` | `distill-session.py` | Distills the session into a durable note and stores it via `ohmyboring/remember`. |
 

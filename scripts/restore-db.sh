@@ -48,7 +48,7 @@ read ans
 [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { echo "aborted."; exit 0; }
 
 echo "[restore] stopping boring-drudge ..."
-$COMPOSE --profile vector stop boring-drudge || true
+$COMPOSE --profile vector stop boring-drudge
 
 echo "[restore] recreating database ..."
 $COMPOSE --profile vector exec -T boring-postgres dropdb -U boring --if-exists boring

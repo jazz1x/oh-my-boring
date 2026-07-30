@@ -17,13 +17,14 @@ worker instead:
   are harvested while files still being written are skipped.
 - Large transcripts are extracted into a bounded distill budget:
   `CODEX_DISTILL_CLAMP`, then `INGEST_CLAMP`, then `4000` characters. Status
-  output reports `distill_clamp`, and the distill hook emits an `input_budget`
-  event with raw/extracted/emitted character counts.
+  output reports `distill_clamp`, `0` disables clamping, and invalid or
+  negative values fail before distillation. The distill hook emits an
+  `input_budget` event with raw/extracted/emitted character counts.
 - True subagent/guardian roll-outs are skipped unless `CODEX_INCLUDE_SUBAGENTS=1`
   is set explicitly.
 - `install.sh` registers a host launchd/cron worker that runs every 20 minutes
   when the `codex` adapter is enabled.
-- When `hermes-agent` is enabled, `install.sh` also adds a
+- When `hermes-agent` is enabled, `install.sh` may also add a duplicate
   `codex-memory-ingest-worker` job inside Hermes.
 - Use `make doctor` to check queue, skipped rollout copies, marker health, host
   worker state, Hermes worker state, and newest Codex note.
@@ -43,11 +44,12 @@ status output does not count them as successful user-session ingestion. Pending,
 retry, and dead-letter rollout markers are still surfaced because they represent
 failed or incomplete harvest attempts.
 
-`make readiness` runs the same checks in strict mode. It fails when the host
-worker is missing/unloaded, the Hermes `codex-memory-ingest-worker` is missing,
-disabled, failed, stale-scheduled, or reports `last_error`, pending or retry
-markers exceed their TTL, any dead-letter marker exists, or the newest Codex note
-is older than the configured freshness window.
+`make readiness` runs the same checks in strict mode. It fails when the canonical
+host worker is missing/unloaded, pending or retry markers exceed their TTL, any
+dead-letter marker exists, or the newest Codex note is older than the configured
+freshness window. Hermes `codex-memory-ingest-worker` findings are still printed
+as notices, but they do not override a healthy host worker because Hermes is an
+optional duplicate ingestion path.
 
 Session markers live in `~/.cache/boring-distill/codex-<sid>.*` and are shared
 with the rest of the pipeline.
@@ -99,4 +101,4 @@ Codex will automatically invoke the right ohmyboring tool:
 
 ## Available tools
 
-`context`, `recall`, `ask`, `remember`, `forget`, `sync`, `config_get`, `classify_repo`, `project_status`, `weekly_brief`, `decisions`, `risks`, `next_actions`, `stalled`, `brief`, `claims`, `corpus_status`, `events`, `neighbors`.
+`context`, `recall`, `ask`, `remember`, `remember_code`, `forget`, `sync`, `config_get`, `classify_repo`, `project_status`, `weekly_brief`, `decisions`, `risks`, `next_actions`, `stalled`, `brief`, `claims`, `corpus_status`, `events`, `neighbors`.

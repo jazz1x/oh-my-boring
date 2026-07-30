@@ -114,11 +114,15 @@ mtime_human() {
     echo "unknown"
 }
 
-# Newest file matching a glob, or empty. `ls -t` (POSIX) avoids non-portable find -printf;
-# the glob is passed unquoted so the shell expands it.
-newest() {
-    # shellcheck disable=SC2086
-    ls -t $1 2>/dev/null | head -n 1
+newest_source_note() {
+    source_note_filter="$BORING_HOME/scripts/dedup-wiki.py"
+    if [ ! -f "$source_note_filter" ]; then
+        echo "source note filter missing: $source_note_filter" >&2
+        return 1
+    fi
+    python3 "$source_note_filter" \
+        --wiki-dir "$BORING_HOME/vault/wiki" \
+        --print-newest-source-note
 }
 
 newest_session_marker() {
@@ -233,16 +237,27 @@ fi
 # (c) Container status — surface crash-loops the HTTP probes alone would miss.
 if docker_bin="$(resolve_docker)"; then
     compose_label="$docker_bin compose"
+    compose_probe_ran=1
     if "$docker_bin" compose version >/dev/null 2>&1; then
-        ps=$(cd "$BORING_HOME" 2>/dev/null && "$docker_bin" compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null)
+        ps=$(cd "$BORING_HOME" 2>&1 && "$docker_bin" compose ps --format '{{.Name}} {{.Status}}' 2>&1)
+        ps_rc=$?
     elif command -v docker-compose >/dev/null 2>&1; then
         compose_label="docker-compose"
-        ps=$(cd "$BORING_HOME" 2>/dev/null && docker-compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null)
+        ps=$(cd "$BORING_HOME" 2>&1 && docker-compose ps --format '{{.Name}} {{.Status}}' 2>&1)
+        ps_rc=$?
     else
         ps=""
+        ps_rc=127
+        compose_probe_ran=0
         bad "docker found at $docker_bin but Docker Compose is unavailable"; failed_containers=1
     fi
-    if [ -n "$ps" ]; then
+    if [ "$compose_probe_ran" -eq 1 ] && [ "${ps_rc:-0}" -ne 0 ]; then
+        bad "container status unavailable via $compose_label in $BORING_HOME"
+        [ -n "$ps" ] && printf '%s\n' "$ps" | sed 's/^/    /'
+        failed_containers=1
+    elif [ "$compose_probe_ran" -eq 0 ]; then
+        :
+    elif [ -n "$ps" ]; then
         ok "containers ($compose_label ps in $BORING_HOME):"
         printf '%s\n' "$ps" | sed 's/^/    /'
         if printf '%s\n' "$ps" | grep -qi 'restarting'; then
@@ -255,14 +270,21 @@ else
     bad "docker not found — can't inspect container status (set DOCKER_BIN or install Docker CLI)"; failed_containers=1
 fi
 
-# (d1) Newest distilled note — proof the write door produced output. The hook writes notes
-# as vault/wiki/wiki-*.md, so the newest mtime is the last successful distillation.
-note=$(newest "$BORING_HOME/vault/wiki/wiki-*.md")
-if [ -n "$note" ]; then
-    ok "newest distilled note: $(mtime_human "$note")"
+# (d1) Newest source distilled note — proof the write door produced output. Generated briefs live in
+# vault/wiki too, but are output artifacts; they must not make readiness look fresh.
+note=""
+note_scan="$(newest_source_note 2>&1)"
+note_scan_rc=$?
+if [ "$note_scan_rc" -ne 0 ]; then
+    bad "source distilled note scan failed — readiness cannot distinguish source memory from generated briefs"
+    [ -n "$note_scan" ] && printf '    %s\n' "$note_scan"
+    failed_note=1
+elif [ -n "$note_scan" ]; then
+    note="$note_scan"
+    ok "newest source distilled note: $(mtime_human "$note")"
     echo "    $note"
 else
-    bad "no distilled notes in $BORING_HOME/vault/wiki/ — nothing written yet"; failed_note=1
+    bad "no source distilled notes in $BORING_HOME/vault/wiki/ — nothing written yet"; failed_note=1
 fi
 
 # (d2) Newest SessionEnd hook marker — proof the hook itself fired (it stamps MARK_DIR after
@@ -342,8 +364,8 @@ if [ "$stale_pending" -gt 0 ] || [ "$stale_retry" -gt 0 ] || [ "$dead_letter" -g
 fi
 
 # (d3) Codex worker/queue status — Codex has no SessionEnd hook, so the write-door
-# is a hermes cron worker scanning ~/.codex/sessions. Keep the collector status as
-# an internal read-only probe and expose it here with the rest of doctor.
+# is the host launchd/cron worker scanning ~/.codex/sessions. Hermes may run a
+# duplicate worker when enabled; collector status reports it without making it the SSOT.
 codex_status="$BORING_HOME/agents/codex/collect-sessions.py"
 if [ -f "$codex_status" ]; then
     ok "Codex session ingestion status:"

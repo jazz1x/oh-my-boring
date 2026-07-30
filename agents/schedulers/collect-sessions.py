@@ -32,10 +32,10 @@ import workflow_contract
 from drudge_client import DrudgeClient
 
 BORING_URL = omb_env.drudge_url()  # BORING_URL canonical, BORING_URL deprecated alias
-WINDOW_H = float(os.environ.get("COLLECT_WINDOW_HOURS") or "720")
-LIMIT = int(os.environ.get("COLLECT_LIMIT") or "1")
-MIN_KB = float(os.environ.get("COLLECT_MIN_KB") or "20")  # skip small sessions (distill would SKIP anyway)
-PENDING_TTL = float(os.environ.get("COLLECT_PENDING_TTL") or os.environ.get("INGEST_PENDING_TTL") or "1800")
+WINDOW_H = omb_env.env_positive_float("COLLECT_WINDOW_HOURS", 720.0)
+LIMIT = omb_env.env_positive_int("COLLECT_LIMIT", 1)
+MIN_KB = omb_env.env_non_negative_float("COLLECT_MIN_KB", 20.0)  # skip small sessions (distill would SKIP anyway)
+PENDING_TTL = omb_env.env_positive_float(("COLLECT_PENDING_TTL", "INGEST_PENDING_TTL"), 1800.0)
 # BORING_HOME: repo clone location (default ~/oh-my-boring). Lets a forker clone elsewhere
 # without editing this file.
 BORING_HOME = os.environ.get("BORING_HOME") or os.path.expanduser("~/oh-my-boring")
@@ -101,13 +101,15 @@ def main():
     for d in boring_config.source_dirs(adapter="session-end") or [os.path.expanduser("~/.claude/projects")]:
         paths.extend(glob.glob(os.path.join(d, "*", "*.jsonl")))  # top-level only
     # within window + big enough; backfill also skips already-done (marker), --now ignores the marker.
-    todo = [
-        p
-        for p in paths
-        if os.path.getmtime(p) >= cutoff
-        and os.path.getsize(p) >= MIN_KB * 1024
-        and (args.now or not _marked(os.path.splitext(os.path.basename(p))[0]))
-    ]
+    todo = []
+    for p in paths:
+        try:
+            recent = os.path.getmtime(p) >= cutoff
+            large_enough = os.path.getsize(p) >= MIN_KB * 1024
+        except OSError:
+            continue
+        if recent and large_enough and (args.now or not _marked(os.path.splitext(os.path.basename(p))[0])):
+            todo.append(p)
     todo.sort(key=os.path.getmtime, reverse=True)
     # --now is an on-demand single-shot on the current (newest) session, not a batch drain.
     batch = todo[:1] if args.now else todo[:LIMIT]

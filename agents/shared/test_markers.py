@@ -80,6 +80,73 @@ class MarkerReliabilityTests(unittest.TestCase):
             self.assertFalse((Path(d) / "s1.ts").exists())
             self.assertFalse((Path(d) / "s1.retry").exists())
 
+    def test_marker_write_uses_atomic_replace_without_temp_leftover(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+
+            markers.mark_pending("s1")
+
+            self.assertTrue((Path(d) / "s1.pending").exists())
+            self.assertEqual(list(Path(d).glob(".s1.pending.*.tmp")), [])
+
+    def test_marker_write_preserves_existing_marker_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            pending = Path(d) / "s1.pending"
+            done = Path(d) / "s1.ts"
+            pending.write_text("old-pending", encoding="utf-8")
+            done.write_text("done", encoding="utf-8")
+            old_replace = markers.os.replace
+
+            def boom(_src, _dst):
+                raise OSError("replace failed")
+
+            markers.os.replace = boom
+            try:
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    markers.mark_pending("s1")
+            finally:
+                markers.os.replace = old_replace
+
+            self.assertEqual(pending.read_text(encoding="utf-8"), "old-pending")
+            self.assertTrue(done.exists())
+            self.assertEqual(list(Path(d).glob(".s1.pending.*.tmp")), [])
+
+    def test_read_ingest_pending_rejects_mismatched_body_session_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            (Path(d) / "s1.pending").write_text("s2\n7\n0")
+
+            self.assertIsNone(markers.read_ingest_pending("s1"))
+
+    def test_ingest_pending_allows_missing_chunk_baseline(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+
+            markers.write_ingest_pending("s1", None, 2)
+
+            self.assertEqual(markers.read_ingest_pending("s1"), ("s1", None, 2))
+
+    def test_read_ingest_pending_rejects_negative_numbers(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            cases = {
+                "negative-before": "s1\n-1\n0",
+                "negative-attempts": "s1\n7\n-1",
+            }
+
+            for label, text in cases.items():
+                with self.subTest(label=label):
+                    (Path(d) / "s1.pending").write_text(text)
+                    self.assertIsNone(markers.read_ingest_pending("s1"))
+
+    def test_read_ingest_pending_rejects_extra_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            (Path(d) / "s1.pending").write_text("s1\n7\n0\nextra")
+
+            self.assertIsNone(markers.read_ingest_pending("s1"))
+
     def test_retry_marker_ttl(self):
         with tempfile.TemporaryDirectory() as d:
             markers.set_mark_dir(d)

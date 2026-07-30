@@ -1,0 +1,42 @@
+{
+  "description": "Golden queries for the /code-search code lane. Fixtures live in data/eval/code-fixtures/ and are indexed by `make code-index` like any repo file. Gate: every query must surface the expected symbol within K hits.",
+  "k": 5,
+  "queries": [
+    {
+      "query": "eval_fixture_parse",
+      "expect": ["eval_fixture_parse"]
+    },
+    {
+      "query": "EvalFixtureConfig",
+      "expect": ["EvalFixtureConfig"]
+    },
+    {
+      "query": "eval_fixture_validate",
+      "expect": ["eval_fixture_validate"]
+    },
+    {
+      "query": "EvalFixtureHandler",
+      "expect": ["EvalFixtureHandler"]
+    },
+    {
+      "query": "eval_fixture_normalize",
+      "expect": ["eval_fixture_normalize"]
+    },
+    {
+      "query": "EvalFixtureCache",
+      "expect": ["EvalFixtureCache"]
+    },
+    {
+      "query": "eval_fixture_render",
+      "expect": ["eval_fixture_render"]
+    },
+    {
+      "query": "EvalFixtureService",
+      "expect": ["EvalFixtureService"]
+    },
+    {
+      "query": "eval_fixture_route",
+      "expect": ["eval_fixture_route"]
+    }
+  ]
+}

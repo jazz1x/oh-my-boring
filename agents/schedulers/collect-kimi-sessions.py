@@ -24,9 +24,9 @@ BORING_URL = omb_env.drudge_url()  # BORING_URL canonical, BORING_URL deprecated
 KIMI_HOME = os.environ.get("KIMI_CODE_HOME") or os.path.expanduser("~/.kimi-code")
 BORING_HOME = os.environ.get("BORING_HOME") or omb_env.omb_home()
 HOOK = os.path.join(BORING_HOME, "agents", "kimi", "distill-session.py")
-LIMIT = int(os.environ.get("COLLECT_LIMIT") or "1")
-WINDOW_H = float(os.environ.get("COLLECT_WINDOW_HOURS") or "720")
-PENDING_TTL = float(os.environ.get("COLLECT_PENDING_TTL") or os.environ.get("INGEST_PENDING_TTL") or "1800")
+LIMIT = omb_env.env_positive_int("COLLECT_LIMIT", 1)
+WINDOW_H = omb_env.env_positive_float("COLLECT_WINDOW_HOURS", 720.0)
+PENDING_TTL = omb_env.env_positive_float(("COLLECT_PENDING_TTL", "INGEST_PENDING_TTL"), 1800.0)
 
 
 def _marked(session_id: str) -> bool:

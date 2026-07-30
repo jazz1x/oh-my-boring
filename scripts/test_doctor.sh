@@ -3,6 +3,8 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
+REAL_PYTHON="$(command -v python3)"
+export REAL_PYTHON
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 make_fake_path() {
@@ -24,6 +26,10 @@ if [ "${1:-}" = compose ] && [ "${2:-}" = version ]; then
     exit 0
 fi
 if [ "${1:-}" = compose ] && [ "${2:-}" = ps ]; then
+    if [ "${DOCTOR_DOCKER_PS_FAIL:-0}" = 1 ]; then
+        echo "permission denied while trying to connect to the docker API" >&2
+        exit 1
+    fi
     echo "boring-drudge Up"
     exit 0
 fi
@@ -42,12 +48,19 @@ SH
     cat >"$fakebin/python3" <<'SH'
 #!/bin/sh
 case "${1:-}" in
+  */dedup-wiki.py)
+    exec "$REAL_PYTHON" "$@"
+    ;;
   */event_log.py)
     if [ "${2:-}" = --record ]; then
         if [ -n "${DOCTOR_EVENT_CALLS:-}" ]; then
             printf '%s %s %s\n' "${3:-}" "${4:-}" "${5:-}" >>"$DOCTOR_EVENT_CALLS"
         fi
         exit 0
+    fi
+    if [ "${BORING_EVENT_RECENT_HOURS:-24}" = 0 ]; then
+        echo "[event-log] invalid config: BORING_EVENT_RECENT_HOURS must be a positive integer, got 0" >&2
+        exit 2
     fi
     echo "resolution_quality recent_failures=0 log=/tmp/events.ndjson"
     exit 0
@@ -72,6 +85,7 @@ make_case() {
     mkdir -p "$home/.claude" "$home/.cache/boring-distill" "$boring/vault/wiki" "$boring/agents/codex" "$boring/agents/shared" "$boring/scripts"
     touch "$boring/agents/codex/collect-sessions.py"
     touch "$boring/agents/shared/event_log.py"
+    cp "$ROOT/scripts/dedup-wiki.py" "$boring/scripts/dedup-wiki.py"
     touch "$home/.cache/boring-distill/session.ts"
     [ "$with_note" = yes ] && touch "$boring/vault/wiki/wiki-0001.md"
     printf 'DRUDGE_TOKEN=local\n' >"$boring/.env"
@@ -93,7 +107,7 @@ SH
     chmod +x "$boring/scripts/verify-llm.sh"
 }
 
-run_strict() {
+run_strict() (
     case_dir="$1"
     out="$2"
     HOME="$case_dir/home" \
@@ -103,7 +117,7 @@ run_strict() {
     DOCTOR_EVENT_CALLS="$case_dir/events.calls" \
     PATH="$TMP/fakebin:$PATH" \
     sh "$ROOT/scripts/doctor.sh" --strict >"$out" 2>&1
-}
+)
 
 make_fake_path "$TMP/fakebin"
 
@@ -159,6 +173,23 @@ case "$(cat "$TMP/provider-fail.out")" in
     exit 1
     ;;
 esac
+unset DOCTOR_VERIFY_LLM_FAIL
+
+make_case "$TMP/docker-ps-fail" yes
+if DOCTOR_DOCKER_PS_FAIL=1 run_strict "$TMP/docker-ps-fail" "$TMP/docker-ps-fail.out"; then
+    cat "$TMP/docker-ps-fail.out"
+    echo "FAIL: strict doctor should fail when compose ps cannot inspect containers" >&2
+    exit 1
+fi
+case "$(cat "$TMP/docker-ps-fail.out")" in
+  *"container status unavailable via"*"permission denied while trying to connect to the docker API"*) ;;
+  *)
+    cat "$TMP/docker-ps-fail.out"
+    echo "FAIL: strict doctor hid docker compose ps failure as an empty container list" >&2
+    exit 1
+    ;;
+esac
+unset DOCTOR_DOCKER_PS_FAIL
 
 make_case "$TMP/stale-note" yes
 old_note="$TMP/stale-note/boring/vault/wiki/wiki-0001.md"
@@ -174,6 +205,58 @@ case "$(cat "$TMP/stale-note.out")" in
   *)
     cat "$TMP/stale-note.out"
     echo "FAIL: strict doctor did not report note freshness failure" >&2
+    exit 1
+    ;;
+esac
+
+make_case "$TMP/generated-brief-fresh" yes
+source_note="$TMP/generated-brief-fresh/boring/vault/wiki/wiki-0001.md"
+generated_note="$TMP/generated-brief-fresh/boring/vault/wiki/wiki-0002.md"
+old_epoch=$(( $(date +%s) - 7200 ))
+python3 -c 'import os, sys; os.utime(sys.argv[1], (int(sys.argv[2]), int(sys.argv[2])))' "$source_note" "$old_epoch"
+cat >"$generated_note" <<'MD'
+---
+tags:
+  - daily-brief
+---
+generated briefing output, not source memory
+MD
+if BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/generated-brief-fresh" "$TMP/generated-brief-fresh.out"; then
+    cat "$TMP/generated-brief-fresh.out"
+    echo "FAIL: strict doctor should ignore generated brief freshness" >&2
+    exit 1
+fi
+case "$(cat "$TMP/generated-brief-fresh.out")" in
+  *"path=$source_note"*"newest note is stale"*) ;;
+  *)
+    cat "$TMP/generated-brief-fresh.out"
+    echo "FAIL: strict doctor used generated brief as source freshness evidence" >&2
+    exit 1
+    ;;
+esac
+
+make_case "$TMP/similar-brief-tag-is-source" yes
+old_source_note="$TMP/similar-brief-tag-is-source/boring/vault/wiki/wiki-0001.md"
+similar_tag_note="$TMP/similar-brief-tag-is-source/boring/vault/wiki/wiki-0002.md"
+old_epoch=$(( $(date +%s) - 7200 ))
+python3 -c 'import os, sys; os.utime(sys.argv[1], (int(sys.argv[2]), int(sys.argv[2])))' "$old_source_note" "$old_epoch"
+cat >"$similar_tag_note" <<'MD'
+---
+tags:
+  - not-daily-brief
+---
+source memory that should still count for freshness
+MD
+if ! BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/similar-brief-tag-is-source" "$TMP/similar-brief-tag-is-source.out"; then
+    cat "$TMP/similar-brief-tag-is-source.out"
+    echo "FAIL: strict doctor treated a similar tag as generated daily-brief output" >&2
+    exit 1
+fi
+case "$(cat "$TMP/similar-brief-tag-is-source.out")" in
+  *"path=$similar_tag_note"*) ;;
+  *)
+    cat "$TMP/similar-brief-tag-is-source.out"
+    echo "FAIL: strict doctor did not use the similar-tag source note for freshness" >&2
     exit 1
     ;;
 esac
@@ -207,6 +290,21 @@ case "$(cat "$TMP/invalid-ttl.out")" in
   *)
     cat "$TMP/invalid-ttl.out"
     echo "FAIL: strict doctor did not report invalid marker TTL" >&2
+    exit 1
+    ;;
+esac
+
+make_case "$TMP/invalid-recent-hours" yes
+if BORING_EVENT_RECENT_HOURS=0 run_strict "$TMP/invalid-recent-hours" "$TMP/invalid-recent-hours.out"; then
+    cat "$TMP/invalid-recent-hours.out"
+    echo "FAIL: strict doctor should fail on invalid recent event window" >&2
+    exit 1
+fi
+case "$(cat "$TMP/invalid-recent-hours.out")" in
+  *"[event-log] invalid config: BORING_EVENT_RECENT_HOURS must be a positive integer"*) ;;
+  *)
+    cat "$TMP/invalid-recent-hours.out"
+    echo "FAIL: strict doctor did not report invalid recent event window" >&2
     exit 1
     ;;
 esac

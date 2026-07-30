@@ -21,6 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "shared"))
 import boring_config
+import transcript
 from distill_core import (  # noqa: F401
     _mark,
     _distill_resolution,
@@ -29,9 +30,12 @@ from distill_core import (  # noqa: F401
     git_remote_url,
     log_skip_event,
     repo_slug,
+    write_raw_witness,
 )
 
 KIMI_HOME = os.environ.get("KIMI_CODE_HOME") or os.path.expanduser("~/.kimi-code")
+DEFAULT_DISTILL_CLAMP = 2000
+CLAMP = None
 
 
 def _work_dir_key(cwd: str) -> str:
@@ -93,9 +97,12 @@ def _text_from_content(content) -> str:
     return ""
 
 
-def extract_session(session_dir: str) -> str:
-    """Extract user/assistant text from a Kimi Code session directory."""
-    wire_path = os.path.join(session_dir, "agents", "main", "wire.jsonl")
+def _wire_path(session_dir: str) -> str:
+    return os.path.join(session_dir, "agents", "main", "wire.jsonl")
+
+
+def extract_wire(wire_path: str) -> str:
+    """Extract user/assistant text from a Kimi Code wire transcript."""
     if not os.path.exists(wire_path):
         return ""
 
@@ -154,6 +161,20 @@ def extract_session(session_dir: str) -> str:
     return "\n".join(out)
 
 
+def extract_session(session_dir: str) -> str:
+    """Extract user/assistant text from a Kimi Code session directory."""
+    return extract_wire(_wire_path(session_dir))
+
+
+def _clamp_limit() -> int:
+    if CLAMP is not None:
+        return transcript.parse_clamp_limit(CLAMP, "CLAMP")
+    raw = os.environ.get("DISTILL_CLAMP")
+    if raw is not None and raw.strip():
+        return transcript.parse_clamp_limit(raw, "DISTILL_CLAMP")
+    return DEFAULT_DISTILL_CLAMP
+
+
 def main() -> int:
     try:
         data = json.load(sys.stdin)
@@ -172,7 +193,13 @@ def main() -> int:
         print(f"[omb-distill] session dir not found for {session_id}", file=sys.stderr)
         return 2
 
-    text = extract_session(session_dir)
+    wire_path = _wire_path(session_dir)
+    if not os.path.exists(wire_path):
+        print(f"[omb-distill] session transcript not found: {wire_path!r}", file=sys.stderr)
+        return 2
+
+    witness = write_raw_witness(wire_path, "kimi", session_id)
+    text = extract_wire(witness["path"])
     remote_url = git_remote_url(cwd)
     origin, _rule = boring_config.classify(cwd, remote_url or None)
     repo = repo_slug(cwd)
@@ -182,8 +209,11 @@ def main() -> int:
         if session_id:
             _mark(session_id)
         return 0
+    text, was_clamped = transcript.clamp_text(text, _clamp_limit())
+    if was_clamped:
+        print(f"[omb-distill] transcript clamped to {len(text)} chars", file=sys.stderr)
 
-    if distill_and_remember(text, origin, repo, session_id):
+    if distill_and_remember(text, origin, repo, session_id, sources=[witness["source"]]):
         _mark(session_id)
         print("[omb-distill] remembered", file=sys.stderr)
         return 0

@@ -12,6 +12,11 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
+# Allow cron to run this script from any cwd while still importing the sibling
+# renderer. The renderer lives in the same directory as this script.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from briefing_quality import check_briefing_quality, format_quality_log
 from slack_briefing import (
     maybe_print_blocks_json,
     render_body_mrkdwn,
@@ -40,7 +45,7 @@ def slack_mrkdwn(answer: str) -> str:
 def main() -> None:
     req = urllib.request.Request(
         f"{HERMES_URL}/brief",
-        data=b"{}",
+        data=json.dumps({"since_hours": 24}).encode("utf-8"),
         headers={"content-type": "application/json"},
         method="POST",
     )
@@ -59,6 +64,20 @@ def main() -> None:
     if not answer:
         print(header(EMPTY_MESSAGE))
         return
+
+    quality = check_briefing_quality(answer, sources, 24, None, kind="daily")
+    if quality.level == "fail":
+        print(
+            header(
+                "⚠️ 브리핑 품질 계약 위반 — 엔진/prompt 점검 필요. "
+                f"({' · '.join(quality.metrics.violations)})"
+            )
+        )
+        sys.stderr.write(format_quality_log(quality) + "\n")
+        sys.exit(1)
+    if quality.level == "warn":
+        sys.stderr.write(format_quality_log(quality) + "\n")
+
     if maybe_print_blocks_json(TITLE, DATE, answer, sources, EMPTY_MESSAGE):
         return
     print(render_message_mrkdwn(f"*{TITLE}*", DATE, answer, sources, EMPTY_MESSAGE))

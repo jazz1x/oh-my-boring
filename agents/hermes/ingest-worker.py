@@ -27,10 +27,11 @@ hermes-agent container at /host/.cache/boring-distill.
 import glob
 import json
 import os
-import re
 import sys
 import time
 import urllib.request
+
+import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "shared"))
 import boring_config
@@ -79,22 +80,33 @@ BORING_URL = omb_env.drudge_url()  # BORING_URL canonical, BORING_URL deprecated
 # BORING_HOME is only meaningful on the host; inside the container we rely on /host/boring.json.
 BORING_HOME = os.environ.get("BORING_HOME") or omb_env.omb_home()
 TRANSCRIPT_FORMAT = boring_config.agent_config("claude-code").get("format") or "claude-json"
-WINDOW_H = float(os.environ.get("COLLECT_WINDOW_HOURS") or "720")
-MIN_KB = float(os.environ.get("COLLECT_MIN_KB") or "20")
-CLAMP = int(os.environ.get("INGEST_CLAMP") or "4000")  # 12B digest ceiling — above this the agent derails
+WINDOW_H = omb_env.env_positive_float("COLLECT_WINDOW_HOURS", 720.0)
+MIN_KB = omb_env.env_non_negative_float("COLLECT_MIN_KB", 20.0)
+DEFAULT_INGEST_CLAMP = 4000
+CLAMP = None  # 12B digest ceiling — above this the agent derails
 MIN_TEXT = 500  # below this = no real content → skip (host-side pre-filter)
+GENERATED_BRIEF_TAG = "daily-brief"
 # A pending-marker prevents the same session being re-offered every tick while the agent is still
 # working on it (or just failed). It expires so a crashed tick doesn't pin a session forever.
-PENDING_TTL = float(os.environ.get("INGEST_PENDING_TTL") or "1800")
+PENDING_TTL = omb_env.env_positive_float("INGEST_PENDING_TTL", 1800.0)
 # A retry-marker is a backoff signal, not a terminal state. Once it is stale, Hermes may re-offer it.
-RETRY_TTL = float(os.environ.get("INGEST_RETRY_TTL") or str(PENDING_TTL))
+RETRY_TTL = omb_env.env_positive_float("INGEST_RETRY_TTL", PENDING_TTL)
 # wiki-first mode has no chunk counter, so we retry a bounded number of confirmation attempts before
 # surfacing a visible retry marker. We do not mark unconfirmed sessions done.
-MAX_WIKI_ATTEMPTS = int(os.environ.get("INGEST_WIKI_ATTEMPTS") or "3")
+MAX_WIKI_ATTEMPTS = omb_env.env_positive_int("INGEST_WIKI_ATTEMPTS", 3)
 
 def _repo_slug(cwd):
     """Category axis: canonical repo slug from git remote or cwd basename."""
     return distill_core.repo_slug(cwd)
+
+
+def _clamp_limit() -> int:
+    if CLAMP is not None:
+        return transcript.parse_clamp_limit(CLAMP, "CLAMP")
+    raw = os.environ.get("INGEST_CLAMP")
+    if raw is not None and raw.strip():
+        return transcript.parse_clamp_limit(raw, "INGEST_CLAMP")
+    return DEFAULT_INGEST_CLAMP
 
 
 def _vault_root():
@@ -109,8 +121,8 @@ def _wiki_dir():
     return os.path.join(_vault_root(), "wiki")
 
 
-def _frontmatter_session_id(path):
-    """Return omb_session_id from YAML frontmatter, or None if absent/malformed."""
+def _frontmatter(path):
+    """Return YAML frontmatter mapping, or None if absent/malformed."""
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()
@@ -122,8 +134,29 @@ def _frontmatter_session_id(path):
     if end == -1:
         return None
     yaml_text = text[4:end]
-    m = re.search(r'^omb_session_id:\s*"?([^"\n]+)"?\s*$', yaml_text, re.MULTILINE)
-    return m.group(1).strip() if m else None
+    try:
+        front = yaml.safe_load(yaml_text) or {}
+    except yaml.YAMLError:
+        return None
+    return front if isinstance(front, dict) else None
+
+
+def _frontmatter_session_id_from(front):
+    sid = front.get("omb_session_id")
+    return sid.strip() if isinstance(sid, str) and sid.strip() else None
+
+
+def _frontmatter_generated_brief(front):
+    tags = front.get("tags", [])
+    return isinstance(tags, list) and any(
+        isinstance(tag, str) and tag.strip() == GENERATED_BRIEF_TAG for tag in tags
+    )
+
+
+def _frontmatter_session_id(path):
+    """Return omb_session_id from YAML frontmatter, or None if absent/malformed."""
+    front = _frontmatter(path)
+    return _frontmatter_session_id_from(front) if front is not None else None
 
 
 def _find_session_note(sid):
@@ -132,7 +165,10 @@ def _find_session_note(sid):
     if not wiki_dir or not os.path.isdir(wiki_dir):
         return None
     for p in glob.glob(os.path.join(wiki_dir, "wiki-*.md")):
-        if _frontmatter_session_id(p) == sid:
+        front = _frontmatter(p)
+        if front is None or _frontmatter_generated_brief(front):
+            continue
+        if _frontmatter_session_id_from(front) == sid:
             return p
     return None
 
@@ -195,9 +231,10 @@ def _is_vector_mode():
 
 def _chunk_count():
     try:
-        return int(DrudgeClient(base_url=BORING_URL, timeout=15.0, retries=0).audit().get("total_chunks", -1))
+        raw_count = DrudgeClient(base_url=BORING_URL, timeout=15.0, retries=0).audit().get("total_chunks")
+        return int(raw_count) if raw_count is not None else None
     except Exception:
-        return -1
+        return None
 
 
 def _reconcile():
@@ -212,10 +249,7 @@ def _reconcile():
         sid = os.path.splitext(os.path.basename(pend))[0]
         parsed = markers.read_ingest_pending(sid)
         if parsed is None:
-            try:
-                os.remove(pend)
-            except OSError:
-                pass
+            markers.remove_pending(sid)
             _log_worker_event("ingest_reconcile", "failed", session_id=sid, reason="pending_marker_unreadable")
             continue
         sid, before, attempts = parsed
@@ -227,9 +261,10 @@ def _reconcile():
             _log_worker_event("ingest_reconcile", "ok", session_id=sid, witness="note")
             continue
 
-        # SECONDARY (vector mode): global chunk counter is still useful as a corroborating signal.
+        # SECONDARY (vector mode): global chunk counter is useful only when both samples exist.
         if vector:
-            if _chunk_count() > before:
+            after = _chunk_count()
+            if before is not None and after is not None and after > before:
                 markers.mark_done(sid)
                 markers.remove_pending(sid)
                 _log_worker_event("ingest_reconcile", "ok", session_id=sid, witness="chunk_count")
@@ -287,6 +322,7 @@ def main():
         "en": "Write the note in English.",
     }.get(boring_config.note_lang(), "Write in the same language as the source transcript.")
 
+    clamp_limit = _clamp_limit()
     for p in paths:
         sid = os.path.splitext(os.path.basename(p))[0]
         text = extract(p)
@@ -301,7 +337,7 @@ def main():
                 source_chars=original_text_chars,
             )
             continue
-        text, was_clamped = transcript.clamp_text(text, CLAMP)
+        text, was_clamped = transcript.clamp_text(text, clamp_limit)
         cwd = transcript_cwd(p)
         remote_url = distill_core.git_remote_url(cwd)
         origin, _name = boring_config.classify(cwd, remote_url)

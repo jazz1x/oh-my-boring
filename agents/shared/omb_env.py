@@ -7,8 +7,61 @@ variables and fall back to sensible defaults.
 """
 from __future__ import annotations
 
+import math
 import os
 from urllib.parse import urlparse
+
+
+def _present_env(names: str | tuple[str, ...]) -> tuple[str, str] | None:
+    candidates = (names,) if isinstance(names, str) else names
+    for name in candidates:
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip():
+            return name, raw
+    return None
+
+
+def _env_number(names: str | tuple[str, ...], default, parser, kind: str):
+    found = _present_env(names)
+    if found is None:
+        return default, None
+    name, raw = found
+    try:
+        return parser(raw), name
+    except ValueError as e:
+        raise ValueError(f"{name} must be {kind}, got {raw!r}") from e
+
+
+def env_positive_int(names: str | tuple[str, ...], default: int) -> int:
+    value, name = _env_number(names, default, int, "a positive integer")
+    if value <= 0:
+        label = name or (names if isinstance(names, str) else "/".join(names))
+        raise ValueError(f"{label} must be a positive integer, got {value!r}")
+    return value
+
+
+def env_non_negative_int(names: str | tuple[str, ...], default: int) -> int:
+    value, name = _env_number(names, default, int, "a non-negative integer")
+    if value < 0:
+        label = name or (names if isinstance(names, str) else "/".join(names))
+        raise ValueError(f"{label} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def env_positive_float(names: str | tuple[str, ...], default: float) -> float:
+    value, name = _env_number(names, default, float, "a positive number")
+    if not math.isfinite(value) or value <= 0:
+        label = name or (names if isinstance(names, str) else "/".join(names))
+        raise ValueError(f"{label} must be a positive number, got {value!r}")
+    return value
+
+
+def env_non_negative_float(names: str | tuple[str, ...], default: float) -> float:
+    value, name = _env_number(names, default, float, "a non-negative number")
+    if not math.isfinite(value) or value < 0:
+        label = name or (names if isinstance(names, str) else "/".join(names))
+        raise ValueError(f"{label} must be a non-negative number, got {value!r}")
+    return value
 
 
 def _in_container() -> bool:
@@ -63,7 +116,7 @@ def llm_base_url() -> str:
 
 
 def llm_model() -> str:
-    return os.environ.get("BORING_LLM_MODEL") or _boring_llm().get("model") or "gemma4:12b"
+    return os.environ.get("BORING_LLM_MODEL") or _boring_llm().get("model") or "qwen3:14b"
 
 
 def llm_api_key() -> str:

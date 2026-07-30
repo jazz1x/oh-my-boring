@@ -15,11 +15,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import omb_env
+
 
 DEFAULT_EVENT_LOG = "~/.cache/oh-my-boring/events.ndjson"
 DEFAULT_RECENT_HOURS = 24
 DEFAULT_SERVICE_NAMESPACE = "oh-my-boring"
 DEFAULT_ENGINE_URL = "http://127.0.0.1:7700"
+DEFAULT_EVENT_SINK_TIMEOUT = 0.5
 
 
 def event_log_path() -> Path:
@@ -38,6 +41,8 @@ def append_event(component: str, event: str, status: str, **fields: Any) -> None
 
 def _event_payload(component: str, event: str, status: str, **fields: Any) -> dict[str, Any]:
     normalized = {k: v for k, v in fields.items() if v is not None}
+    for key, value in _self_verify_fields().items():
+        normalized.setdefault(key, value)
     if "run_id" not in normalized and normalized.get("session_id"):
         normalized["run_id"] = normalized["session_id"]
     now = datetime.now(timezone.utc)
@@ -52,17 +57,48 @@ def _event_payload(component: str, event: str, status: str, **fields: Any) -> di
     return payload
 
 
+def _self_verify_fields() -> dict[str, str]:
+    mapping = {
+        "self_verify_summary": "BORING_SELF_VERIFY_SUMMARY",
+        "self_verify_event_log": "BORING_SELF_VERIFY_EVENT_LOG",
+        "self_verify_cycle": "BORING_SELF_VERIFY_CYCLE",
+        "self_verify_step": "BORING_SELF_VERIFY_STEP",
+    }
+    values = {key: (os.environ.get(env_name) or "").strip() for key, env_name in mapping.items()}
+    present = {key: value for key, value in values.items() if value}
+    if not present:
+        return {}
+    missing = [env_name for key, env_name in mapping.items() if not values[key]]
+    if missing:
+        raise ValueError(f"partial self-verify provenance: missing {', '.join(missing)}")
+    try:
+        cycle = int(values["self_verify_cycle"])
+    except ValueError as e:
+        raise ValueError(
+            f"BORING_SELF_VERIFY_CYCLE must be a positive integer, got {values['self_verify_cycle']!r}"
+        ) from e
+    if cycle < 1:
+        raise ValueError(f"BORING_SELF_VERIFY_CYCLE must be a positive integer, got {cycle!r}")
+    values["self_verify_cycle"] = str(cycle)
+    return values
+
+
 def _append_to_spool(payload: dict[str, Any]) -> None:
     path = event_log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        f.write("\n")
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def try_append_event(component: str, event: str, status: str, **fields: Any) -> bool:
     try:
         append_event(component, event, status, **fields)
+    except ValueError as e:
+        print(f"[event-log] invalid config: {e}", file=sys.stderr)
+        return False
     except OSError as e:
         print(f"[event-log] write failed: {e}", file=sys.stderr)
         return False
@@ -134,7 +170,7 @@ def _try_store_in_engine(payload: dict[str, Any]) -> bool:
     url = _event_sink_url()
     if not url:
         return False
-    timeout = float(os.environ.get("BORING_EVENT_SINK_TIMEOUT") or "0.5")
+    timeout = _event_sink_timeout()
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -158,6 +194,14 @@ def _event_sink_url() -> Optional[str]:
         return explicit
     base = os.environ.get("BORING_URL") or DEFAULT_ENGINE_URL
     return f"{base.rstrip('/')}/events"
+
+
+def _event_sink_timeout() -> float:
+    return omb_env.env_positive_float("BORING_EVENT_SINK_TIMEOUT", DEFAULT_EVENT_SINK_TIMEOUT)
+
+
+def _event_recent_hours() -> int:
+    return omb_env.env_positive_int("BORING_EVENT_RECENT_HOURS", DEFAULT_RECENT_HOURS)
 
 
 def _event_sink_mode() -> str:
@@ -189,6 +233,7 @@ def _fetch_engine_events(
     event_name: Optional[str] = None,
     status: Optional[str] = None,
 ) -> Optional[list[dict[str, Any]]]:
+    limit = _require_positive_int(limit, "limit")
     url = _event_sink_url()
     if not url:
         return None
@@ -199,7 +244,7 @@ def _fetch_engine_events(
         "status": status,
     }
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-    timeout = float(os.environ.get("BORING_EVENT_SINK_TIMEOUT") or "0.5")
+    timeout = _event_sink_timeout()
     try:
         with urllib.request.urlopen(f"{url}?{query}", timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
@@ -209,7 +254,8 @@ def _fetch_engine_events(
     entries = body.get("entries") if isinstance(body, dict) else None
     if not isinstance(entries, list):
         return None
-    return [_normalize_engine_event(entry) for entry in reversed(entries) if isinstance(entry, dict)]
+    events = [_normalize_engine_event(entry) for entry in reversed(entries) if isinstance(entry, dict)]
+    return events[-limit:]
 
 
 def _normalize_engine_event(entry: dict[str, Any]) -> dict[str, Any]:
@@ -248,6 +294,7 @@ def recent_events(
     event_name: Optional[str] = None,
     status: Optional[str] = None,
 ) -> list[dict[str, Any]]:
+    limit = _require_positive_int(limit, "limit")
     engine_events = _fetch_engine_events(limit, component, event_name, status)
     if engine_events is not None:
         return engine_events
@@ -264,9 +311,11 @@ def recent_events(
 
 
 def recent_resolution_failures(limit: int = 3, hours: Optional[int] = None) -> list[dict[str, Any]]:
+    limit = _require_positive_int(limit, "limit")
     if hours is None:
-        raw_hours = os.environ.get("BORING_EVENT_RECENT_HOURS") or str(DEFAULT_RECENT_HOURS)
-        hours = int(raw_hours)
+        hours = _event_recent_hours()
+    else:
+        hours = _require_positive_int(hours, "hours")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     latest_by_key: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
     anonymous_failures: list[tuple[int, dict[str, Any]]] = []
@@ -327,6 +376,23 @@ def _parse_field(raw: str) -> tuple[str, Any]:
     return key, _coerce_value(value)
 
 
+def _parse_positive_int_arg(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be a positive integer") from e
+    try:
+        return _require_positive_int(value, "argument")
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be a positive integer") from e
+
+
+def _require_positive_int(value: int, label: str) -> int:
+    if value <= 0:
+        raise ValueError(f"{label} must be a positive integer, got {value!r}")
+    return value
+
+
 def _coerce_value(value: str) -> Any:
     text = value.strip()
     if text == "":
@@ -346,7 +412,7 @@ def _format_event(event: dict[str, Any]) -> str:
     ).strip()
     details = []
     for key in sorted(event):
-        if key in {"ts", "component", "event", "status"}:
+        if key in {"ts", "component", "event", "status", "otel"}:
             continue
         value = event[key]
         if isinstance(value, (dict, list)):
@@ -367,17 +433,20 @@ def main() -> int:
     parser.add_argument("--event")
     parser.add_argument("--status")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--max", type=int, default=3)
-    parser.add_argument("--hours", type=int, default=None)
+    parser.add_argument("--max", type=_parse_positive_int_arg, default=3)
+    parser.add_argument("--hours", type=_parse_positive_int_arg, default=None)
     args = parser.parse_args()
 
     if args.record:
         fields = dict(args.field)
-        append_event(args.record[0], args.record[1], args.record[2], **fields)
-        return 0
+        return 0 if try_append_event(args.record[0], args.record[1], args.record[2], **fields) else 1
 
     if args.tail:
-        events = recent_events(args.max, args.component, args.event, args.status)
+        try:
+            events = recent_events(args.max, args.component, args.event, args.status)
+        except ValueError as e:
+            print(f"[event-log] invalid config: {e}", file=sys.stderr)
+            return 2
         for event in events:
             if args.json:
                 print(json.dumps(event, ensure_ascii=False, sort_keys=True))
@@ -386,7 +455,11 @@ def main() -> int:
         return 0
 
     if args.recent_resolution_failures:
-        failures = recent_resolution_failures(args.max, args.hours)
+        try:
+            failures = recent_resolution_failures(args.max, args.hours)
+        except ValueError as e:
+            print(f"[event-log] invalid config: {e}", file=sys.stderr)
+            return 2
         if not failures:
             print(f"resolution_quality recent_failures=0 log={event_log_path()}")
             return 0

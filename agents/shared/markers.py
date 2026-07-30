@@ -11,6 +11,8 @@ Markers:
 """
 import os
 import re
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -43,8 +45,31 @@ def _remove_marker(path: str) -> None:
 
 
 def _write_marker(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    target = Path(path)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = Path(f.name)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+    except OSError:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                print(f"[markers] cleanup temp failed: {cleanup_error}", file=sys.stderr)
+        raise
 
 
 def _transition_marker(target: str, cleanup: tuple[str, ...], text: str) -> None:
@@ -123,22 +148,30 @@ def ingest_pending_path(session_id: str) -> str:
     return _paths(session_id)[1]
 
 
-def write_ingest_pending(session_id: str, before: int, attempts: int) -> None:
+def write_ingest_pending(session_id: str, before: Optional[int], attempts: int) -> None:
     """Write the ingest-worker's pending marker with ``(sid, before, attempts)``."""
     ts, path, retry = _paths(session_id)
+    before_text = "" if before is None else str(before)
     _ensure_dir()
-    _transition_marker(path, (ts, retry), f"{session_id}\n{before}\n{attempts}")
+    _transition_marker(path, (ts, retry), f"{session_id}\n{before_text}\n{attempts}")
 
 
-def read_ingest_pending(session_id: str) -> Optional[tuple[str, int, int]]:
+def read_ingest_pending(session_id: str) -> Optional[tuple[str, Optional[int], int]]:
     """Parse the ingest-worker's pending marker. Return None if absent/corrupt."""
     _, path, _ = _paths(session_id)
     try:
         with open(path, encoding="utf-8") as f:
             parts = f.read().strip().split("\n")
+        if len(parts) != 3:
+            return None
         sid = parts[0]
-        before = int(parts[1].strip())
+        if sid != session_id:
+            return None
+        before_raw = parts[1].strip()
+        before = int(before_raw) if before_raw else None
         attempts = int(parts[2].strip()) if len(parts) > 2 else 0
+        if (before is not None and before < 0) or attempts < 0:
+            return None
         return sid, before, attempts
     except Exception:
         return None

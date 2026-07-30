@@ -10,6 +10,7 @@
 #   3. Missing backup → exit 1, no dropdb.
 #   4. User declines the prompt → no dropdb.
 #   5. Valid backup + confirm → validation (pg_restore -l) runs BEFORE dropdb.
+#   6. Stop failure after confirm → ABORT before dropdb.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,6 +34,7 @@ echo "\$*" >> "$STUB_LOG"
 case "\$*" in
   "compose version") echo "Docker Compose version v2.29.0"; exit 0 ;;
   *"pg_restore -l"*) exit \${STUB_PGRESTORE_L_RC:-0} ;;
+  *"stop boring-drudge"*) exit \${STUB_STOP_RC:-0} ;;
   *) exit 0 ;;
 esac
 STUB
@@ -43,7 +45,8 @@ teardown() { rm -rf "$WORK"; }
 
 run() { # stdin_answer ; runs restore with stub docker on PATH; sets RC
   printf '%s\n' "$1" | PATH="$STUB_BIN:$PATH" STUB_PGRESTORE_L_RC="${STUB_PGRESTORE_L_RC:-0}" \
-    FILE="${FILE:-}" BORING_BACKUP_DIR="$WORK/backups" sh "$SCRIPT" >"$WORK/out" 2>&1 || RC=$?
+    STUB_STOP_RC="${STUB_STOP_RC:-0}" FILE="${FILE:-}" BORING_BACKUP_DIR="$WORK/backups" \
+    sh "$SCRIPT" >"$WORK/out" 2>&1 || RC=$?
   RC="${RC:-0}"
 }
 
@@ -85,6 +88,13 @@ val_line=$(grep -n "pg_restore -l" "$STUB_LOG" | head -1 | cut -d: -f1)
 drop_line=$(grep -n "dropdb" "$STUB_LOG" | head -1 | cut -d: -f1)
 { [ "$RC" = 0 ] && [ -n "$val_line" ] && [ -n "$drop_line" ] && [ "$val_line" -lt "$drop_line" ]; }
 check "validation runs before dropdb on confirm" $?
+teardown
+
+# --- 6. stop failure after confirm → abort before dropdb ---------------------
+setup
+printf 'realish' > "$WORK/ok.dump"
+RC=0; FILE="$WORK/ok.dump" STUB_PGRESTORE_L_RC=0 STUB_STOP_RC=1; run "y"
+{ [ "$RC" = 1 ] && ! dropdb_called; }; check "stop failure aborts before dropdb" $?
 teardown
 
 echo

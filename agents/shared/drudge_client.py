@@ -78,6 +78,20 @@ class DrudgeClient:
         )
         return data.get("hits", []) if isinstance(data, dict) else []
 
+    def code_search(self, query: str, max_symbols: int = 5) -> list[dict[str, Any]]:
+        """POST /code-search and return the AST code-symbol hits (requires BORING_VECTOR=on)."""
+        return self.code_search_full(query, max_symbols=max_symbols).get("hits", [])
+
+    def code_search_full(self, query: str, max_symbols: int = 5) -> dict[str, Any]:
+        """POST /code-search and return the whole payload — symbol `hits` plus `notes`
+        (wiki notes the user linked to matched symbols via remember_code)."""
+        data = self._retry(
+            "POST",
+            "/code-search",
+            {"query": query, "max_symbols": max_symbols},
+        )
+        return data if isinstance(data, dict) else {}
+
     def health(self) -> dict[str, Any]:
         """GET /health."""
         return self._retry("GET", "/health")

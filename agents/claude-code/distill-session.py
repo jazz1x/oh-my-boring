@@ -26,6 +26,7 @@ from distill_core import (  # noqa: F401
     git_remote_url,
     log_skip_event,
     repo_slug,
+    write_raw_witness,
 )
 
 # Re-export generic helpers at module top level so existing tests can keep using them.
@@ -33,19 +34,29 @@ from distill_core import (  # noqa: F401
 __all__ = [
     "_extract_json", "_mark", "_strip_trailing_metadata",
     "_build_prompt", "_call_llm", "_call_remember", "_throttled",
-    "distill_and_remember", "git_remote_url", "log_skip_event", "repo_slug", "extract", "main", "run",
+    "distill_and_remember", "git_remote_url", "log_skip_event", "repo_slug", "write_raw_witness", "extract", "main", "run",
 ]
 # fmt: on
 
 TRANSCRIPT_FORMAT = boring_config.agent_config("claude-code").get("format") or "claude-json"
 # Direct SessionEnd distill calls the local LLM synchronously; keep the default tighter than
 # the Hermes offer path, and let operators raise it explicitly when the local model can handle it.
-CLAMP = int(os.environ.get("DISTILL_CLAMP") or "2000")
+DEFAULT_DISTILL_CLAMP = 2000
+CLAMP = None
 
 
 def extract(path):
     """Extract user/assistant text from a session transcript using the configured format."""
     return transcript.extract(path, TRANSCRIPT_FORMAT)
+
+
+def _clamp_limit() -> int:
+    if CLAMP is not None:
+        return transcript.parse_clamp_limit(CLAMP, "CLAMP")
+    raw = os.environ.get("DISTILL_CLAMP")
+    if raw is not None and raw.strip():
+        return transcript.parse_clamp_limit(raw, "DISTILL_CLAMP")
+    return DEFAULT_DISTILL_CLAMP
 
 
 def main() -> int:
@@ -69,18 +80,19 @@ def main() -> int:
     remote_url = git_remote_url(cwd)
     origin, _rule = boring_config.classify(cwd, remote_url or None)
     repo = repo_slug(cwd)
-    text = extract(transcript_path)
+    witness = write_raw_witness(transcript_path, "claude-code", session_id)
+    text = extract(witness["path"])
     if len(text) < 500:
         print("[omb-distill] transcript too short; skipping", file=sys.stderr)
         log_skip_event(session_id, origin, repo, _distill_resolution(), "too_short")
         if session_id:
             _mark(session_id)
         return 0
-    text, was_clamped = transcript.clamp_text(text, CLAMP)
+    text, was_clamped = transcript.clamp_text(text, _clamp_limit())
     if was_clamped:
         print(f"[omb-distill] transcript clamped to {len(text)} chars", file=sys.stderr)
 
-    if distill_and_remember(text, origin, repo, session_id):
+    if distill_and_remember(text, origin, repo, session_id, sources=[witness["source"]]):
         _mark(session_id)
         print("[omb-distill] remembered", file=sys.stderr)
         return 0

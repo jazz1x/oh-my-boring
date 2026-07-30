@@ -32,6 +32,25 @@ recall = _load("kimi_recall", "recall.py")
 import recall_core  # noqa: E402
 
 
+def _write_wire(session_dir: str, text: str = "hello") -> str:
+    wire = Path(session_dir) / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True, exist_ok=True)
+    wire.write_text(
+        json.dumps({"type": "turn.prompt", "input": [{"type": "text", "text": text}]}) + "\n",
+        encoding="utf-8",
+    )
+    return str(wire)
+
+
+def _witness(path: str) -> dict:
+    return {
+        "path": path,
+        "source": "raw-witness/kimi/20260703/session-abc.jsonl#sha256=abc123",
+        "sha256": "abc123",
+        "bytes": 100,
+    }
+
+
 def test_work_dir_key_format():
     key = distill._work_dir_key("/home/user/my-project")
     assert key.startswith("wd_my-project_")
@@ -143,6 +162,7 @@ def test_distill_invalid_stdin_logs_error():
 def test_distill_short_transcript_logs_skip_and_marks_done():
     with tempfile.TemporaryDirectory() as session_dir:
         root = Path(session_dir)
+        wire_path = _write_wire(session_dir)
         event_path = root / "events.ndjson"
         captured = io.StringIO()
         stderr = io.StringIO()
@@ -151,7 +171,8 @@ def test_distill_short_transcript_logs_skip_and_marks_done():
              mock.patch.object(distill.sys, "stdout", captured), \
              mock.patch.object(distill.sys, "stderr", stderr), \
              mock.patch.object(distill, "_find_session_dir", return_value=session_dir), \
-             mock.patch.object(distill, "extract_session", return_value="too short"), \
+             mock.patch.object(distill, "write_raw_witness", return_value=_witness(wire_path)), \
+             mock.patch.object(distill, "extract_wire", return_value="too short"), \
              mock.patch.object(distill, "git_remote_url", return_value=""), \
              mock.patch.object(distill, "repo_slug", return_value="repo"), \
              mock.patch.object(distill.boring_config, "classify", return_value=("personal", None)), \
@@ -171,6 +192,7 @@ def test_distill_short_transcript_logs_skip_and_marks_done():
 
 def test_distill_remember_failure_returns_nonzero_and_marks_retry():
     with tempfile.TemporaryDirectory() as session_dir:
+        wire_path = _write_wire(session_dir)
         captured = io.StringIO()
         stderr = io.StringIO()
         payload = {"session_id": "session_abc", "cwd": "/x", "hook_event_name": "SessionEnd"}
@@ -178,18 +200,100 @@ def test_distill_remember_failure_returns_nonzero_and_marks_retry():
              mock.patch.object(distill.sys, "stdout", captured), \
              mock.patch.object(distill.sys, "stderr", stderr), \
              mock.patch.object(distill, "_find_session_dir", return_value=session_dir), \
-             mock.patch.object(distill, "extract_session", return_value="x" * 600), \
+             mock.patch.object(distill, "write_raw_witness", return_value=_witness(wire_path)), \
+             mock.patch.object(distill, "extract_wire", return_value="x" * 600), \
              mock.patch.object(distill, "git_remote_url", return_value=""), \
              mock.patch.object(distill, "repo_slug", return_value="repo"), \
              mock.patch.object(distill.boring_config, "classify", return_value=("personal", None)), \
-             mock.patch.object(distill, "distill_and_remember", return_value=False), \
+             mock.patch.object(distill, "distill_and_remember", return_value=False) as remember, \
              mock.patch.object(distill, "_mark") as mark:
             rc = distill.main()
 
     assert captured.getvalue() == ""
     assert rc == 1
+    remember.assert_called_once_with(
+        "x" * 600,
+        "personal",
+        "repo",
+        "session_abc",
+        sources=["raw-witness/kimi/20260703/session-abc.jsonl#sha256=abc123"],
+    )
     mark.assert_called_once_with("session_abc", retry=True)
     assert "remember failed" in stderr.getvalue()
+
+
+def test_distill_extracts_from_raw_witness_snapshot():
+    with tempfile.TemporaryDirectory() as session_dir:
+        wire_path = _write_wire(session_dir)
+        witness_path = Path(session_dir) / "raw-witness-copy.jsonl"
+        witness_path.write_text(Path(wire_path).read_text(encoding="utf-8"), encoding="utf-8")
+        captured = io.StringIO()
+        stderr = io.StringIO()
+        payload = {"session_id": "session_abc", "cwd": "/x", "hook_event_name": "SessionEnd"}
+        with mock.patch.object(distill.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             mock.patch.object(distill.sys, "stdout", captured), \
+             mock.patch.object(distill.sys, "stderr", stderr), \
+             mock.patch.object(distill, "_find_session_dir", return_value=session_dir), \
+             mock.patch.object(distill, "write_raw_witness", return_value=_witness(str(witness_path))), \
+             mock.patch.object(distill, "extract_wire", return_value="x" * 600) as extract_wire, \
+             mock.patch.object(distill, "git_remote_url", return_value=""), \
+             mock.patch.object(distill, "repo_slug", return_value="repo"), \
+             mock.patch.object(distill.boring_config, "classify", return_value=("personal", None)), \
+             mock.patch.object(distill, "distill_and_remember", return_value=True), \
+             mock.patch.object(distill, "_mark"):
+            rc = distill.main()
+
+    assert captured.getvalue() == ""
+    assert rc == 0
+    extract_wire.assert_called_once_with(str(witness_path))
+
+
+def test_distill_clamps_with_direct_hook_budget():
+    old_clamp = distill.CLAMP
+    try:
+        with tempfile.TemporaryDirectory() as session_dir:
+            wire_path = _write_wire(session_dir)
+            captured = io.StringIO()
+            stderr = io.StringIO()
+            payload = {"session_id": "session_abc", "cwd": "/x", "hook_event_name": "SessionEnd"}
+            long_text = "0123456789" * 80
+            distill.CLAMP = 120
+            with mock.patch.object(distill.sys, "stdin", io.StringIO(json.dumps(payload))), \
+                 mock.patch.object(distill.sys, "stdout", captured), \
+                 mock.patch.object(distill.sys, "stderr", stderr), \
+                 mock.patch.object(distill, "_find_session_dir", return_value=session_dir), \
+                 mock.patch.object(distill, "write_raw_witness", return_value=_witness(wire_path)), \
+                 mock.patch.object(distill, "extract_wire", return_value=long_text), \
+                 mock.patch.object(distill, "git_remote_url", return_value=""), \
+                 mock.patch.object(distill, "repo_slug", return_value="repo"), \
+                 mock.patch.object(distill.boring_config, "classify", return_value=("personal", None)), \
+                 mock.patch.object(distill, "distill_and_remember", return_value=True) as remember, \
+                 mock.patch.object(distill, "_mark"):
+                rc = distill.main()
+
+        assert captured.getvalue() == ""
+        assert rc == 0
+        remembered_text = remember.call_args.args[0]
+        assert len(remembered_text) < len(long_text)
+        assert "truncated" in remembered_text
+        assert "transcript clamped" in stderr.getvalue()
+    finally:
+        distill.CLAMP = old_clamp
+
+
+def test_distill_rejects_invalid_clamp_env_at_boundary():
+    old_clamp = distill.CLAMP
+    try:
+        distill.CLAMP = None
+        with mock.patch.dict(os.environ, {"DISTILL_CLAMP": "-1"}, clear=True):
+            try:
+                distill._clamp_limit()
+            except ValueError as e:
+                assert "DISTILL_CLAMP must be a non-negative integer" in str(e)
+            else:
+                raise AssertionError("expected invalid DISTILL_CLAMP to fail")
+    finally:
+        distill.CLAMP = old_clamp
 
 
 def test_distill_run_returns_nonzero_on_crash():
@@ -215,5 +319,8 @@ if __name__ == "__main__":
     test_distill_invalid_stdin_logs_error()
     test_distill_short_transcript_logs_skip_and_marks_done()
     test_distill_remember_failure_returns_nonzero_and_marks_retry()
+    test_distill_extracts_from_raw_witness_snapshot()
+    test_distill_clamps_with_direct_hook_budget()
+    test_distill_rejects_invalid_clamp_env_at_boundary()
     test_distill_run_returns_nonzero_on_crash()
     print("ok - kimi agent adapters")

@@ -24,22 +24,26 @@ import subprocess
 import sys
 import time
 
+import yaml
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "shared"))
 import boring_config
 import event_log
 import markers
 import omb_env
+import transcript
 import workflow_contract
 from drudge_client import DrudgeClient
 
 BORING_URL = omb_env.drudge_url()
-WINDOW_H = float(os.environ.get("COLLECT_WINDOW_HOURS") or "720")
-LIMIT = int(os.environ.get("COLLECT_LIMIT") or "1")
-MIN_KB = float(os.environ.get("COLLECT_MIN_KB") or "20")
-DISTILL_CLAMP = int(os.environ.get("CODEX_DISTILL_CLAMP") or os.environ.get("INGEST_CLAMP") or "4000")
-STABLE_AGE_S = float(os.environ.get("COLLECT_STABLE_AGE_SECONDS") or "1800")
-PENDING_TTL = float(os.environ.get("COLLECT_PENDING_TTL") or os.environ.get("INGEST_PENDING_TTL") or "1800")
-RETRY_TTL = float(os.environ.get("COLLECT_RETRY_TTL") or os.environ.get("INGEST_RETRY_TTL") or str(PENDING_TTL))
+WINDOW_H = omb_env.env_positive_float("COLLECT_WINDOW_HOURS", 720.0)
+LIMIT = omb_env.env_positive_int("COLLECT_LIMIT", 1)
+MIN_KB = omb_env.env_non_negative_float("COLLECT_MIN_KB", 20.0)
+DEFAULT_CODEX_DISTILL_CLAMP = 4000
+DISTILL_CLAMP = None
+STABLE_AGE_S = omb_env.env_non_negative_float("COLLECT_STABLE_AGE_SECONDS", 1800.0)
+PENDING_TTL = omb_env.env_positive_float(("COLLECT_PENDING_TTL", "INGEST_PENDING_TTL"), 1800.0)
+RETRY_TTL = omb_env.env_positive_float(("COLLECT_RETRY_TTL", "INGEST_RETRY_TTL"), PENDING_TTL)
 BORING_HOME = os.environ.get("BORING_HOME") or omb_env.omb_home()
 HOOK = os.path.join(BORING_HOME, "agents/codex/distill-session.py")
 HOST_WORKER_LABEL = "com.ohmyboring.codex-ingest"
@@ -50,6 +54,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.lower() in ("1", "true", "yes")
+
+
+def _effective_distill_clamp() -> int:
+    if DISTILL_CLAMP is not None:
+        return transcript.parse_clamp_limit(DISTILL_CLAMP, "DISTILL_CLAMP")
+    for name in ("CODEX_DISTILL_CLAMP", "INGEST_CLAMP"):
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip():
+            return transcript.parse_clamp_limit(raw, name)
+    return DEFAULT_CODEX_DISTILL_CLAMP
 
 
 INCLUDE_SUBAGENTS = _env_bool("CODEX_INCLUDE_SUBAGENTS")
@@ -165,6 +179,34 @@ def _format_mtime(path: str) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(os.path.getmtime(path)))
 
 
+def _status_field(value) -> str:
+    return " ".join(str(value).split())
+
+
+def _next_extract_probe(path: str) -> dict:
+    text = transcript.extract(path, "codex-jsonl")
+    assistant_chars = transcript.codex_extractable_assistant_chars(path)
+    raw_bytes = os.path.getsize(path)
+    short = len(text) < 500
+    retry_if_short = (
+        raw_bytes >= int(MIN_KB * 1024)
+        and assistant_chars >= transcript.CODEX_SHORT_EXTRACT_RETRY_MIN_ASSISTANT_CHARS
+    )
+    if not short:
+        classification = "distillable"
+    elif retry_if_short:
+        classification = "short_retry"
+    else:
+        classification = "short_skip"
+    return {
+        "raw_bytes": raw_bytes,
+        "extracted_chars": len(text),
+        "assistant_chars": assistant_chars,
+        "short_retry": retry_if_short,
+        "classification": classification,
+    }
+
+
 def _newest(paths: list[str]) -> str:
     if not paths:
         return ""
@@ -225,10 +267,14 @@ def _frontmatter_session_id(path: str) -> str:
     end = text.find("\n---\n")
     if end < 0:
         return ""
-    for line in text[4:end].splitlines():
-        if line.startswith("omb_session_id:"):
-            return line.split(":", 1)[1].strip().strip("\"'")
-    return ""
+    try:
+        front = yaml.safe_load(text[4:end]) or {}
+    except yaml.YAMLError:
+        return ""
+    if not isinstance(front, dict):
+        return ""
+    sid = front.get("omb_session_id")
+    return sid.strip() if isinstance(sid, str) and sid.strip() else ""
 
 
 def _newest_codex_note() -> dict:
@@ -285,25 +331,25 @@ def _parse_worker_time(raw: str) -> dt.datetime | None:
         return None
 
 
-def _worker_readiness_issues(worker: dict) -> list[str]:
-    issues = []
+def _hermes_worker_readiness_notices(worker: dict) -> list[str]:
+    notices = []
     if not worker.get("found"):
-        return ["hermes codex worker missing"]
+        return notices
     if not worker.get("enabled"):
-        issues.append("hermes codex worker disabled")
+        notices.append("hermes codex worker disabled")
     last_status = str(worker.get("last_status") or "").lower()
     if last_status not in ("ok", "success"):
-        issues.append(f"hermes codex worker last_status={last_status or 'missing'}")
+        notices.append(f"hermes codex worker last_status={last_status or 'missing'}")
     if worker.get("last_error"):
-        issues.append("hermes codex worker last_error set")
+        notices.append("hermes codex worker last_error set")
     next_run = _parse_worker_time(str(worker.get("next_run_at") or ""))
     if next_run is None:
-        issues.append("hermes codex worker next_run_at missing_or_invalid")
+        notices.append("hermes codex worker next_run_at missing_or_invalid")
     else:
         now = dt.datetime.now(next_run.tzinfo) if next_run.tzinfo else dt.datetime.now()
         if next_run < now:
-            issues.append("hermes codex worker schedule stale")
-    return issues
+            notices.append("hermes codex worker schedule stale")
+    return notices
 
 
 def _marker_readiness_issues(marker: dict) -> list[str]:
@@ -359,13 +405,14 @@ def _print_status(source_dir: str, scan: dict) -> bool:
     worker = _hermes_worker_status()
     host_worker = _host_worker_status()
     latest_note = _newest_codex_note()
+    distill_clamp = _effective_distill_clamp()
 
     print(f"[codex-status] source_dir={source_dir}")
     print(f"[codex-status] marker_dir={markers.MARK_DIR}")
     print(
         "[codex-status] config "
         f"window_h={WINDOW_H:g} min_kb={MIN_KB:g} limit={LIMIT} "
-        f"distill_clamp={DISTILL_CLAMP} "
+        f"distill_clamp={distill_clamp} "
         f"stable_age_s={STABLE_AGE_S:g} include_rollouts={str(INCLUDE_ROLLOUTS).lower()} "
         f"include_subagents={str(INCLUDE_SUBAGENTS).lower()}"
     )
@@ -378,10 +425,18 @@ def _print_status(source_dir: str, scan: dict) -> bool:
     )
     if todo:
         next_path = todo[0]
+        probe = _next_extract_probe(next_path)
         print(
             "[codex-status] next_session "
             f"id={_codex_session_id(next_path)} mtime={_format_mtime(next_path)} "
             f"size_kb={os.path.getsize(next_path) / 1024:.1f} path={next_path}"
+        )
+        print(
+            "[codex-status] next_extract "
+            f"classification={probe['classification']} "
+            f"raw_bytes={probe['raw_bytes']} extracted_chars={probe['extracted_chars']} "
+            f"assistant_chars={probe['assistant_chars']} "
+            f"short_retry={str(probe['short_retry']).lower()}"
         )
     else:
         print("[codex-status] next_session none")
@@ -401,10 +456,13 @@ def _print_status(source_dir: str, scan: dict) -> bool:
         "[codex-status] worker "
         f"found={str(worker.get('found', False)).lower()} "
         f"enabled={str(worker.get('enabled', False)).lower()} "
-        f"state={worker.get('state', '')} last_status={worker.get('last_status', '')} "
-        f"last_error={worker.get('last_error', '')} "
-        f"last_run_at={worker.get('last_run_at', '')} next_run_at={worker.get('next_run_at', '')} "
-        f"script={worker.get('script', '')} path={worker.get('path', '')}"
+        f"state={_status_field(worker.get('state', ''))} "
+        f"last_status={_status_field(worker.get('last_status', ''))} "
+        f"last_error={_status_field(worker.get('last_error', ''))} "
+        f"last_run_at={_status_field(worker.get('last_run_at', ''))} "
+        f"next_run_at={_status_field(worker.get('next_run_at', ''))} "
+        f"script={_status_field(worker.get('script', ''))} "
+        f"path={_status_field(worker.get('path', ''))}"
     )
     print(
         "[codex-status] host_worker "
@@ -415,10 +473,12 @@ def _print_status(source_dir: str, scan: dict) -> bool:
     issues = []
     if not (host_worker.get("found") and host_worker.get("loaded")):
         issues.append("host worker is not installed/loaded")
-    issues.extend(_worker_readiness_issues(worker))
     issues.extend(_marker_readiness_issues(marker))
+    notices = _hermes_worker_readiness_notices(worker)
     for issue in issues:
         print(f"[codex-status] readiness_issue {issue}")
+    for notice in notices:
+        print(f"[codex-status] readiness_notice {notice}")
     if latest_note:
         print(
             "[codex-status] newest_note "
@@ -586,6 +646,7 @@ def main(argv: list[str] | None = None):
         env["BORING_DISTILL_NO_MARK"] = "1"
     done = 0
     failed = 0
+    distill_clamp = _effective_distill_clamp()
     for tp in batch:
         sid = _codex_session_id(tp)
         cwd = _transcript_cwd(tp)
@@ -597,7 +658,7 @@ def main(argv: list[str] | None = None):
                 "hook_event_name": "SessionEnd",
                 "raw_bytes": os.path.getsize(tp),
                 "min_raw_bytes_for_retry": int(MIN_KB * 1024),
-                "distill_clamp": DISTILL_CLAMP,
+                "distill_clamp": distill_clamp,
             }
         )
         r = subprocess.run([sys.executable, HOOK], input=payload, text=True, env=env)

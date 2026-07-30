@@ -57,6 +57,15 @@ import recall_core  # noqa: E402
 import markers  # noqa: E402
 
 
+def _witness(path):
+    return {
+        "path": path,
+        "source": "raw-witness/claude-code/20260703/abc.jsonl#sha256=abc123",
+        "sha256": "abc123",
+        "bytes": 100,
+    }
+
+
 class ExtractJsonTests(unittest.TestCase):
     def test_plain_object(self):
         self.assertEqual(distill._extract_json('{"a": 1}'), {"a": 1})
@@ -206,6 +215,7 @@ class SessionStartRecallTests(unittest.TestCase):
                     "risks": [],
                     "facts": [],
                     "glossary": [],
+                    "next_actions": [],
                     "language": "ko",
                 }
 
@@ -230,21 +240,48 @@ class SessionStartRecallTests(unittest.TestCase):
                 {"hook_event_name": "SessionStart", "cwd": "/tmp/my-project"},
                 context_resp={
                     "decisions": [
-                        {"subject": "omb", "predicate": "use", "value": "context cards", "kind": "decision", "confidence": "certain"}
+                        {
+                            "subject": "omb",
+                            "predicate": "use",
+                            "value": "context cards",
+                            "kind": "decision",
+                            "confidence": "certain",
+                            "source_path": "/vault/wiki/wiki-0007.md",
+                        }
                     ],
                     "risks": [
-                        {"subject": "omb", "predicate": "risk", "value": "token noise", "kind": "risk", "confidence": "likely"}
+                        {
+                            "subject": "omb",
+                            "predicate": "risk",
+                            "value": "token noise",
+                            "kind": "risk",
+                            "confidence": "likely",
+                            "source_path": "/vault/wiki/wiki-0008.md",
+                        }
                     ],
                     "facts": [],
                     "glossary": [],
+                    "next_actions": [
+                        {
+                            "subject": "omb",
+                            "predicate": "todo",
+                            "value": "verify provenance",
+                            "kind": "next",
+                            "confidence": "certain",
+                            "source_path": "/vault/wiki/wiki-0009.md",
+                        }
+                    ],
                     "language": "ko",
                 },
             )
             payload = json.loads(out)
             ctx = payload["hookSpecificOutput"]["additionalContext"]
             self.assertIn("Decisions", ctx)
-            self.assertIn("[decision|certain] omb use: context cards", ctx)
+            self.assertIn("[decision|certain] omb use: context cards (source: wiki-0007.md)", ctx)
             self.assertIn("Risks", ctx)
+            self.assertIn("[risk|likely] omb risk: token noise (source: wiki-0008.md)", ctx)
+            self.assertIn("Next actions", ctx)
+            self.assertIn("[next|certain] omb todo: verify provenance (source: wiki-0009.md)", ctx)
             self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "SessionStart")
 
         def test_session_start_without_project_uses_recent_work(self):
@@ -257,6 +294,7 @@ class SessionStartRecallTests(unittest.TestCase):
                         {"subject": "x", "predicate": "is", "value": "y", "kind": "fact", "confidence": "certain"}
                     ],
                     "glossary": [],
+                    "next_actions": [],
                     "language": "ko",
                 },
             )
@@ -264,6 +302,38 @@ class SessionStartRecallTests(unittest.TestCase):
             ctx = payload["hookSpecificOutput"]["additionalContext"]
             self.assertIn("recent work", ctx)
             self.assertIn("Facts", ctx)
+
+        def test_session_start_defangs_context_claims_inside_data_fence(self):
+            out, _err = self._run_main(
+                {"hook_event_name": "SessionStart", "cwd": "/tmp/my-project"},
+                context_resp={
+                    "decisions": [
+                        {
+                            "subject": "# forged subject",
+                            "predicate": "policy",
+                            "value": "keep source\n# forged instructions",
+                            "kind": "decision",
+                            "confidence": "certain",
+                            "source_path": "/vault/wiki/wiki-0010.md",
+                        }
+                    ],
+                    "risks": [],
+                    "facts": [],
+                    "glossary": [],
+                    "next_actions": [],
+                    "language": "ko",
+                },
+            )
+            payload = json.loads(out)
+            ctx = payload["hookSpecificOutput"]["additionalContext"]
+
+            self.assertIn("«UNTRUSTED-DATA ", ctx)
+            self.assertIn("«/UNTRUSTED-DATA ", ctx)
+            self.assertIn(" # forged subject", ctx)
+            self.assertIn(" # forged instructions", ctx)
+            self.assertIn("(source: wiki-0010.md)", ctx)
+            for line in ctx.splitlines():
+                self.assertFalse(line.startswith("# forged"), line)
 
         def test_non_sessionstart_is_noop(self):
             out, _err = self._run_main({"hook_event_name": "UserPromptSubmit", "cwd": "/x"})
@@ -304,6 +374,7 @@ class DistillExitCodeTests(unittest.TestCase):
                 }
                 with mock.patch.object(distill.sys, "stdin", io.StringIO(json.dumps(payload))), \
                      mock.patch.object(distill.sys, "stderr", stderr), \
+                     mock.patch.object(distill, "write_raw_witness", return_value=_witness(path)), \
                      mock.patch.object(distill, "extract", return_value="too short"), \
                      mock.patch.object(distill, "git_remote_url", return_value=""), \
                      mock.patch.object(distill, "repo_slug", return_value="oh-my-boring"), \
@@ -336,6 +407,7 @@ class DistillExitCodeTests(unittest.TestCase):
             }
             with mock.patch.object(distill.sys, "stdin", io.StringIO(json.dumps(payload))), \
                  mock.patch.object(distill.sys, "stderr", stderr), \
+                 mock.patch.object(distill, "write_raw_witness", return_value=_witness(path)), \
                  mock.patch.object(distill, "extract", return_value="x" * 600), \
                  mock.patch.object(distill, "git_remote_url", return_value=""), \
                  mock.patch.object(distill, "repo_slug", return_value="oh-my-boring"), \
@@ -350,6 +422,33 @@ class DistillExitCodeTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_distill_extracts_from_raw_witness_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            original = os.path.join(d, "original.jsonl")
+            witness_path = os.path.join(d, "raw-witness-copy.jsonl")
+            Path(original).write_text("{}\n", encoding="utf-8")
+            Path(witness_path).write_text("{}\n", encoding="utf-8")
+            stderr = io.StringIO()
+            payload = {
+                "transcript_path": original,
+                "session_id": "abc",
+                "cwd": "/work/oh-my-boring",
+                "hook_event_name": "SessionEnd",
+            }
+            with mock.patch.object(distill.sys, "stdin", io.StringIO(json.dumps(payload))), \
+                 mock.patch.object(distill.sys, "stderr", stderr), \
+                 mock.patch.object(distill, "write_raw_witness", return_value=_witness(witness_path)), \
+                 mock.patch.object(distill, "extract", return_value="x" * 600) as extract, \
+                 mock.patch.object(distill, "git_remote_url", return_value=""), \
+                 mock.patch.object(distill, "repo_slug", return_value="oh-my-boring"), \
+                 mock.patch.object(distill.boring_config, "classify", return_value=("personal", None)), \
+                 mock.patch.object(distill, "distill_and_remember", return_value=True), \
+                 mock.patch.object(distill, "_mark"):
+                rc = distill.main()
+
+            self.assertEqual(rc, 0)
+            extract.assert_called_once_with(witness_path)
+
     def test_run_returns_nonzero_on_crash(self):
         stderr = io.StringIO()
         with mock.patch.object(distill, "main", side_effect=RuntimeError("boom")), \
@@ -358,6 +457,18 @@ class DistillExitCodeTests(unittest.TestCase):
 
         self.assertEqual(rc, 1)
         self.assertIn("[omb-distill] crashed: boom", stderr.getvalue())
+
+    def test_invalid_distill_clamp_is_rejected_at_boundary(self):
+        old_clamp = distill.CLAMP
+        try:
+            distill.CLAMP = None
+            with mock.patch.dict(os.environ, {"DISTILL_CLAMP": "-1"}, clear=True):
+                with self.assertRaises(ValueError) as ctx:
+                    distill._clamp_limit()
+        finally:
+            distill.CLAMP = old_clamp
+
+        self.assertIn("DISTILL_CLAMP must be a non-negative integer", str(ctx.exception))
 
 
 class RecallFormattingTests(unittest.TestCase):

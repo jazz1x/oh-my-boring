@@ -190,25 +190,38 @@ def wire_kimi(path: Path | None = None) -> dict:
 
     distill = f"python3 {BORING_HOME}/hooks/kimi-distill-session.py"
     recall = f"python3 {BORING_HOME}/hooks/kimi-recall.py"
+    code_recall = f"python3 {BORING_HOME}/hooks/code-recall.py"
 
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     changed = False
-    if distill not in existing or recall not in existing:
-        snippet = (
+    blocks = []
+    if distill not in existing:
+        blocks.append(
             "\n[[hooks]]\n"
             'event = "SessionEnd"\n'
             f'command = "{distill}"\n'
             "timeout = 130\n"
+        )
+    if recall not in existing:
+        blocks.append(
             "\n[[hooks]]\n"
             'event = "UserPromptSubmit"\n'
             f'command = "{recall}"\n'
             "timeout = 10\n"
         )
+    if code_recall not in existing:
+        blocks.append(
+            "\n[[hooks]]\n"
+            'event = "UserPromptSubmit"\n'
+            f'command = "{code_recall}"\n'
+            "timeout = 10\n"
+        )
+    if blocks:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
-            f.write(snippet)
+            f.write("".join(blocks))
         changed = True
 
     return {"agent": "kimi", "path": str(path), "changed": changed}
@@ -406,29 +419,39 @@ def _upsert_mcp_block(lines: list[str], mcp_idx: int, server_name: str, url: str
 
 
 def _install_hermes_briefing(boring_home: str | None = None) -> None:
-    """Install the canonical briefing.py template into ~/.hermes/scripts/."""
+    """Install the canonical briefing.py template (and its renderer dependency) into ~/.hermes/scripts/."""
     home = boring_home if boring_home is not None else BORING_HOME
-    src = Path(home) / "agents" / "hermes" / "briefing.py"
-    if not src.exists():
-        raise FileNotFoundError(f"briefing template not found: {src}")
+    src_dir = Path(home) / "agents" / "hermes"
+    briefing_src = src_dir / "briefing.py"
+    renderer_src = src_dir / "slack_briefing.py"
+    if not briefing_src.exists():
+        raise FileNotFoundError(f"briefing template not found: {briefing_src}")
+    if not renderer_src.exists():
+        raise FileNotFoundError(f"briefing renderer not found: {renderer_src}")
     dst_dir = Path(os.path.expanduser("~/.hermes/scripts"))
-    dst = dst_dir / "briefing.py"
     dst_dir.mkdir(parents=True, exist_ok=True)
-    _backup(dst)
-    shutil.copy2(src, dst)
+    _backup(dst_dir / "briefing.py")
+    _backup(dst_dir / "slack_briefing.py")
+    shutil.copy2(briefing_src, dst_dir / "briefing.py")
+    shutil.copy2(renderer_src, dst_dir / "slack_briefing.py")
 
 
 def _install_hermes_weekly_briefing(boring_home: str | None = None) -> None:
-    """Install the canonical weekly-briefing.py template into ~/.hermes/scripts/."""
+    """Install the canonical weekly-briefing.py template (and its renderer dependency) into ~/.hermes/scripts/."""
     home = boring_home if boring_home is not None else BORING_HOME
-    src = Path(home) / "agents" / "hermes" / "weekly-briefing.py"
-    if not src.exists():
-        raise FileNotFoundError(f"weekly briefing template not found: {src}")
+    src_dir = Path(home) / "agents" / "hermes"
+    weekly_src = src_dir / "weekly-briefing.py"
+    renderer_src = src_dir / "slack_briefing.py"
+    if not weekly_src.exists():
+        raise FileNotFoundError(f"weekly briefing template not found: {weekly_src}")
+    if not renderer_src.exists():
+        raise FileNotFoundError(f"briefing renderer not found: {renderer_src}")
     dst_dir = Path(os.path.expanduser("~/.hermes/scripts"))
-    dst = dst_dir / "weekly-briefing.py"
     dst_dir.mkdir(parents=True, exist_ok=True)
-    _backup(dst)
-    shutil.copy2(src, dst)
+    _backup(dst_dir / "weekly-briefing.py")
+    _backup(dst_dir / "slack_briefing.py")
+    shutil.copy2(weekly_src, dst_dir / "weekly-briefing.py")
+    shutil.copy2(renderer_src, dst_dir / "slack_briefing.py")
 
 
 def _install_hermes_codex_collector(boring_home: str | None = None) -> None:
@@ -459,6 +482,8 @@ def _parse_cron_dow(dow_expr: str) -> set[int]:
         part = part.strip()
         if part:
             cron_dow = int(part)
+            if cron_dow < 0 or cron_dow > 6:
+                raise ValueError(f"unsupported cron day-of-week: {part}")
             # cron 0=Sunday -> Python 6; cron 1=Monday -> Python 0; ...
             result.add((cron_dow + 6) % 7)
     return result

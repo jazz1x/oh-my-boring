@@ -1,0 +1,55 @@
+{
+  "description": "GraphRAG golden retrieval set. Queries are paraphrased and often mention a tool/concept without copying the fixture title, so they test whether the graph (shared tool/concept/claim) plus claim authority can surface the right note when flat vector recall is noisy. Fixtures are the same files used by data/eval/golden.json; fixture ids resolve to wiki-NNNN ids at ingest time.",
+  "queries": [
+    {
+      "query": "BuildKit keeps rebuilding the dependency layer even when package-lock did not change",
+      "expect": ["eval-docker-layer-cache"],
+      "rationale": "Requires 'docker'/'buildkit' tool link or 'layer caching' concept link; title/body phrasing differs from the query."
+    },
+    {
+      "query": "Postgres rejects new connections during a traffic spike despite the app seeming fine",
+      "expect": ["eval-pg-pool"],
+      "rationale": "Connects via 'postgres'/'pgbouncer' tools and 'connection pooling' concept; query does not name deadpool."
+    },
+    {
+      "query": "JVM pod restarts because the kernel killed the process for memory",
+      "expect": ["eval-k8s-oomkill"],
+      "rationale": "Graph link through 'kubernetes'/'jvm' tools and 'oom killer' concept; query avoids 'OOMKilled' verbatim."
+    },
+    {
+      "query": "Typing in a search box makes every row in a React list render again",
+      "expect": ["eval-react-rerender"],
+      "rationale": "Links via 'react' tool and 'memoization' concept; query does not use 'useCallback' or 'React.memo'."
+    },
+    {
+      "query": "Users get logged out because the server thinks their token is from the future",
+      "expect": ["eval-jwt-clock-skew"],
+      "rationale": "Concept/time-axis signal; relies on claim/temporal authority as much as vector similarity."
+    },
+    {
+      "query": "Docker image build reinstalls npm packages on every source edit",
+      "expect": ["eval-docker-layer-cache"],
+      "rationale": "Same topic as query 1 but with different wording; tests graph stability across paraphrases."
+    },
+    {
+      "query": "Database connection count grows without bound until Postgres says too many clients",
+      "expect": ["eval-pg-pool"],
+      "rationale": "Paraphrase of query 2; shared tool/concept lane should still surface the note."
+    },
+    {
+      "query": "Container memory limit is smaller than the JVM heap plus off-heap allocations",
+      "expect": ["eval-k8s-oomkill"],
+      "rationale": "Paraphrase of query 3; tests concept-link consistency."
+    },
+    {
+      "query": "List component re-renders all children because the parent passes a new inline function each time",
+      "expect": ["eval-react-rerender"],
+      "rationale": "Paraphrase of query 4; 'referential stability' concept link should help."
+    },
+    {
+      "query": "Authentication token is rejected due to clock difference between issuer and verifier",
+      "expect": ["eval-jwt-clock-skew"],
+      "rationale": "Paraphrase of query 5; temporal claim authority should beat old chunk noise."
+    }
+  ]
+}

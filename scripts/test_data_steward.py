@@ -103,6 +103,55 @@ def test_no_case_duplicate_repo_tag_and_keeps_real_tags():
         assert real in tags, f"real tag {real!r} dropped: {tags}"
 
 
+def test_fix_uses_atomic_replace_without_temp_leftover():
+    d = tempfile.mkdtemp()
+    wiki = Path(d) / "wiki"
+    wiki.mkdir()
+    p = wiki / "wiki-0042.md"
+    p.write_text(
+        "---\nid: wiki-0042\ntitle: t\nproject: marketboro/omb\ntags: []\n---\nbody.\n",
+        encoding="utf-8",
+    )
+
+    note = ds._collect_notes(wiki)[0]
+    ds._fix_note(note, "omb")
+
+    out = p.read_text(encoding="utf-8")
+    assert "project: omb" in out
+    leftovers = list(wiki.glob(f".{p.name}.*.tmp"))
+    assert leftovers == [], leftovers
+
+
+def test_fix_preserves_original_when_atomic_replace_fails():
+    d = tempfile.mkdtemp()
+    wiki = Path(d) / "wiki"
+    wiki.mkdir()
+    p = wiki / "wiki-0042.md"
+    original = "---\nid: wiki-0042\ntitle: t\nproject: marketboro/omb\ntags: []\n---\nbody.\n"
+    p.write_text(original, encoding="utf-8")
+    note = ds._collect_notes(wiki)[0]
+
+    old_replace = ds.os.replace
+
+    def boom(_src, _dst):
+        raise OSError("replace failed")
+
+    ds.os.replace = boom
+    try:
+        try:
+            ds._fix_note(note, "omb")
+            raise AssertionError("expected OSError")
+        except OSError as e:
+            assert "replace failed" in str(e)
+    finally:
+        ds.os.replace = old_replace
+
+    assert p.read_text(encoding="utf-8") == original
+    assert p.with_name(p.name + ".bak").exists()
+    leftovers = list(wiki.glob(f".{p.name}.*.tmp"))
+    assert leftovers == [], leftovers
+
+
 def _make_note(frontmatter: str, body: str = "body.\n"):
     d = tempfile.mkdtemp()
     wiki = Path(d) / "wiki"

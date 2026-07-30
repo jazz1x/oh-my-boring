@@ -119,6 +119,25 @@ def test_wire_claude_code_adds_session_start():
         assert any("session-start-recall.py" in c for c in commands)
 
 
+def test_wire_claude_code_preserves_existing_settings_backup_once():
+    """Existing Claude settings are copied once before wiring and not overwritten later."""
+    with tempfile.TemporaryDirectory() as d:
+        settings = Path(d) / "settings.json"
+        settings.write_text('{"hooks":{"PreToolUse":[]}}\n', encoding="utf-8")
+
+        first = agent_wiring.wire_claude_code(settings)
+        backup = Path(str(settings) + ".omb-bak")
+        backup_text = backup.read_text(encoding="utf-8")
+
+        second = agent_wiring.wire_claude_code(settings)
+
+        assert first["changed"] is True
+        assert second["changed"] is False
+        assert backup_text == '{"hooks":{"PreToolUse":[]}}\n'
+        assert backup.read_text(encoding="utf-8") == backup_text
+        assert "SessionEnd" in settings.read_text(encoding="utf-8")
+
+
 def test_wire_hermes_adds_hint_and_weekly():
     """hermes wiring installs hint + weekly script and updates config.yaml."""
     with tempfile.TemporaryDirectory() as d, mock.patch.object(
@@ -138,6 +157,7 @@ def test_wire_hermes_adds_hint_and_weekly():
         scripts.mkdir(parents=True)
         (scripts / "briefing.py").write_text("# stub", encoding="utf-8")
         (scripts / "weekly-briefing.py").write_text("# stub", encoding="utf-8")
+        (scripts / "slack_briefing.py").write_text("# stub", encoding="utf-8")
         (scripts / "codex-collect-sessions.py").write_text("# stub", encoding="utf-8")
         cfg = Path(d) / "config.yaml"
         with mock.patch.object(agent_wiring.os.path, "expanduser", side_effect=fake_expanduser):
@@ -146,7 +166,9 @@ def test_wire_hermes_adds_hint_and_weekly():
         text = cfg.read_text(encoding="utf-8")
         assert "environment_hint:" in text
         assert "ohmyboring/context" in text
+        assert (fake_home / ".hermes" / "scripts" / "briefing.py").exists()
         assert (fake_home / ".hermes" / "scripts" / "weekly-briefing.py").exists()
+        assert (fake_home / ".hermes" / "scripts" / "slack_briefing.py").exists()
         assert (fake_home / ".hermes" / "scripts" / "codex-collect-sessions.py").exists()
         assert mock_cron.called is True
 
@@ -220,6 +242,18 @@ def test_next_cron_run_finds_next_monday():
     assert nxt > now
 
 
+def test_next_cron_run_rejects_unsupported_day_of_week():
+    tz = agent_wiring.datetime.timezone(agent_wiring.datetime.timedelta(hours=9))
+    now = agent_wiring.datetime.datetime(2026, 6, 29, 10, 0, 0, tzinfo=tz)
+
+    try:
+        agent_wiring._next_cron_run("0 9 * * 9", tz, now)
+    except ValueError as e:
+        assert "unsupported cron day-of-week: 9" in str(e)
+    else:
+        raise AssertionError("unsupported cron day-of-week should fail")
+
+
 def test_sync_hermes_cron_jobs_adds_managed_job():
     """_sync_hermes_cron_jobs creates missing managed jobs without touching others."""
     with tempfile.TemporaryDirectory() as d, mock.patch.object(
@@ -263,10 +297,12 @@ if __name__ == "__main__":
     test_settings_path_override()
     test_default_path_when_no_override()
     test_wire_claude_code_adds_session_start()
+    test_wire_claude_code_preserves_existing_settings_backup_once()
     test_wire_hermes_adds_hint_and_weekly()
     test_install_hermes_skills_removes_legacy_nested_duplicate()
     test_install_codex_host_worker_macos_writes_launch_agent()
     test_next_cron_run_finds_next_monday()
+    test_next_cron_run_rejects_unsupported_day_of_week()
     test_sync_hermes_cron_jobs_adds_managed_job()
     test_wire_hermes_adds_hint_and_weekly()
     print("ok - agent_wiring failure propagation + hermes wiring + settings_path")

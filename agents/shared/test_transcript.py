@@ -122,6 +122,14 @@ def test_extract_codex_jsonl_user_and_assistant():
                     "type": "event_msg",
                     "payload": {"type": "agent_message", "last_agent_message": "done"},
                 },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "fallback done"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "<EXTERNAL SESSION IMPORTED>"},
+                },
             ],
         )
         path = f.name
@@ -130,8 +138,13 @@ def test_extract_codex_jsonl_user_and_assistant():
         assert "what is the migration plan?" in out
         assert "use the new schema" in out
         assert "done" in out
+        assert "fallback done" in out
+        assert "EXTERNAL SESSION IMPORTED" not in out
         assert "AGENTS.md" not in out
         assert "internal thought" not in out
+        assert transcript.codex_extractable_assistant_chars(path) == len(
+            "use the new schema." + "done" + "fallback done"
+        )
     finally:
         os.unlink(path)
 
@@ -171,6 +184,21 @@ def test_clamp_text_keeps_short_input():
     assert clamped == text
 
 
+def test_parse_clamp_limit_accepts_zero_and_positive_ints():
+    assert transcript.parse_clamp_limit(0, "CLAMP") == 0
+    assert transcript.parse_clamp_limit("4000", "CLAMP") == 4000
+
+
+def test_parse_clamp_limit_rejects_invalid_values():
+    for raw in (-1, "soon", True, 1.5):
+        try:
+            transcript.parse_clamp_limit(raw, "CLAMP")
+        except ValueError as e:
+            assert "CLAMP must be a non-negative integer" in str(e)
+        else:
+            raise AssertionError("expected ValueError")
+
+
 if __name__ == "__main__":
     test_extract_claude_jsonl_text_and_list_content()
     test_extract_claude_jsonl_ignores_malformed_lines()
@@ -179,4 +207,6 @@ if __name__ == "__main__":
     test_extract_unknown_format_raises()
     test_clamp_text_preserves_head_and_tail()
     test_clamp_text_keeps_short_input()
+    test_parse_clamp_limit_accepts_zero_and_positive_ints()
+    test_parse_clamp_limit_rejects_invalid_values()
     print("ok - transcript parser")

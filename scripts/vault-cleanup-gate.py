@@ -94,24 +94,41 @@ def _manual_issue_count(report: dict, data_steward) -> int:
     return count + len(report.get("claim_issues", []))
 
 
+def _cleanup_temp(path: Path, label: str) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        print(f"[vault-cleanup] {label} temp cleanup failed: {e}", file=sys.stderr)
+
+
 def _create_backup(wiki_dir: Path, backup_dir: Path) -> Path:
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / f"vault-wiki-{_stamp()}.tar.gz"
-    with tarfile.open(backup, "w:gz") as tar:
-        for path in sorted(wiki_dir.iterdir()):
-            if path.is_file():
-                tar.add(path, arcname=f"wiki/{path.name}")
-        manifest = {
-            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "wiki_dir": str(wiki_dir),
-            "file_count": len([p for p in wiki_dir.iterdir() if p.is_file()]),
-        }
-        payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-        info = tarfile.TarInfo("manifest.json")
-        info.size = len(payload)
-        tar.addfile(info, io.BytesIO(payload))
-    if backup.stat().st_size <= 0:
-        raise RuntimeError(f"backup archive is empty: {backup}")
+    tmp = backup.with_name(f".{backup.name}.tmp-{os.getpid()}")
+    try:
+        with tarfile.open(tmp, "w:gz") as tar:
+            for path in sorted(wiki_dir.iterdir()):
+                if path.is_file():
+                    tar.add(path, arcname=f"wiki/{path.name}")
+            manifest = {
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "wiki_dir": str(wiki_dir),
+                "file_count": len([p for p in wiki_dir.iterdir() if p.is_file()]),
+            }
+            payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+        with tmp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        if tmp.stat().st_size <= 0:
+            raise RuntimeError(f"backup archive is empty: {tmp}")
+        os.replace(tmp, backup)
+    except (OSError, tarfile.TarError, RuntimeError):
+        _cleanup_temp(tmp, "backup")
+        raise
     return backup
 
 
@@ -127,6 +144,20 @@ def _apply_safe_fixes(notes: list[dict], data_steward) -> list[str]:
             data_steward._fix_note(note, target)
             fixed.append(note["path"].name)
     return sorted(fixed)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        _cleanup_temp(tmp, "report")
+        raise
 
 
 def _write_report(
@@ -182,7 +213,7 @@ def _write_report(
         lines.extend(f"- {issue}" for issue in issues)
     else:
         lines.append("- none")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_atomic(path, "\n".join(lines) + "\n")
 
 
 def run(args: argparse.Namespace) -> int:
