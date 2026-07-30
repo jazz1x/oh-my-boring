@@ -493,6 +493,10 @@ pub(crate) struct HealthResp {
     /// /health stays a liveness probe).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_count: Option<usize>,
+    /// Result of the DB liveness probe (`SELECT 1`). `None` when vector mode is off; `Some(true/false)`
+    /// when vector mode is on. A failed probe makes `status` "degraded" rather than "ok".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) db_healthy: Option<bool>,
 }
 
 /// Best-effort count of source wiki notes (`vault/wiki/*.md`, excluding generated briefs and internal

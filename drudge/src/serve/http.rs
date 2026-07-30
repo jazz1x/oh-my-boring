@@ -39,11 +39,24 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResp> {
     } else {
         SyncState::Running
     };
+
+    let db_healthy = if let Some(store) = state.store.as_ref() {
+        Some(store.liveness_probe().await.is_ok())
+    } else {
+        None
+    };
+    let status = if db_healthy == Some(false) {
+        "degraded"
+    } else {
+        "ok"
+    };
+
     Json(HealthResp {
-        status: "ok",
+        status,
         vector: state.store.is_some(),
         sync,
         corpus_count: state.wiki_dir().as_deref().and_then(count_wiki_notes),
+        db_healthy,
     })
 }
 
