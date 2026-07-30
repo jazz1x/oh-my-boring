@@ -17,6 +17,10 @@ from typing import Any, Optional
 import omb_env
 
 
+class DrudgeNotWritableError(Exception):
+    """Raised when drudge is not healthy enough to accept writes."""
+
+
 class DrudgeClient:
     """Minimal drudge HTTP client. Silent failures are left to callers."""
 
@@ -120,3 +124,28 @@ class DrudgeClient:
         if project:
             payload["project"] = project
         return self._retry("POST", "/context", payload)
+
+
+def check_drudge_writable(client: DrudgeClient | None = None) -> None:
+    """Preflight: raise DrudgeNotWritableError if drudge cannot accept writes.
+
+    Uses GET /health. A legacy response without ``db_healthy`` is treated as
+    vector-off and allowed through. A present ``db_healthy=false`` or
+    ``status=degraded`` blocks the caller so it can bail out before expensive
+    LLM distillation.
+    """
+    client = client or DrudgeClient()
+    try:
+        health = client.health()
+    except Exception as exc:
+        raise DrudgeNotWritableError(f"drudge /health unreachable: {exc}") from exc
+
+    if "db_healthy" not in health:
+        return
+
+    if health.get("status") == "degraded":
+        raise DrudgeNotWritableError("drudge health status is degraded")
+
+    if not health.get("db_healthy"):
+        status = health.get("status", "unknown")
+        raise DrudgeNotWritableError(f"drudge DB is not healthy (status={status})")

@@ -33,7 +33,7 @@ import markers
 import omb_env
 import transcript
 import workflow_contract
-from drudge_client import DrudgeClient
+from drudge_client import DrudgeClient, DrudgeNotWritableError, check_drudge_writable
 
 BORING_URL = omb_env.drudge_url()
 WINDOW_H = omb_env.env_positive_float("COLLECT_WINDOW_HOURS", 720.0)
@@ -640,6 +640,27 @@ def main(argv: list[str] | None = None):
             **workflow_contract.collector_run_fields("ok", 0),
         )
         return 0
+
+    try:
+        check_drudge_writable()
+    except DrudgeNotWritableError as e:
+        print(f"[codex-collect] write gate blocked: {e}", file=sys.stderr, flush=True)
+        event_log.try_append_event(
+            "codex-collector",
+            "collector_run",
+            "failed",
+            run_id=run_id,
+            agent="codex",
+            pending=len(todo),
+            batch=len(batch),
+            processed=0,
+            failed=0,
+            remaining=len(todo),
+            mode=label,
+            reason=str(e),
+            **workflow_contract.collector_run_fields("failed", len(batch)),
+        )
+        return 1
 
     env = dict(os.environ)
     if args.now:

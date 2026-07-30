@@ -18,7 +18,7 @@ import event_log
 import markers
 import omb_env
 import workflow_contract
-from drudge_client import DrudgeClient
+from drudge_client import DrudgeClient, DrudgeNotWritableError, check_drudge_writable
 
 BORING_URL = omb_env.drudge_url()  # BORING_URL canonical, BORING_URL deprecated alias
 KIMI_HOME = os.environ.get("KIMI_CODE_HOME") or os.path.expanduser("~/.kimi-code")
@@ -102,6 +102,25 @@ def main():
         return 1
 
     sessions = _load_index()
+    try:
+        check_drudge_writable()
+    except DrudgeNotWritableError as e:
+        print(f"[collect-kimi] write gate blocked: {e}", file=sys.stderr, flush=True)
+        event_log.try_append_event(
+            "kimi-collector",
+            "collector_run",
+            "failed",
+            run_id=run_id,
+            agent="kimi",
+            eligible=0,
+            attempted=0,
+            processed=0,
+            failed=0,
+            reason=str(e),
+            **workflow_contract.collector_run_fields("failed", 0),
+        )
+        return 1
+
     eligible = 0
     attempted = 0
     processed = 0
