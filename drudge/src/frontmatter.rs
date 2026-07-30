@@ -8,6 +8,60 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 
+/// Scheduler-produced briefing notes are output artifacts, not source memory.
+pub const GENERATED_BRIEF_TAG: &str = "daily-brief";
+
+/// Claim kind vocabulary shared by remember/schema/retrieval filters.
+pub const CLAIM_KINDS: &[&str] = &[
+    "fact",
+    "decision",
+    "assumption",
+    "risk",
+    "blocked",
+    "goal",
+    "term",
+    "next",
+];
+
+/// Claim confidence vocabulary shared by remember/schema/data hygiene.
+pub const CLAIM_CONFIDENCES: &[&str] = &["certain", "likely", "assumption", "outdated"];
+
+#[must_use]
+pub fn has_generated_brief_tag(tags: &[String]) -> bool {
+    tags.iter().any(|tag| tag.trim() == GENERATED_BRIEF_TAG)
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct TagFrontmatter {
+    tags: Vec<String>,
+}
+
+#[must_use]
+pub fn raw_has_generated_brief_tag(raw: &str) -> bool {
+    yaml_frontmatter(raw).is_some_and(|yaml| {
+        serde_yaml::from_str::<TagFrontmatter>(yaml)
+            .is_ok_and(|fm| has_generated_brief_tag(&fm.tags))
+    })
+}
+
+#[must_use]
+pub fn is_internal_eval_fixture_path(path: &str) -> bool {
+    let Some(name) = path.rsplit('/').next() else {
+        return false;
+    };
+    name.starts_with("eval-")
+        && std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
+fn yaml_frontmatter(raw: &str) -> Option<&str> {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    raw.strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---\n").map(|end| &rest[..end]))
+}
+
 /// Structured metadata for an ingested document — the basis (SSOT) for audit · filtering · graph edges.
 ///
 /// Honest disclosure: `origin`/`kind` are `String`, not enums — unlike `vault::{Origin,Kind}`,
@@ -15,7 +69,7 @@ use crate::config;
 /// from arbitrary markdown (Claude Code transcripts, freeform notes); their only consumers are
 /// audit tally (distribution counts) and a Postgres `text` column bind — nothing re-derives domain
 /// meaning from them, so there is no parse-don't-validate smell to close. vault's enums cover a
-/// different, curated value set (note/memory/session/decision) where exhaustive matching matters.
+/// different, curated value set (note/memory/session/decision/code) where exhaustive matching matters.
 /// Forcing an enum here would mean code changes for any new ingest kind and a second near-duplicate
 /// enum — escalation the rule-of-three doesn't justify (§C "simplest thing that works").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -34,12 +88,25 @@ pub struct FrontMatter {
     pub tools: Vec<String>,
     pub concepts: Vec<String>,
     pub claims: Vec<Claim>,
-    /// Source artifacts this distilled note is grounded in. Wiki lint requires these to point at
-    /// vault-local evidence paths such as `raw/...`, not transient host paths.
+    /// Source artifacts this distilled note is grounded in. These point at local evidence pointers
+    /// such as `raw-witness/...#sha256=...`, not transient host paths or indexed raw transcripts.
     pub sources: Vec<String>,
     /// Ephemeral ingestion queue marker. Not part of the semantic graph; carried only so the
     /// hermes/cron worker can confirm that a specific session was remembered. May be absent.
     pub omb_session_id: Option<String>,
+    /// OKF bundle version this note targets. Emitted by the write gate; absent on legacy notes.
+    pub okf_version: Option<String>,
+    /// One-line OKF `description` (and Obsidian summary). May be absent on legacy notes.
+    pub summary: Option<String>,
+    /// Skills invoked during the session. Graph keys for skill-usage analytics.
+    pub skills: Vec<String>,
+    /// Contracts referenced or established during the session (e.g., ollama, lm-studio, graph).
+    pub contracts: Vec<String>,
+    /// Failures, blockers, or repeated errors observed during the session.
+    pub incidents: Vec<String>,
+    /// Code symbols this note is grounded in (e.g., `src/lib.rs:parse`). Used by `remember_code`
+    /// to link a note to the AST code graph.
+    pub code_symbols: Vec<String>,
 }
 
 /// One temporal fact — `(subject, predicate, value)` plus `kind` and `confidence`.
@@ -57,25 +124,60 @@ pub struct Claim {
 }
 
 impl Claim {
-    /// Normalized kind, or `"fact"` when absent/unknown.
+    /// Normalized kind, or `"fact"` when absent.
     pub fn kind(&self) -> &str {
         let k = self.kind.trim();
         if k.is_empty() { "fact" } else { k }
     }
 
-    /// Normalized confidence, or `"certain"` when absent/unknown.
+    /// Normalized confidence, or `"certain"` when absent.
     pub fn confidence(&self) -> &str {
         let c = self.confidence.trim();
         if c.is_empty() { "certain" } else { c }
     }
 }
 
+/// Canonical key for tool/concept names used by graph links and duplicate matching.
+/// Separators are not meaningful for these labels: `LM Studio`, `lm-studio`, and
+/// `lmstudio` should point at the same semantic node.
+#[must_use]
+pub fn semantic_key(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let normalized = lower
+        .replace("c++", "cpp")
+        .replace("c#", "csharp")
+        .replace(".net", "dotnet");
+    normalized
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect()
+}
+
+/// Canonical key for claim subjects and predicates. Claims remain human-readable
+/// in values/labels, but their identity should not fork on casing or spacing.
+#[must_use]
+pub fn claim_key(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let normalized = lower
+        .replace("c++", "cpp")
+        .replace("c#", "csharp")
+        .replace(".net", "dotnet");
+    normalized
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl FrontMatter {
     /// Fill empty fields via path heuristics (part of constructing the typed value).
     fn enrich(&mut self, path: &str, cfg: &config::BoringConfig) {
-        if self.source_path.is_empty() {
-            self.source_path.push_str(path);
-        }
+        path.clone_into(&mut self.source_path);
+        self.origin = self.origin.trim().to_owned();
+        self.project = self.project.trim().to_owned();
+        self.kind = self.kind.trim().to_owned();
         if self.origin.is_empty() {
             let (origin, _rule) = cfg.classify(path, None);
             self.origin.push_str(match origin {
@@ -159,7 +261,10 @@ pub fn render(front: &FrontMatter, body: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use super::{FrontMatter, parse, render};
+    use super::{
+        FrontMatter, GENERATED_BRIEF_TAG, claim_key, is_internal_eval_fixture_path, parse,
+        raw_has_generated_brief_tag, render, semantic_key,
+    };
     use crate::config::BoringConfig;
 
     fn test_cfg() -> BoringConfig {
@@ -174,6 +279,68 @@ mod tests {
         assert_eq!(fm.project, "demo");
         assert_eq!(fm.tags, vec!["rust", "rop"]);
         assert_eq!(body, "본문 시작\n둘째 줄");
+    }
+
+    #[test]
+    fn parse_uses_ingest_path_as_source_path_even_when_yaml_has_stale_value() {
+        let raw = "---\nsource_path: stale/wiki-old.md\nproject: demo\n---\n본문";
+        let (fm, body) = parse(raw, "/actual/wiki-new.md", &test_cfg()).unwrap();
+
+        assert_eq!(fm.source_path, "/actual/wiki-new.md");
+        assert_eq!(body, "본문");
+    }
+
+    #[test]
+    fn parse_trims_identity_fields_before_storage() {
+        let raw = "---\norigin: ' company '\nproject: ' demo '\nkind: ' note '\n---\n본문";
+        let (fm, body) = parse(raw, "/actual/wiki-new.md", &test_cfg()).unwrap();
+
+        assert_eq!(fm.origin, "company");
+        assert_eq!(fm.project, "demo");
+        assert_eq!(fm.kind, "note");
+        assert_eq!(body, "본문");
+    }
+
+    #[test]
+    fn parse_treats_whitespace_project_as_missing_and_derives_from_path() {
+        let raw = "---\nproject: '   '\n---\n본문";
+        let (fm, body) = parse(
+            raw,
+            "/Users/x/.claude/projects/oh-my-boring/data/notes/s.md",
+            &test_cfg(),
+        )
+        .unwrap();
+
+        assert_eq!(fm.project, "oh-my-boring");
+        assert_eq!(body, "본문");
+    }
+
+    #[test]
+    fn raw_generated_brief_tag_is_detected_without_full_parse() {
+        let raw = format!("---\ntitle: Daily\ntags:\n  - {GENERATED_BRIEF_TAG}\n---\nsummary");
+
+        assert!(raw_has_generated_brief_tag(&raw));
+        assert!(!raw_has_generated_brief_tag(
+            "---\ntitle: Source\ntags: [memory]\n---\nsource"
+        ));
+        assert!(
+            !raw_has_generated_brief_tag("---\ntags: [unclosed\n---\nbody"),
+            "malformed YAML should not be silently classified as generated"
+        );
+    }
+
+    #[test]
+    fn internal_eval_fixture_path_matches_store_boundary() {
+        assert!(is_internal_eval_fixture_path(
+            "/vault/wiki/eval-docker-layer-cache.md"
+        ));
+        assert!(is_internal_eval_fixture_path("eval-briefing.md"));
+        assert!(!is_internal_eval_fixture_path(
+            "/vault/wiki/wiki-eval-docker-layer-cache.md"
+        ));
+        assert!(!is_internal_eval_fixture_path(
+            "/vault/wiki/eval-briefing.txt"
+        ));
     }
 
     #[test]
@@ -216,5 +383,25 @@ mod tests {
         // ROP: broken frontmatter goes to Err (not a silent fallback)
         let raw = "---\norigin: [unclosed\n---\n본문";
         assert!(parse(raw, "/p.md", &test_cfg()).is_err());
+    }
+
+    #[test]
+    fn semantic_key_collapses_tool_and_concept_variants() {
+        assert_eq!(semantic_key("LM Studio"), "lmstudio");
+        assert_eq!(semantic_key("lm-studio"), "lmstudio");
+        assert_eq!(semantic_key("oh-my-boring"), "ohmyboring");
+        assert_eq!(semantic_key("c++"), "cpp");
+        assert_eq!(semantic_key("C#"), "csharp");
+        assert_eq!(semantic_key(".NET"), "dotnet");
+    }
+
+    #[test]
+    fn claim_key_collapses_casing_and_spacing() {
+        assert_eq!(claim_key("  Release   Version "), "release version");
+        assert_eq!(claim_key("release-version"), "release version");
+        assert_eq!(claim_key("release_version"), "release version");
+        assert_eq!(claim_key("OH-my  Boring"), "oh my boring");
+        assert_eq!(claim_key("c++/.NET"), "cpp dotnet");
+        assert_eq!(claim_key("브리핑 상태"), "브리핑 상태");
     }
 }

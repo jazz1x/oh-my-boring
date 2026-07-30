@@ -4,7 +4,7 @@
 //!
 //! Architecture:
 //! - Shares `Store` + `Llm` via `Arc` (the Postgres client supports concurrent use).
-//! - axum router: /health · /ask · /brief · /search · /graph · /audit · /sync
+//! - axum router: /health · /ask · /brief · /search · /code-search · /graph · /audit · /sync
 //! - Background scheduler: `BORING_SYNC_HOURS` (default 4h) interval + one immediate run at startup.
 //! - Error propagation: `AppError` → explicit HTTP status + JSON body.
 use std::path::{Path, PathBuf};
@@ -18,9 +18,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config;
+use crate::frontmatter::{is_internal_eval_fixture_path, raw_has_generated_brief_tag};
 use crate::llm::Llm;
 use crate::pii;
 use crate::store::Store;
@@ -46,8 +47,9 @@ pub struct AppState {
     pub(crate) cfg: Arc<config::BoringConfig>,
     /// Resolved path to the loaded config, so `classify_repo` writes back to the same file.
     pub(crate) cfg_path: Arc<Option<PathBuf>>,
-    /// Serializes startup, periodic, and HTTP-triggered syncs so they never overlap.
-    /// `/sync` waits for an in-flight startup sync and returns its actual outcome.
+    /// Serializes the write-maintenance lane: startup/periodic/HTTP sync plus
+    /// vector-mode `remember`/`forget` relation rewrites. `/sync` waits for an
+    /// in-flight writer and returns its actual outcome.
     pub(crate) sync_lock: Arc<Mutex<()>>,
     /// Resident wiki recall index (BORING_VECTOR=off path). Persists parsed/lowercased notes across
     /// requests; `refresh()` re-reads only mtime-changed files, so repeated `/search` (the recall hook
@@ -71,6 +73,7 @@ impl AppState {
         query: &str,
         k: usize,
         project: Option<&str>,
+        exclude_origins: &[String],
         since_hours: Option<i32>,
     ) -> Result<Vec<wiki_recall::WikiHit>> {
         let Some(dir) = self.wiki_dir() else {
@@ -82,35 +85,60 @@ impl AppState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         idx.refresh(&dir)?;
-        Ok(idx.search(query, k, project, since_hours))
+        Ok(idx.search(query, k, project, exclude_origins, since_hours))
     }
+}
+
+pub(crate) fn optional_project(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|project| !project.is_empty())
+}
+
+pub(crate) fn parse_exclude_origins(values: &[String]) -> std::result::Result<Vec<String>, String> {
+    let mut origins = Vec::new();
+    for value in values {
+        let candidate = value.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        let origin = candidate.parse::<config::Origin>()?.as_str().to_owned();
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    Ok(origins)
+}
+
+/// Input bundle for fire-and-forget query logging. Keeps `spawn_query_log` from
+/// growing an eighth positional argument and makes the call sites explicit.
+pub(crate) struct QueryLogInput {
+    pub endpoint: &'static str,
+    pub query: String,
+    pub hit_paths: Vec<String>,
+    pub sources: Vec<String>,
+    pub answer_snippet: String,
+    pub elapsed: std::time::Duration,
+    pub meta: Option<Value>,
 }
 
 /// Fire-and-forget query logging. Latency and result context are recorded for
 /// memory-utility analytics; failures are logged to stderr and never fail the request.
 #[allow(clippy::needless_borrow)] // tokio-postgres needs &&str to coerce to &dyn ToSql.
-pub(crate) fn spawn_query_log(
-    store: Option<Arc<Store>>,
-    endpoint: &'static str,
-    query: String,
-    hit_paths: Vec<String>,
-    sources: Vec<String>,
-    answer_snippet: String,
-    elapsed: std::time::Duration,
-) {
+pub(crate) fn spawn_query_log(store: Option<Arc<Store>>, input: QueryLogInput) {
     let Some(store) = store else {
         return;
     };
     tokio::spawn(async move {
-        let latency_ms = i32::try_from(elapsed.as_millis()).ok();
+        let latency_ms = i32::try_from(input.elapsed.as_millis()).ok();
+        let meta = input.meta.unwrap_or_else(|| json!({}));
         if let Err(e) = store
             .log_query(
-                &endpoint,
-                &query,
-                &hit_paths,
-                &sources,
-                &answer_snippet,
+                input.endpoint,
+                &input.query,
+                &input.hit_paths,
+                &input.sources,
+                &input.answer_snippet,
                 latency_ms,
+                &meta,
             )
             .await
         {
@@ -163,7 +191,17 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 pub(crate) struct AskReq {
     pub(crate) question: String,
     #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
+    #[serde(default)]
     pub(crate) project: Option<String>,
+    #[serde(default)]
+    pub(crate) since_hours: Option<i32>,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct BriefReq {
+    #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
     #[serde(default)]
     pub(crate) since_hours: Option<i32>,
 }
@@ -182,17 +220,19 @@ pub(crate) struct SearchReq {
     #[serde(default = "default_max_tokens")]
     pub(crate) max_tokens: usize,
     #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
+    #[serde(default)]
     pub(crate) project: Option<String>,
     #[serde(default)]
     pub(crate) since_hours: Option<i32>,
 }
 
 fn default_max_results() -> usize {
-    5
+    MCP_DEFAULT_RESULTS
 }
 
 fn default_max_tokens() -> usize {
-    2000
+    MCP_DEFAULT_TOKENS
 }
 
 #[derive(Serialize)]
@@ -210,37 +250,94 @@ pub(crate) struct SearchResp {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct GraphReq {
+pub(crate) struct CodeSearchReq {
     pub(crate) query: String,
+    #[serde(default = "default_code_search_max_symbols")]
+    pub(crate) max_symbols: usize,
+}
+
+fn default_code_search_max_symbols() -> usize {
+    CODE_SEARCH_DEFAULT_SYMBOLS
+}
+
+/// One AST code-graph symbol as returned by `/code-search`.
+#[derive(Serialize)]
+pub(crate) struct CodeSymbolHit {
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) source_path: String,
+    pub(crate) signature: String,
+}
+
+/// A wiki note linked to a matched code symbol by `remember_code` (`code_uses` edge).
+#[derive(Serialize)]
+pub(crate) struct CodeNoteHit {
+    pub(crate) source_path: String,
+    pub(crate) title: String,
+    pub(crate) snippet: String,
+    pub(crate) symbol_name: String,
+    pub(crate) symbol_path: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodeSearchResp {
+    pub(crate) hits: Vec<CodeSymbolHit>,
+    /// Notes the user deliberately linked to the matched symbols (empty until
+    /// `remember_code` is used); survives re-indexing.
+    pub(crate) notes: Vec<CodeNoteHit>,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct WeeklyReq {}
+pub(crate) struct GraphReq {
+    pub(crate) query: String,
+    #[serde(default)]
+    pub(crate) depth: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WeeklyReq {
+    #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
+    #[serde(default)]
+    pub(crate) since_hours: Option<i32>,
+    #[serde(default)]
+    pub(crate) until_hours: Option<i32>,
+}
 
 #[derive(Deserialize)]
 pub(crate) struct StatusReq {
     pub(crate) project: String,
+    #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct DecisionsReq {
     pub(crate) project: Option<String>,
+    #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct RisksReq {
     pub(crate) project: Option<String>,
+    #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct NextActionsReq {
     pub(crate) project: Option<String>,
+    #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct StalledReq {
     pub(crate) project: Option<String>,
     pub(crate) older_than_days: Option<u32>,
+    #[serde(default)]
+    pub(crate) exclude_origins: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -253,7 +350,7 @@ pub(crate) struct ContextReq {
 }
 
 fn default_context_max_items() -> usize {
-    5
+    CONTEXT_DEFAULT_ITEMS
 }
 
 #[derive(Serialize)]
@@ -391,22 +488,34 @@ pub(crate) struct HealthResp {
     /// "running" while a sync/remember/forget holds the sync lock, else "idle". Lets `make up` callers
     /// tell a still-warming corpus (empty results are expected) from a genuinely empty one.
     pub(crate) sync: SyncState,
-    /// Wiki note count (vault/wiki/*.md) — the corpus size in both modes. `null` when the vault is
-    /// unset/unreadable (kept best-effort so /health stays a liveness probe).
+    /// Source wiki note count (vault/wiki/*.md, excluding generated briefs and internal eval fixtures)
+    /// — the corpus size in both modes. `null` when the vault is unset/unreadable (kept best-effort so
+    /// /health stays a liveness probe).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_count: Option<usize>,
 }
 
-/// Best-effort count of wiki notes (`vault/wiki/*.md`). `None` on any IO error — `/health` must stay a
-/// liveness signal, so an unreadable/absent vault reports "unknown" (null), never fails the probe.
+/// Best-effort count of source wiki notes (`vault/wiki/*.md`, excluding generated briefs and internal
+/// eval fixtures). `None` on any IO error — `/health` must stay a liveness signal, so an
+/// unreadable/absent vault reports "unknown" (null), never fails the probe.
 pub(crate) fn count_wiki_notes(wiki_dir: &Path) -> Option<usize> {
     let entries = std::fs::read_dir(wiki_dir).ok()?;
-    Some(
-        entries
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
-            .count(),
-    )
+    let mut count = 0;
+    for entry in entries {
+        let path = entry.ok()?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("md") {
+            continue;
+        }
+        let source_path = path.to_string_lossy();
+        if is_internal_eval_fixture_path(source_path.as_ref()) {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path).ok()?;
+        if !raw_has_generated_brief_tag(&raw) {
+            count += 1;
+        }
+    }
+    Some(count)
 }
 
 /// The explicit rejection (not silence) that vector/graph-dependent endpoints return under `BORING_VECTOR=off`.
@@ -424,8 +533,21 @@ pub(crate) fn vec_off_rpc() -> (i32, String) {
 }
 
 /// Hard ceiling on agent-supplied recall budget to prevent token/DoS explosions.
+pub(crate) const MCP_DEFAULT_RESULTS: usize = 5;
 pub(crate) const MCP_MAX_RESULTS: usize = 50;
+pub(crate) const MCP_DEFAULT_TOKENS: usize = 2_000;
 pub(crate) const MCP_MAX_TOKENS: usize = 16_384;
+pub(crate) const CONTEXT_DEFAULT_ITEMS: usize = 5;
+pub(crate) const CONTEXT_MAX_ITEMS: usize = 20;
+pub(crate) const CODE_SEARCH_DEFAULT_SYMBOLS: usize = 5;
+pub(crate) const CODE_SEARCH_MAX_SYMBOLS: usize = 20;
+pub(crate) const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+pub(crate) fn recall_max_chars(max_tokens: usize) -> Result<usize> {
+    max_tokens
+        .checked_mul(CHARS_PER_TOKEN_ESTIMATE)
+        .ok_or_else(|| anyhow::anyhow!("recall max_tokens cannot fit character budget"))
+}
 
 // ── entry point ─────────────────────────────────────────────────────────────
 
@@ -463,7 +585,7 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
         Arc::clone(&state.cfg),
         Arc::clone(&state.sync_lock),
         Arc::clone(&last_compact),
-    );
+    )?;
     // cfg_path is only used by the HTTP/MCP handlers; the scheduler does not need it.
 
     let router = axum::Router::new()
@@ -478,6 +600,7 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
         .route("/stalled", post(http::handle_stalled))
         .route("/context", post(http::handle_context))
         .route("/search", post(http::handle_search))
+        .route("/code-search", post(http::handle_code_search))
         .route("/graph", post(http::handle_graph))
         .route("/audit", get(http::handle_audit))
         .route("/query-log", get(http::handle_query_log))
@@ -502,4 +625,85 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
     axum::serve(listener, router)
         .await
         .map_err(|e| anyhow::anyhow!("axum serve: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{
+        CHARS_PER_TOKEN_ESTIMATE, count_wiki_notes, optional_project, parse_exclude_origins,
+        recall_max_chars,
+    };
+    use crate::frontmatter::GENERATED_BRIEF_TAG;
+
+    #[test]
+    fn optional_project_trims_and_filters_empty_values() {
+        assert_eq!(optional_project(Some(" omb ")), Some("omb"));
+        assert_eq!(optional_project(Some("   ")), None);
+        assert_eq!(optional_project(None), None);
+    }
+
+    #[test]
+    fn parse_exclude_origins_trims_dedupes_and_rejects_unknown_values() {
+        let origins = vec![
+            " company ".to_owned(),
+            "company".to_owned(),
+            String::new(),
+            "mirror".to_owned(),
+        ];
+        assert_eq!(
+            parse_exclude_origins(&origins).unwrap(),
+            vec!["company".to_owned(), "mirror".to_owned()]
+        );
+
+        let invalid = vec!["work".to_owned()];
+        let err = parse_exclude_origins(&invalid).unwrap_err();
+        assert!(err.contains("invalid origin: work"));
+    }
+
+    #[test]
+    fn recall_max_chars_preserves_token_budget_estimate() {
+        assert_eq!(
+            recall_max_chars(2_000).ok(),
+            Some(2_000 * CHARS_PER_TOKEN_ESTIMATE)
+        );
+    }
+
+    #[test]
+    fn recall_max_chars_rejects_unrepresentable_budget() {
+        assert!(matches!(
+            recall_max_chars(usize::MAX),
+            Err(err)
+                if format!("{err:#}").contains("recall max_tokens cannot fit character budget")
+        ));
+    }
+
+    #[test]
+    fn health_corpus_count_excludes_generated_brief_and_eval_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wiki-0001.md"),
+            "---\ntitle: source memory\n---\nreal memory",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("daily-brief-2026-07-02.md"),
+            format!("---\ntags: [{GENERATED_BRIEF_TAG}]\n---\ngenerated summary"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("wiki-0002.md"),
+            format!("---\ntags:\n  - {GENERATED_BRIEF_TAG}\n---\ngenerated summary"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("eval-health.md"),
+            "---\ntitle: eval source\n---\neval fixture",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("scratch.txt"), "not wiki").unwrap();
+
+        assert_eq!(count_wiki_notes(dir.path()), Some(1));
+    }
 }

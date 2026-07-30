@@ -9,11 +9,13 @@
 > ([`PRINCIPLES.md`](./PRINCIPLES.md) is the earlier summary — the three documents above are the SSOT.) Below are supplementary guardrails.
 
 ## Enforcement (gated in code — Cargo.toml `[lints]` is the SSOT)
-- `unsafe_code = "forbid"` · clippy `all` / `pedantic` / `nursery` = **deny**.
+- `unsafe_code = "forbid"` · clippy `all` / `pedantic` = **deny** (`nursery` is intentionally excluded — unstable lints that false-fail on toolchain bumps).
   → **If `cargo clippy -- -D warnings` doesn't pass, no merging.** For new code this gate is the default.
 - edition **2024** · toolchain **stable** + clippy + rustfmt pinned (`rust-toolchain.toml`).
+- `make guard` is the full stack-free structural gate: `scripts/guard.sh` plus data-steward dry-run.
+- `.pre-commit-config.yaml` is a faster staged-file subset; install it with `pre-commit install`.
 - Code/file search via `rg` / `fd`. No `grep -r` / `find -name`.
-- Bypassing the pre-commit hook (`git commit --no-verify`) is **absolutely forbidden** — on failure, fix the root cause (lint/format).
+- Bypassing the pre-commit hook (`git commit --no-verify`) is **absolutely forbidden** — on failure, fix the root cause in the failing gate.
 
 ## Philosophy (principles)
 - **ROP** (Wlaschin): fallible goes on the `Result` rail. Structured error types with `thiserror`.
@@ -38,7 +40,15 @@
 
 ## Layers (current)
 ```
-main.rs (interface)  →  retrieve / ingest (use case, planned)  →  store / ollama (adapter)
+main.rs (interface)  →  retrieve / ingest (use case, planned)  →  store / llm (adapter)
                                                               ↘  frontmatter (entity, planned)
 ```
-SSOT separation: store = persistence · search, ollama = embedding · generation, frontmatter = document schema, retrieve = recall pipeline.
+SSOT separation: store = persistence · search, llm = embedding · generation over any OpenAI-compatible provider (Ollama, LM Studio, etc.), frontmatter = document schema, retrieve = recall pipeline.
+
+## Vector and graph lanes
+
+- **Vector lane** (`store::vector_search_filtered`, `store::recent_docs`) — pgvector HNSW indexes chunk embeddings. `/search` is vector-only; `/ask` starts from vector hits.
+- **Graph lane** (`store::neighbors_khop`, claim-axis reasoning) — node/edge tables plus recursive CTE give k-hop traversal without a graph DB. Edges are deterministic: they come from parsed `frontmatter` (`tools`, `concepts`, `claims`, `relates_to`), not from an LLM pass over the body.
+- **GraphRAG path** (`retrieve::related_brief_context`, `ask::answer`) — top vector hits seed graph expansion by shared tool/concept nodes; claim axes add related evidence. Related documents are scored and de-duplicated before entering the synthesis prompt. The schema is already k-hop ready; moving from recursive CTE to AGE/SurrealDB would not change the API contract.
+- **multi-hop traversal** — Implemented via recursive CTE in `store::related_docs_khop`. Default depth is 2 hops for `/ask`, `/weekly` related context, and the `/graph` endpoint; CLI/HTTP/MCP accept an explicit `depth`. Depth is interpreted as document-to-document hops (internally `2*k` edge traversals).
+- **graph reranker** — Implemented in `retrieve::rerank_by_graph`. `/ask` reranks the vector + BM25 RRF pool using shared `uses`/`about` nodes, shared claim axes, graph degree, and recency decay; the top vector hit stays anchored so the reranker cannot drift. `/search` keeps the raw RRF ranking as the external recall contract.

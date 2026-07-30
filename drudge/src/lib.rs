@@ -5,6 +5,7 @@
 //! other kernel contracts directly against a live Postgres backend.
 pub mod ask;
 pub mod audit;
+pub mod codegraph;
 pub mod config;
 pub mod frontmatter;
 pub mod graph;

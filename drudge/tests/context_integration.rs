@@ -59,6 +59,7 @@ async fn context_card_returns_structured_sections() {
         ("risk", "token noise", "risk"),
         ("has", "claims", "fact"),
         ("is", "a temporal fact", "term"),
+        ("todo", "preserve context provenance", "next"),
     ] {
         store
             .upsert_claim(&project, pred, value, &path, now(), &emb(), kind, "certain")
@@ -73,12 +74,16 @@ async fn context_card_returns_structured_sections() {
     assert_eq!(card.language, "ko");
     assert_eq!(card.decisions.len(), 1);
     assert_eq!(card.decisions[0].kind, "decision");
+    assert_eq!(card.decisions[0].source_path.as_str(), path.as_str());
     assert_eq!(card.risks.len(), 1);
     assert_eq!(card.risks[0].kind, "risk");
     assert_eq!(card.facts.len(), 1);
     assert_eq!(card.facts[0].kind, "fact");
     assert_eq!(card.glossary.len(), 1);
     assert_eq!(card.glossary[0].kind, "term");
+    assert_eq!(card.next_actions.len(), 1);
+    assert_eq!(card.next_actions[0].kind, "next");
+    assert_eq!(card.next_actions[0].source_path.as_str(), path.as_str());
 
     store.delete_document(&path).await.expect("cleanup");
 }
@@ -182,7 +187,12 @@ async fn context_card_excludes_origins() {
         .await
         .expect("personal only");
     assert_eq!(personal_only.decisions.len(), 1);
-    assert_eq!(personal_only.decisions[0].predicate, "personal-decision");
+    // Predicates are stored in canonical claim-key form (punctuation → spaces).
+    assert_eq!(personal_only.decisions[0].predicate, "personal decision");
+    assert_eq!(
+        personal_only.decisions[0].source_path.as_str(),
+        p_path.as_str()
+    );
 
     store.delete_document(&p_path).await.expect("cleanup p");
     store.delete_document(&c_path).await.expect("cleanup c");

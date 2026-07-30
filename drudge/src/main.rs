@@ -30,8 +30,12 @@ enum Cmd {
     Ask { question: String },
     /// Recency-first briefing — recency (updated_at) retrieval + supersede synthesis (morning briefing)
     Brief,
-    /// Graph-expanded retrieval — vector hits → graph (edge) 1-hop neighbors
-    Graph { query: String },
+    /// Graph-expanded retrieval — vector hits → graph (edge) k-hop neighbors
+    Graph {
+        query: String,
+        #[arg(short, long, default_value = "2")]
+        depth: usize,
+    },
     /// Deterministic re-ingest: walk → embed → upsert → graph (from frontmatter) → relations
     Sync,
     /// Delete orphan semantic nodes (remove edge-unreferenced legacy remnants)
@@ -44,6 +48,16 @@ enum Cmd {
         #[arg(long)]
         vault: Option<String>,
     },
+    /// Code indexing — full-refresh the AST code graph from current sources (tree-sitter)
+    CodeIndex {
+        /// repo root to index (default: current directory)
+        #[arg(long, default_value = ".")]
+        root: String,
+        /// Replace the graph even when the walk shares no files with the indexed one
+        /// (the wrong-root footgun guard). Required for intentional root changes.
+        #[arg(long)]
+        force: bool,
+    },
     /// HTTP resident daemon — ingest/ask/graph/audit API + background scheduler
     Serve,
     /// Maintenance compact — VACUUM/ANALYZE + REINDEX + prune old query_log + GC orphans
@@ -51,6 +65,15 @@ enum Cmd {
     /// Recent query/retrieval log (memory usage analytics)
     QueryLog {
         #[arg(short, long, default_value = "50")]
+        limit: i64,
+    },
+    /// Repeated code-lane queries from query_log — what the agent keeps forgetting
+    CodeHotspots {
+        #[arg(long, default_value = "30")]
+        days: i64,
+        #[arg(long, default_value = "2")]
+        min_count: i64,
+        #[arg(short, long, default_value = "20")]
         limit: i64,
     },
     /// Personal vault lint/audit/maintenance
@@ -79,6 +102,15 @@ enum VaultCmd {
         /// Treat warnings as errors too (exit 2)
         #[arg(long)]
         strict: bool,
+    },
+    /// Add OKF v0.1 fields (type/description/timestamp/skills/contracts/incidents) to legacy wiki notes
+    MigrateOkf {
+        /// vault root path (default: $PWD/vault)
+        #[arg(long)]
+        vault: Option<String>,
+        /// Show what would change without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -187,7 +219,7 @@ async fn main() -> Result<()> {
         Cmd::Search { query } => {
             let store = store.as_ref().context(VEC_OFF)?;
             let ol = llm::Llm::from_config(&cfg);
-            let hits = retrieve::retrieve(store, &ol, &query, 5, &[], None, None).await?;
+            let hits = retrieve::retrieve(store, &ol, &query, 5, &[], None, None, false).await?;
             println!("'{query}' → {} hits", hits.len());
             for h in &hits {
                 let snip: String = h.content.chars().take(50).collect();
@@ -202,7 +234,7 @@ async fn main() -> Result<()> {
         Cmd::Brief => {
             let store = store.as_ref().context(VEC_OFF)?;
             let ol = llm::Llm::from_config(&cfg);
-            let out = ask::brief(store, &ol, &[], cfg.note_lang.as_str()).await?;
+            let out = ask::brief(store, &ol, &[], cfg.note_lang.as_str(), None).await?;
             println!("{}\n", out.answer);
             if !out.sources.is_empty() {
                 println!("sources:");
@@ -211,10 +243,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Graph { query } => {
+        Cmd::Graph { query, depth } => {
             let store = store.as_ref().context(VEC_OFF)?;
             let ol = llm::Llm::from_config(&cfg);
-            graph::run(store, &ol, &query).await?;
+            graph::run(store, &ol, &query, depth).await?;
         }
         Cmd::Sync => {
             let store = store.as_ref().context(VEC_OFF)?;
@@ -259,6 +291,63 @@ async fn main() -> Result<()> {
                 });
             let n = vault::project_links(store, std::path::Path::new(&vault_root), 6).await?;
             println!("graph→obsidian: updated relates_to of {n} wiki notes");
+        }
+        Cmd::CodeIndex { root, force } => {
+            let store = store.as_ref().context(VEC_OFF)?;
+            if !cfg.code_index.enabled {
+                println!("code indexing disabled — set code_index.enabled in boring.json");
+                return Ok(());
+            }
+            let stats = drudge::codegraph::ingest::walk_directory(
+                std::path::Path::new(&root),
+                &cfg.code_index,
+            )?;
+            if stats.symbols.is_empty() {
+                // Refuse to wipe on an empty walk — a wrong --root would otherwise
+                // delete the whole code graph (full-refresh semantics below).
+                println!(
+                    "code-index: no symbols found under {root} — existing graph untouched (check --root/config)"
+                );
+                return Ok(());
+            }
+            // Wrong-root guard: replacing the graph with a walk that shares NO files
+            // with the indexed one is almost always a mistake (e.g. --root data/eval/...
+            // instead of the repo root). Require --force for intentional root changes.
+            let existing_files = store.code_indexed_files().await?;
+            if !force && !existing_files.is_empty() {
+                let new_files: std::collections::BTreeSet<&str> = stats
+                    .symbols
+                    .iter()
+                    .map(|s| s.source_path.as_str())
+                    .collect();
+                if !new_files.iter().any(|f| existing_files.contains(*f)) {
+                    anyhow::bail!(
+                        "code-index: walk under {root} shares no files with the indexed graph \
+                         ({} files) — refusing to replace it. Pass --force if this root change \
+                         is intentional.",
+                        existing_files.len()
+                    );
+                }
+            }
+            // Full refresh: replace the graph with this walk's result (stale symbols of
+            // renamed/deleted files disappear); doc→code note edges survive and re-attach.
+            store.clear_code_graph_preserving_doc_edges().await?;
+            for symbol in &stats.symbols {
+                store.upsert_code_symbol(symbol).await?;
+            }
+            for relation in &stats.relations {
+                store.upsert_code_relation(relation).await?;
+            }
+            let note_edges_gc = store.gc_dangling_code_note_edges().await?;
+            println!(
+                "code-index: files={} symbols={} relations={} skipped={} errors={} note_edges_gc={}",
+                stats.files_parsed,
+                stats.symbols_upserted,
+                stats.relations_upserted,
+                stats.files_skipped,
+                stats.parse_errors,
+                note_edges_gc,
+            );
         }
         Cmd::Gc => {
             let store = store.as_ref().context(VEC_OFF)?;
@@ -311,6 +400,34 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Cmd::CodeHotspots {
+            days,
+            min_count,
+            limit,
+        } => {
+            let store = store.as_ref().context(VEC_OFF)?;
+            let rows = store
+                .repeated_queries(
+                    days.clamp(1, 365),
+                    min_count.clamp(2, 100),
+                    limit.clamp(1, 100),
+                )
+                .await?;
+            let code_rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| retrieve::is_code_query(&r.query))
+                .collect();
+            if code_rows.is_empty() {
+                println!("no repeated code queries in the window — nothing forgotten yet");
+                return Ok(());
+            }
+            for r in code_rows {
+                println!("{}× {:?}", r.count, r.query);
+                for line in retrieve::code_context(store, &r.query, 3, 120).await? {
+                    println!("    → {line}");
+                }
+            }
+        }
         Cmd::Vault { sub } => {
             let default_vault = format!(
                 "{}/oh-my-boring/vault",
@@ -330,6 +447,16 @@ async fn main() -> Result<()> {
                     let vault_root = std::path::PathBuf::from(vault.unwrap_or(default_vault));
                     let code = vault::run_audit(&vault_root, strict)?;
                     std::process::exit(code);
+                }
+                VaultCmd::MigrateOkf { vault, dry_run } => {
+                    drop(store);
+                    let vault_root = std::path::PathBuf::from(vault.unwrap_or(default_vault));
+                    let (examined, changed) = vault::run_migrate_okf(&vault_root, dry_run)?;
+                    println!("migrate-okf: examined {examined} notes, changed {changed} notes");
+                    if dry_run {
+                        println!("(dry-run — no files were modified)");
+                    }
+                    std::process::exit(0);
                 }
             }
         }

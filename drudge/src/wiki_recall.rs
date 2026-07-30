@@ -14,11 +14,18 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
+use crate::config;
+use crate::frontmatter::{is_internal_eval_fixture_path, raw_has_generated_brief_tag};
+
+const SECONDS_PER_HOUR: u64 = 3_600;
+
 /// A single retrieval result (minimal fields compatible with the vector path's hit).
 #[derive(Debug, Clone)]
 pub struct WikiHit {
     pub id: String,
     pub title: String,
+    pub origin: String,
+    pub project: String,
     pub source_path: String,
     pub snippet: String,
     pub score: f32,
@@ -113,12 +120,16 @@ fn snippet_around(text: &str, pos: usize) -> String {
     }
 }
 
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    content.strip_prefix("---\n").and_then(|rest| {
+        rest.find("\n---\n")
+            .map(|end| (&rest[..end], &rest[end + 5..]))
+    })
+}
+
 /// Split `--- yaml ---\nbody` + extract the title from frontmatter. If absent, the first `# ` heading, and failing that the stem. Pure.
 fn extract_title_body<'a>(content: &'a str, stem: &str) -> (String, &'a str) {
-    let (yaml, body) = content
-        .strip_prefix("---\n")
-        .and_then(|rest| rest.find("\n---\n").map(|e| (&rest[..e], &rest[e + 5..])))
-        .unwrap_or(("", content));
+    let (yaml, body) = split_frontmatter(content).unwrap_or(("", content));
     if let Some(line) = yaml.lines().find(|l| l.trim_start().starts_with("title:")) {
         let t = line
             .split_once(':')
@@ -135,18 +146,36 @@ fn extract_title_body<'a>(content: &'a str, stem: &str) -> (String, &'a str) {
     (stem.to_owned(), body)
 }
 
-/// Extract `project:` from the YAML frontmatter, if present. Pure.
-fn extract_project(content: &str) -> String {
-    content
-        .strip_prefix("---\n")
-        .and_then(|rest| rest.find("\n---\n").map(|e| &rest[..e]))
+/// Extract a scalar frontmatter field by key, if present. Pure.
+fn extract_frontmatter_scalar(content: &str, key: &str) -> String {
+    split_frontmatter(content)
+        .map(|(yaml, _body)| yaml)
         .and_then(|yaml| {
             yaml.lines()
-                .find(|l| l.trim_start().starts_with("project:"))
+                .find(|l| l.trim_start().starts_with(key))
                 .and_then(|l| l.split_once(':'))
                 .map(|(_, v)| v.trim().trim_matches('"').to_owned())
         })
         .unwrap_or_default()
+}
+
+fn extract_origin(content: &str) -> Result<config::Origin> {
+    let origin = extract_frontmatter_scalar(content, "origin:");
+    if origin.is_empty() {
+        return Ok(config::Origin::Personal);
+    }
+    origin.parse::<config::Origin>().map_err(anyhow::Error::msg)
+}
+
+fn extract_project(content: &str) -> String {
+    extract_frontmatter_scalar(content, "project:")
+}
+
+fn file_modified_time(path: &Path) -> Result<SystemTime> {
+    std::fs::metadata(path)
+        .with_context(|| format!("stat wiki mtime: {}", path.display()))?
+        .modified()
+        .with_context(|| format!("read wiki mtime: {}", path.display()))
 }
 
 /// One parsed wiki note, cached in lowercased form for scoring. `mtime` keys incremental refresh.
@@ -154,6 +183,7 @@ struct CachedDoc {
     id: String,
     title: String, // raw (for display); lowercased forms below are what scoring reads
     source_path: String,
+    origin: config::Origin,
     project: String,
     title_lower: String,
     body_lower: String,
@@ -184,23 +214,33 @@ impl WikiIndex {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
+            let source_path = path.to_string_lossy().into_owned();
+            if is_internal_eval_fixture_path(&source_path) {
+                self.docs.remove(&path);
+                continue;
+            }
             seen.insert(path.clone());
-            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let mtime = file_modified_time(&path)?;
             // Up-to-date cache entry → skip the expensive read+parse.
-            if let Some(mt) = mtime
-                && self.docs.get(&path).is_some_and(|c| c.mtime == mt)
-            {
+            if self.docs.get(&path).is_some_and(|c| c.mtime == mtime) {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&path) else {
+                self.docs.remove(&path);
                 continue; // skip on read failure (graceful)
             };
+            if raw_has_generated_brief_tag(&content) {
+                self.docs.remove(&path);
+                continue;
+            }
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_owned();
             let (title, body) = extract_title_body(&content, &stem);
+            let origin = extract_origin(&content)
+                .with_context(|| format!("parse wiki origin: {}", path.display()))?;
             let project = extract_project(&content);
             self.docs.insert(
                 path.clone(),
@@ -209,9 +249,10 @@ impl WikiIndex {
                     title_lower: title.to_lowercase(),
                     body_lower: body.to_lowercase(),
                     title,
-                    source_path: path.to_string_lossy().into_owned(),
+                    source_path,
+                    origin,
                     project,
-                    mtime: mtime.unwrap_or_else(SystemTime::now),
+                    mtime,
                 },
             );
         }
@@ -227,6 +268,7 @@ impl WikiIndex {
         query: &str,
         k: usize,
         project: Option<&str>,
+        exclude_origins: &[String],
         since_hours: Option<i32>,
     ) -> Vec<WikiHit> {
         let terms = query_terms(query);
@@ -234,26 +276,26 @@ impl WikiIndex {
             return Vec::new();
         }
         let cutoff = since_hours.map(|h| {
-            let hours = i64::from(h).max(0);
-            let secs = u64::try_from(hours.saturating_mul(3600)).unwrap_or(0);
+            let hours = u64::from(h.max(0).unsigned_abs());
+            let secs = hours * SECONDS_PER_HOUR;
             SystemTime::now() - std::time::Duration::from_secs(secs)
         });
         let mut hits: Vec<WikiHit> = self
             .docs
             .values()
             .filter(|d| {
-                if let Some(p) = project {
-                    return d.project == p;
-                }
-                if let Some(cutoff) = cutoff {
-                    return d.mtime >= cutoff;
-                }
-                true
+                project.is_none_or(|project| d.project == project)
+                    && !exclude_origins
+                        .iter()
+                        .any(|origin| origin == d.origin.as_str())
+                    && cutoff.is_none_or(|cutoff| d.mtime >= cutoff)
             })
             .filter_map(|d| {
                 score_lower(&d.title_lower, &d.body_lower, &terms).map(|(score, snippet)| WikiHit {
                     id: d.id.clone(),
                     title: d.title.clone(),
+                    origin: d.origin.as_str().to_owned(),
+                    project: d.project.clone(),
                     source_path: d.source_path.clone(),
                     snippet,
                     score,
@@ -262,8 +304,8 @@ impl WikiIndex {
             .collect();
         hits.sort_by(|a, b| {
             b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.score)
+                .then_with(|| a.source_path.cmp(&b.source_path))
         });
         hits.truncate(k);
         hits
@@ -278,11 +320,43 @@ pub fn recall(
     query: &str,
     k: usize,
     project: Option<&str>,
+    exclude_origins: &[String],
     since_hours: Option<i32>,
 ) -> Result<Vec<WikiHit>> {
     let mut index = WikiIndex::default();
     index.refresh(wiki_dir)?;
-    Ok(index.search(query, k, project, since_hours))
+    Ok(index.search(query, k, project, exclude_origins, since_hours))
+}
+
+#[must_use]
+pub(crate) fn trim_hits_to_budget(
+    hits: Vec<WikiHit>,
+    max_results: usize,
+    max_chars: usize,
+) -> Vec<WikiHit> {
+    if max_results == 0 || max_chars == 0 {
+        return Vec::new();
+    }
+    let per_hit_cap = max_chars / max_results;
+    let mut budget = max_chars;
+    let mut out = Vec::new();
+    for mut hit in hits {
+        if out.len() >= max_results {
+            break;
+        }
+        let take = per_hit_cap.min(budget);
+        if take == 0 {
+            break;
+        }
+        let cut = hit.snippet.chars().take(take).collect::<String>();
+        if cut.is_empty() {
+            continue;
+        }
+        budget -= cut.chars().count();
+        hit.snippet = cut;
+        out.push(hit);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -293,7 +367,53 @@ mod tests {
         clippy::panic,
         clippy::float_cmp
     )]
-    use super::{WikiIndex, count_occurrences, extract_title_body, query_terms, score_doc};
+    use super::{
+        WikiHit, WikiIndex, count_occurrences, extract_title_body, file_modified_time, query_terms,
+        score_doc, trim_hits_to_budget,
+    };
+    use crate::frontmatter::GENERATED_BRIEF_TAG;
+
+    fn hit(id: &str, snippet: &str) -> WikiHit {
+        WikiHit {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            origin: "personal".to_owned(),
+            project: "omb".to_owned(),
+            source_path: format!("vault/wiki/{id}.md"),
+            snippet: snippet.to_owned(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn wiki_recall_budget_trims_each_hit_and_total_results() {
+        let out = trim_hits_to_budget(
+            vec![
+                hit("a", "abcdefghijk"),
+                hit("b", "1234567890"),
+                hit("c", "extra"),
+            ],
+            2,
+            10,
+        );
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].snippet, "abcde");
+        assert_eq!(out[1].snippet, "12345");
+        assert_eq!(
+            out.iter().map(|h| h.snippet.chars().count()).sum::<usize>(),
+            10
+        );
+    }
+
+    #[test]
+    fn wiki_recall_budget_uses_character_counts_not_bytes() {
+        let out = trim_hits_to_budget(vec![hit("ko", "가나다라마바")], 1, 4);
+
+        assert_eq!(out[0].snippet, "가나다라");
+        assert_eq!(out[0].snippet.len(), 12);
+        assert_eq!(out[0].snippet.chars().count(), 4);
+    }
 
     #[test]
     fn wiki_index_refresh_is_incremental_and_honest() {
@@ -314,10 +434,10 @@ mod tests {
         let mut idx = WikiIndex::default();
         idx.refresh(dir.path()).unwrap();
         // search hits the right note by content
-        let hits = idx.search("docker layer", 5, None, None);
+        let hits = idx.search("docker layer", 5, None, &[], None);
         assert_eq!(hits.first().map(|h| h.id.as_str()), Some("wiki-0001"));
         assert!(
-            idx.search("clients", 5, None, None)
+            idx.search("clients", 5, None, &[], None)
                 .iter()
                 .any(|h| h.id == "wiki-0002")
         );
@@ -332,12 +452,12 @@ mod tests {
         filetime_set(&p("wiki-0001.md"), future);
         idx.refresh(dir.path()).unwrap();
         assert!(
-            idx.search("kubernetes oomkilled", 5, None, None)
+            idx.search("kubernetes oomkilled", 5, None, &[], None)
                 .iter()
                 .any(|h| h.id == "wiki-0001")
         );
         assert!(
-            idx.search("layer caching", 5, None, None).is_empty(),
+            idx.search("layer caching", 5, None, &[], None).is_empty(),
             "stale body must be gone"
         );
 
@@ -345,9 +465,45 @@ mod tests {
         std::fs::remove_file(p("wiki-0002.md")).unwrap();
         idx.refresh(dir.path()).unwrap();
         assert!(
-            idx.search("clients", 5, None, None).is_empty(),
+            idx.search("clients", 5, None, &[], None).is_empty(),
             "removed note must not be recalled"
         );
+    }
+
+    #[test]
+    fn refresh_drops_cached_note_when_path_becomes_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        let note_path = p("wiki-0001.md");
+        std::fs::write(&note_path, "---\ntitle: cached\n---\nstale body").unwrap();
+
+        let mut idx = WikiIndex::default();
+        idx.refresh(dir.path()).unwrap();
+        assert_eq!(
+            idx.search("stale body", 5, None, &[], None)
+                .first()
+                .map(|h| h.id.as_str()),
+            Some("wiki-0001")
+        );
+
+        std::fs::remove_file(&note_path).unwrap();
+        std::fs::create_dir(&note_path).unwrap();
+        idx.refresh(dir.path()).unwrap();
+
+        assert!(
+            idx.search("stale body", 5, None, &[], None).is_empty(),
+            "unreadable wiki path must drop the stale cached document"
+        );
+    }
+
+    #[test]
+    fn file_modified_time_reports_missing_wiki_path_without_now_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.md");
+
+        let err = file_modified_time(&missing).unwrap_err();
+
+        assert!(format!("{err:#}").contains("stat wiki mtime"), "{err:#}");
     }
 
     // Set mtime without an extra dep: write via std then bump using a second write is unreliable, so
@@ -374,10 +530,138 @@ mod tests {
 
         let mut idx = WikiIndex::default();
         idx.refresh(dir.path()).unwrap();
-        let hits = idx.search("tips", 5, Some("omb"), None);
+        let hits = idx.search("tips", 5, Some("omb"), &[], None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "wiki-0001");
-        assert!(idx.search("tips", 5, Some("kb-rag-bot"), None).is_empty());
+        assert!(
+            idx.search("tips", 5, Some("kb-rag-bot"), &[], None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_filters_by_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        std::fs::write(
+            p("wiki-0001.md"),
+            "---\ntitle: personal loop\norigin: personal\nproject: omb\n---\nshared loop content",
+        )
+        .unwrap();
+        std::fs::write(
+            p("wiki-0002.md"),
+            "---\ntitle: company loop\norigin: company\nproject: omb\n---\nshared loop content",
+        )
+        .unwrap();
+
+        let mut idx = WikiIndex::default();
+        idx.refresh(dir.path()).unwrap();
+        let all = idx.search("shared loop", 5, Some("omb"), &[], None);
+        assert_eq!(all.len(), 2);
+
+        let exclude_company = vec!["company".to_owned()];
+        let hits = idx.search("shared loop", 5, Some("omb"), &exclude_company, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "wiki-0001");
+        assert_eq!(hits[0].origin, "personal");
+        assert_eq!(hits[0].project, "omb");
+    }
+
+    #[test]
+    fn search_tie_breaks_equal_scores_by_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        std::fs::write(
+            p("wiki-0002.md"),
+            "---\ntitle: tie\nproject: omb\n---\nshared token",
+        )
+        .unwrap();
+        std::fs::write(
+            p("wiki-0001.md"),
+            "---\ntitle: tie\nproject: omb\n---\nshared token",
+        )
+        .unwrap();
+
+        let mut idx = WikiIndex::default();
+        idx.refresh(dir.path()).unwrap();
+        let hits = idx.search("shared token", 5, Some("omb"), &[], None);
+
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].score == hits[1].score);
+        assert!(hits[0].source_path < hits[1].source_path);
+        assert_eq!(hits[0].id, "wiki-0001");
+        assert_eq!(hits[1].id, "wiki-0002");
+    }
+
+    #[test]
+    fn search_treats_missing_origin_as_personal() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        std::fs::write(
+            p("wiki-0001.md"),
+            "---\ntitle: legacy loop\nproject: omb\n---\nlegacy loop content",
+        )
+        .unwrap();
+
+        let mut idx = WikiIndex::default();
+        idx.refresh(dir.path()).unwrap();
+        let hits = idx.search("legacy loop", 5, Some("omb"), &[], None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].origin, "personal");
+
+        let exclude_personal = vec!["personal".to_owned()];
+        assert!(
+            idx.search("legacy loop", 5, Some("omb"), &exclude_personal, None)
+                .is_empty(),
+            "legacy notes without origin must not bypass personal-only exclusion"
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_invalid_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        std::fs::write(
+            p("wiki-0001.md"),
+            "---\ntitle: bad origin\norigin: workplace\nproject: omb\n---\ncontent",
+        )
+        .unwrap();
+
+        let mut idx = WikiIndex::default();
+        let err = idx.refresh(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parse wiki origin"));
+        assert!(msg.contains("invalid origin: workplace"));
+    }
+
+    #[test]
+    fn search_excludes_generated_briefs_and_eval_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        std::fs::write(
+            p("wiki-0001.md"),
+            "---\ntitle: source loop contract\nproject: omb\n---\nloop contract source memory",
+        )
+        .unwrap();
+        std::fs::write(
+            p("daily-brief-2026-07-02.md"),
+            format!(
+                "---\ntitle: generated loop contract\nproject: omb\ntags: [{GENERATED_BRIEF_TAG}]\n---\nloop contract generated summary"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            p("eval-loop-contract.md"),
+            "---\ntitle: eval loop contract\nproject: omb\n---\nloop contract eval fixture",
+        )
+        .unwrap();
+
+        let mut idx = WikiIndex::default();
+        idx.refresh(dir.path()).unwrap();
+        let hits = idx.search("loop contract", 5, Some("omb"), &[], None);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "wiki-0001");
     }
 
     #[test]
@@ -402,7 +686,38 @@ mod tests {
 
         let mut idx = WikiIndex::default();
         idx.refresh(dir.path()).unwrap();
-        let hits = idx.search("content", 5, None, Some(24));
+        let hits = idx.search("content", 5, None, &[], Some(24));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "wiki-0001");
+    }
+
+    #[test]
+    fn search_combines_project_and_since_filters() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        std::fs::write(
+            p("wiki-0001.md"),
+            "---\ntitle: recent omb\nproject: omb\n---\nshared content",
+        )
+        .unwrap();
+        std::fs::write(
+            p("wiki-0002.md"),
+            "---\ntitle: old omb\nproject: omb\n---\nshared content",
+        )
+        .unwrap();
+        std::fs::write(
+            p("wiki-0003.md"),
+            "---\ntitle: recent other\nproject: other\n---\nshared content",
+        )
+        .unwrap();
+        let old = SystemTime::now() - Duration::from_hours(48);
+        filetime_set(&p("wiki-0002.md"), old);
+
+        let mut idx = WikiIndex::default();
+        idx.refresh(dir.path()).unwrap();
+        let hits = idx.search("content", 5, Some("omb"), &[], Some(24));
+
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "wiki-0001");
     }

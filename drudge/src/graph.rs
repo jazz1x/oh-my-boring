@@ -1,5 +1,5 @@
-//! Graph — project/topic edge + vector-hit → graph 1-hop expansion recall.
-//! "find by vector → one hop by graph": pgvector entry + node/edge recursive CTE expansion.
+//! Graph — project/topic edge + vector-hit → graph k-hop expansion recall.
+//! "find by vector → k hops by graph": pgvector entry + node/edge recursive CTE expansion.
 //!
 //! Cross-reference: design decision D2 (deterministic graph) · ENFORCEMENT.md §B (one-way flow).
 //!
@@ -20,7 +20,7 @@ pub struct GraphOut {
 
 /// Pure logic: graph recall → returns `GraphOut`. No I/O.
 /// If there is no vector hit, returns a `GraphOut` whose `hit` is an empty string.
-pub async fn query(store: &Store, llm: &Llm, q: &str) -> Result<GraphOut> {
+pub async fn query(store: &Store, llm: &Llm, q: &str, depth: usize) -> Result<GraphOut> {
     let qe = llm.embed(q).await?;
     let hits = store.vector_search(&qe, 1).await?;
     let Some(top) = hits.into_iter().next() else {
@@ -33,18 +33,22 @@ pub async fn query(store: &Store, llm: &Llm, q: &str) -> Result<GraphOut> {
 
     let hit = format!("{} ({})", top.source_path, top.project);
 
-    let raw_neighbors = store.graph_neighbors(&top.id).await?;
+    let raw_neighbors = store
+        .related_docs_khop(&top.source_path, depth.max(1), 20)
+        .await?;
     let mut seen = HashSet::new();
     let graph_neighbors: Vec<String> = raw_neighbors
         .into_iter()
         .filter(|n| n != &top.source_path && seen.insert(n.clone()))
         .collect();
 
-    let raw_sem = store.semantic_neighbors(&top.id).await?;
+    let raw_sem = store
+        .claim_related_docs_khop(&top.source_path, depth.max(1), 20)
+        .await?;
     let mut seen2 = HashSet::new();
     let semantic_neighbors: Vec<String> = raw_sem
         .into_iter()
-        .filter(|n| seen2.insert(n.clone()))
+        .filter(|n| n != &top.source_path && seen2.insert(n.clone()))
         .collect();
 
     Ok(GraphOut {
@@ -55,21 +59,21 @@ pub async fn query(store: &Store, llm: &Llm, q: &str) -> Result<GraphOut> {
 }
 
 /// CLI shell: call `query()` then print to stdout.
-pub async fn run(store: &Store, llm: &Llm, q: &str) -> Result<()> {
+pub async fn run(store: &Store, llm: &Llm, q: &str, depth: usize) -> Result<()> {
     let gs = store.graph_stats().await?;
     println!(
         "graph: documents {} · chunks {} · project {} · topic {} · edges {}\n",
         gs.documents, gs.chunks, gs.projects, gs.topics, gs.edges
     );
 
-    let out = query(store, llm, q).await?;
+    let out = query(store, llm, q, depth).await?;
     if out.hit.is_empty() {
         println!("no vector hit");
         return Ok(());
     }
     println!("vector top-1: {}", out.hit);
 
-    println!("\ngraph 1-hop neighbors (same project, single-query traversal):");
+    println!("\ngraph {depth}-hop neighbors (same project, recursive traversal):");
     if out.graph_neighbors.is_empty() {
         println!("  (no neighbors)");
     } else {

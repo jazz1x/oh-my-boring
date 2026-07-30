@@ -167,6 +167,35 @@ pub fn allocate_wiki_path(
     }
 }
 
+/// Persist a brand-new wiki note without publishing an empty or half-written `wiki-NNNN.md`.
+///
+/// The final path is created with an atomic no-overwrite publish, so concurrent `remember` calls
+/// race by retrying the next id instead of exposing a placeholder file to recall/sync readers.
+pub fn persist_new_wiki_note(
+    wiki_dir: &Path,
+    db_ids: Option<&HashSet<u32>>,
+    mut front: FrontMatter,
+    body: &str,
+) -> Result<(String, PathBuf, FrontMatter)> {
+    std::fs::create_dir_all(wiki_dir)
+        .with_context(|| format!("failed to create wiki dir: {}", wiki_dir.display()))?;
+    let mut n = next_wiki_id(wiki_dir, db_ids)?;
+    loop {
+        let wiki_id = format!("wiki-{n:04}");
+        let path = wiki_dir.join(format!("{wiki_id}.md"));
+        front.source_path = path.to_string_lossy().into_owned();
+        let content = render_wiki_note(&wiki_id, &front, body)?;
+        match crate::vault::write_new_atomic(&path, content) {
+            Ok(()) => return Ok((wiki_id, path, front)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("failed to write wiki note: {}", path.display())));
+            }
+        }
+    }
+}
+
 /// Render a remember-note into wiki `.md` content (pure). Frontmatter satisfies the lint schema
 /// (id·title·kind·origin·date) AND carries the agent-curated semantic fields (tags·tools·concepts·claims)
 /// so a disk re-ingest rebuilds the same graph deterministically. `relates_to` starts `[]` and is filled
@@ -178,10 +207,15 @@ pub fn render_wiki_note(wiki_id: &str, front: &FrontMatter, body: &str) -> Resul
     struct Fm<'a> {
         id: &'a str,
         title: &'a str,
+        /// OKF required `type` — omb's `kind` mapped at render time.
+        #[serde(rename = "type")]
+        okf_type: &'a str,
         kind: &'a str,
         origin: &'a str,
         project: &'a str,
         date: &'a str,
+        /// OKF recommended ISO-8601 timestamp derived from `date`.
+        timestamp: String,
         tags: &'a [String],
         tools: &'a [String],
         concepts: &'a [String],
@@ -193,6 +227,26 @@ pub fn render_wiki_note(wiki_id: &str, front: &FrontMatter, body: &str) -> Resul
         /// notes and manual remembers → skipped, keeping their frontmatter unchanged.
         #[serde(skip_serializing_if = "Option::is_none")]
         omb_session_id: Option<&'a str>,
+        /// OKF bundle version this note targets.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        okf_version: Option<&'a str>,
+        /// OKF recommended one-line description. Stored as `summary` internally.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'a str>,
+        /// Skills invoked during the session.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        skills: &'a Vec<String>,
+        /// Contracts referenced or established during the session.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        contracts: &'a Vec<String>,
+        /// Failures, blockers, or repeated errors observed during the session.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        incidents: &'a Vec<String>,
+        /// Code symbols this note is grounded in (`path:symbol`). Declarative record of
+        /// the doc→code `code_uses` link: keeps the note self-describing and lets an
+        /// in-place dedupe rewrite accumulate symbols instead of dropping them.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        code_symbols: &'a Vec<String>,
     }
     let title = front.title.as_deref().unwrap_or(wiki_id);
     let kind = if front.kind.is_empty() {
@@ -200,13 +254,23 @@ pub fn render_wiki_note(wiki_id: &str, front: &FrontMatter, body: &str) -> Resul
     } else {
         front.kind.as_str()
     };
+    let description = front.summary.as_deref().or_else(|| {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.lines().next().unwrap_or(trimmed).trim())
+        }
+    });
     let fm = Fm {
         id: wiki_id,
         title,
+        okf_type: kind,
         kind,
         origin: &front.origin,
         project: &front.project,
         date: &front.date,
+        timestamp: format!("{}T00:00:00Z", front.date),
         tags: &front.tags,
         tools: &front.tools,
         concepts: &front.concepts,
@@ -214,6 +278,12 @@ pub fn render_wiki_note(wiki_id: &str, front: &FrontMatter, body: &str) -> Resul
         relates_to: Vec::new(),
         sources: &front.sources,
         omb_session_id: front.omb_session_id.as_deref(),
+        okf_version: front.okf_version.as_deref().or(Some("0.1")),
+        description,
+        skills: &front.skills,
+        contracts: &front.contracts,
+        incidents: &front.incidents,
+        code_symbols: &front.code_symbols,
     };
     let yaml = serde_yaml::to_string(&fm).context("failed to serialize wiki frontmatter YAML")?;
     Ok(format!("---\n{yaml}---\n{}\n", body.trim_end()))
@@ -367,8 +437,9 @@ mod tests {
         assert!(!out.contains("omb_session_id"), "{out}");
 
         // present → persisted as provenance, and the note round-trips through YAML parse
+        let source = "raw-witness/codex/20260703/sess-abc123.jsonl#sha256=abc123".to_owned();
         front.omb_session_id = Some("sess-abc123".to_owned());
-        front.sources = vec!["raw/session-manifests/sess-abc123.md".to_owned()];
+        front.sources = vec![source.clone()];
         let out = render_wiki_note("wiki-0042", &front, "body").unwrap();
         assert!(out.contains("omb_session_id: sess-abc123"), "{out}");
         let (yaml, _) = split_frontmatter(&out).expect("frontmatter splits");
@@ -379,8 +450,43 @@ mod tests {
         );
         assert_eq!(
             parsed["sources"][0],
-            serde_yaml::Value::from("raw/session-manifests/sess-abc123.md")
+            serde_yaml::Value::from(source.as_str())
         );
+
+        let (frontmatter, _) = crate::frontmatter::parse(
+            &out,
+            "/tmp/vault/wiki/wiki-0042.md",
+            &crate::config::BoringConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(frontmatter.sources, vec![source]);
+    }
+
+    #[test]
+    fn render_emits_okf_fields() {
+        let front = FrontMatter {
+            origin: "personal".to_owned(),
+            project: "omb".to_owned(),
+            date: "2026-07-06".to_owned(),
+            kind: "session".to_owned(),
+            title: Some("test".to_owned()),
+            summary: Some("one-line summary".to_owned()),
+            skills: vec!["ohmyboring".to_owned()],
+            contracts: vec!["graph".to_owned()],
+            incidents: vec!["docker import error".to_owned()],
+            okf_version: Some("0.1".to_owned()),
+            ..Default::default()
+        };
+
+        let out = render_wiki_note("wiki-0043", &front, "## Background\nBody.").unwrap();
+
+        assert!(out.contains("type: session"), "{out}");
+        assert!(out.contains("description: one-line summary"), "{out}");
+        assert!(out.contains("timestamp: 2026-07-06T00:00:00Z"), "{out}");
+        assert!(out.contains("skills:\n- ohmyboring"), "{out}");
+        assert!(out.contains("contracts:\n- graph"), "{out}");
+        assert!(out.contains("incidents:\n- docker import error"), "{out}");
+        assert!(out.contains("okf_version: '0.1'"), "{out}");
     }
 
     // ── next_wiki_id ──
@@ -409,5 +515,29 @@ mod tests {
         let db_ids: std::collections::HashSet<u32> = [5, 7].into_iter().collect();
         // max is 7 (from DB), so next is 8 even though files only go up to 2.
         assert_eq!(super::next_wiki_id(&wiki, Some(&db_ids)).unwrap(), 8);
+    }
+
+    #[test]
+    fn persist_new_wiki_note_publishes_complete_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        let front = crate::frontmatter::FrontMatter {
+            title: Some("atomic note".to_owned()),
+            origin: "personal".to_owned(),
+            project: "omb".to_owned(),
+            kind: "note".to_owned(),
+            date: "2026-07-02".to_owned(),
+            ..Default::default()
+        };
+
+        let (wiki_id, path, persisted_front) =
+            super::persist_new_wiki_note(&wiki, None, front, "body").unwrap();
+
+        assert_eq!(wiki_id, "wiki-0001");
+        assert_eq!(persisted_front.source_path, path.to_string_lossy());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("id: wiki-0001"));
+        assert!(content.contains("title: atomic note"));
+        assert!(content.ends_with("body\n"));
     }
 }

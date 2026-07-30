@@ -9,23 +9,31 @@ use axum::extract::{Query, State};
 use serde_json::{Value, json};
 
 use crate::ask;
+use crate::ask::STALLED_DEFAULT_OLDER_THAN_DAYS;
 use crate::audit;
 use crate::graph;
 use crate::retrieve;
 use crate::serve::{
-    AppError, AppState, AskReq, AskResp, CompactResp, EventIngestResp, EventLogEntry, EventLogReq,
-    EventLogResp, GraphReq, GraphResp, HealthResp, MCP_MAX_RESULTS, MCP_MAX_TOKENS, QueryLogEntry,
-    QueryLogReq, QueryLogResp, SearchHit, SearchResp, StalledReq, SyncResp, SyncState,
-    count_wiki_notes, spawn_query_log, vector_disabled,
+    AppError, AppState, AskReq, AskResp, CODE_SEARCH_MAX_SYMBOLS, CONTEXT_MAX_ITEMS, CodeNoteHit,
+    CodeSearchReq, CodeSearchResp, CodeSymbolHit, CompactResp, EventIngestResp, EventLogEntry,
+    EventLogReq, EventLogResp, GraphReq, GraphResp, HealthResp, MCP_MAX_RESULTS, MCP_MAX_TOKENS,
+    QueryLogEntry, QueryLogInput, QueryLogReq, QueryLogResp, SearchHit, SearchResp, StalledReq,
+    SyncResp, SyncState, count_wiki_notes, optional_project, parse_exclude_origins,
+    recall_max_chars, spawn_query_log, vector_disabled,
 };
 use crate::store::EventLogFilter;
 
 const EVENT_LOG_MAX_LIMIT: i64 = 1000;
 const EVENT_INGEST_MAX_BATCH: usize = 100;
+const QUERY_LOG_MAX_LIMIT: i64 = 1000;
+
+fn exclude_origins(values: &[String]) -> Result<Vec<String>, AppError> {
+    parse_exclude_origins(values).map_err(AppError::bad_request)
+}
 
 pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResp> {
-    // Non-blocking: try_lock reveals whether a sync is mid-flight without ever waiting on it. The
-    // momentary guard is dropped at the end of the expression, so this never blocks a real sync.
+    // Non-blocking: try_lock reveals whether the write-maintenance lane (sync/remember/forget) is
+    // mid-flight without ever waiting on it. The guard is dropped immediately, so this never blocks.
     let sync = if state.sync_lock.try_lock().is_ok() {
         SyncState::Idle
     } else {
@@ -45,15 +53,25 @@ pub(crate) async fn handle_ask(
 ) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     // vector on → synthesize from vector+graph retrieval. off → synthesize from direct vault/wiki reads.
-    let project = req.project.as_deref();
-    let since_hours = req.since_hours;
+    let project = optional_project(req.project.as_deref());
+    let since_hours = nonnegative_since_hours(req.since_hours)?;
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
     let out = if let Some(store) = s.store.as_ref() {
-        ask::answer(store, &s.llm, &req.question, &[], project, since_hours).await?
+        ask::answer(
+            store,
+            &s.llm,
+            &req.question,
+            &exclude_origins,
+            project,
+            since_hours,
+        )
+        .await?
     } else {
         ask::answer_wiki(
             &s.llm,
             s.wiki_dir().as_deref(),
             &req.question,
+            &exclude_origins,
             project,
             since_hours,
         )
@@ -61,12 +79,18 @@ pub(crate) async fn handle_ask(
     };
     spawn_query_log(
         s.store.clone(),
-        "ask",
-        req.question,
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "ask",
+            query: req.question,
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: Some(json!({
+                "graph_context_chars": out.graph_context_chars,
+                "graph_source_count": out.graph_source_count,
+            })),
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -76,18 +100,36 @@ pub(crate) async fn handle_ask(
 
 /// Recency-first briefing — no question (recency retrieval). Called by the cron morning briefing.
 /// Recency (updated_at) ordering depends on pgvector → rejected if `BORING_VECTOR=off`.
-pub(crate) async fn handle_brief(State(s): State<AppState>) -> Result<Json<AskResp>, AppError> {
+pub(crate) async fn handle_brief(
+    State(s): State<AppState>,
+    req: Option<Json<crate::serve::BriefReq>>,
+) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
-    let out = ask::brief(store, &s.llm, &[], s.cfg.note_lang.as_str()).await?;
+    let exclude_origins = req.as_ref().map_or_else(
+        || Ok(Vec::new()),
+        |Json(req)| exclude_origins(&req.exclude_origins),
+    )?;
+    let since_hours = req.as_ref().and_then(|Json(req)| req.since_hours);
+    let out = ask::brief(
+        store,
+        &s.llm,
+        &exclude_origins,
+        s.cfg.note_lang.as_str(),
+        since_hours,
+    )
+    .await?;
     spawn_query_log(
         s.store.clone(),
-        "brief",
-        String::new(),
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "brief",
+            query: String::new(),
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -98,19 +140,33 @@ pub(crate) async fn handle_brief(State(s): State<AppState>) -> Result<Json<AskRe
 /// Weekly briefing — last 7 days, grouped by project.
 pub(crate) async fn handle_weekly(
     State(s): State<AppState>,
-    Json(_req): Json<crate::serve::WeeklyReq>,
+    Json(req): Json<crate::serve::WeeklyReq>,
 ) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
-    let out = ask::weekly_brief(store, &s.llm, &[], s.cfg.note_lang.as_str()).await?;
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
+    let since_hours = req.since_hours;
+    let until_hours = req.until_hours;
+    let out = ask::weekly_brief(
+        store,
+        &s.llm,
+        &exclude_origins,
+        s.cfg.note_lang.as_str(),
+        since_hours,
+        until_hours,
+    )
+    .await?;
     spawn_query_log(
         s.store.clone(),
-        "weekly",
-        String::new(),
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "weekly",
+            query: String::new(),
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -125,16 +181,29 @@ pub(crate) async fn handle_project_status(
 ) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
-    let out =
-        ask::project_status(store, &s.llm, &req.project, &[], s.cfg.note_lang.as_str()).await?;
+    let Some(project) = optional_project(Some(&req.project)) else {
+        return Err(AppError::bad_request("missing argument: project"));
+    };
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
+    let out = ask::project_status(
+        store,
+        &s.llm,
+        project,
+        &exclude_origins,
+        s.cfg.note_lang.as_str(),
+    )
+    .await?;
     spawn_query_log(
         s.store.clone(),
-        "status",
-        req.project.clone(),
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "status",
+            query: project.to_owned(),
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -149,22 +218,28 @@ pub(crate) async fn handle_decisions(
 ) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
     let out = ask::decision_register(
         store,
         &s.llm,
-        req.project.as_deref(),
-        &[],
+        optional_project(req.project.as_deref()),
+        &exclude_origins,
         s.cfg.note_lang.as_str(),
     )
     .await?;
     spawn_query_log(
         s.store.clone(),
-        "decisions",
-        req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "decisions",
+            query: optional_project(req.project.as_deref())
+                .unwrap_or_default()
+                .to_owned(),
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -179,22 +254,28 @@ pub(crate) async fn handle_risks(
 ) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
     let out = ask::risk_register(
         store,
         &s.llm,
-        req.project.as_deref(),
-        &[],
+        optional_project(req.project.as_deref()),
+        &exclude_origins,
         s.cfg.note_lang.as_str(),
     )
     .await?;
     spawn_query_log(
         s.store.clone(),
-        "risks",
-        req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "risks",
+            query: optional_project(req.project.as_deref())
+                .unwrap_or_default()
+                .to_owned(),
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -209,22 +290,28 @@ pub(crate) async fn handle_next_actions(
 ) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
     let out = ask::next_action_register(
         store,
         &s.llm,
-        req.project.as_deref(),
-        &[],
+        optional_project(req.project.as_deref()),
+        &exclude_origins,
         s.cfg.note_lang.as_str(),
     )
     .await?;
     spawn_query_log(
         s.store.clone(),
-        "next_actions",
-        req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "next_actions",
+            query: optional_project(req.project.as_deref())
+                .unwrap_or_default()
+                .to_owned(),
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -232,30 +319,37 @@ pub(crate) async fn handle_next_actions(
     }))
 }
 
-/// Stalled register — `next`/`blocked` claims older than N days (default 7).
+/// Stalled register — `next`/`blocked` claims older than N days.
 pub(crate) async fn handle_stalled(
     State(s): State<AppState>,
     Json(req): Json<StalledReq>,
 ) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
     let out = ask::stalled_register(
         store,
         &s.llm,
-        req.project.as_deref(),
-        &[],
+        optional_project(req.project.as_deref()),
+        &exclude_origins,
         s.cfg.note_lang.as_str(),
-        req.older_than_days.unwrap_or(7),
+        req.older_than_days
+            .unwrap_or(STALLED_DEFAULT_OLDER_THAN_DAYS),
     )
     .await?;
     spawn_query_log(
         s.store.clone(),
-        "stalled",
-        req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
-        out.sources.clone(),
-        out.answer.chars().take(280).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "stalled",
+            query: optional_project(req.project.as_deref())
+                .unwrap_or_default()
+                .to_owned(),
+            hit_paths: out.sources.clone(),
+            sources: out.sources.clone(),
+            answer_snippet: out.answer.chars().take(280).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(AskResp {
         answer: out.answer,
@@ -269,14 +363,15 @@ pub(crate) async fn handle_context(
     State(s): State<AppState>,
     Json(req): Json<crate::serve::ContextReq>,
 ) -> Result<Json<ask::ContextCard>, AppError> {
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
     // Context can be served from the vault even when the vector backend is off, because it only
     // needs current claims by recency. Fall back to an empty card if no store is available.
     let card = if let Some(store) = s.store.as_ref() {
         ask::context_card(
             store,
-            req.project.as_deref(),
-            &req.exclude_origins,
-            req.max_items.clamp(1, 20),
+            optional_project(req.project.as_deref()),
+            &exclude_origins,
+            req.max_items.clamp(1, CONTEXT_MAX_ITEMS),
             s.cfg.note_lang.as_str(),
         )
         .await?
@@ -300,9 +395,10 @@ pub(crate) async fn handle_search(
     let started = Instant::now();
     let max_results = req.max_results.clamp(1, MCP_MAX_RESULTS);
     let max_tokens = req.max_tokens.clamp(1, MCP_MAX_TOKENS);
-    let max_chars = max_tokens.saturating_mul(4);
-    let project = req.project.as_deref();
-    let since_hours = req.since_hours;
+    let max_chars = recall_max_chars(max_tokens)?;
+    let project = optional_project(req.project.as_deref());
+    let since_hours = nonnegative_since_hours(req.since_hours)?;
+    let exclude_origins = exclude_origins(&req.exclude_origins)?;
     // vector-first: /search is the external accuracy contract (eval gate). Use the strongest
     // retriever when available; fall back to direct wiki reads only when vector is off.
     let mapped: Vec<SearchHit> = if let Some(store) = s.store.as_ref() {
@@ -312,9 +408,10 @@ pub(crate) async fn handle_search(
             &req.query,
             max_results,
             max_chars,
-            &[],
+            &exclude_origins,
             project,
             since_hours,
+            false,
         )
         .await?
         .into_iter()
@@ -327,31 +424,116 @@ pub(crate) async fn handle_search(
         })
         .collect()
     } else {
-        s.wiki_recall(&req.query, max_results, project, since_hours)?
-            .into_iter()
-            .map(|h| SearchHit {
-                id: h.id,
-                origin: String::new(),
-                project: String::new(),
-                source_path: h.source_path,
-                snippet: h.snippet,
-            })
-            .collect()
+        crate::wiki_recall::trim_hits_to_budget(
+            s.wiki_recall(
+                &req.query,
+                max_results,
+                project,
+                &exclude_origins,
+                since_hours,
+            )?,
+            max_results,
+            max_chars,
+        )
+        .into_iter()
+        .map(|h| SearchHit {
+            id: h.id,
+            origin: h.origin,
+            project: h.project,
+            source_path: h.source_path,
+            snippet: h.snippet,
+        })
+        .collect()
     };
     let hit_paths: Vec<String> = mapped.iter().map(|h| h.source_path.clone()).collect();
     spawn_query_log(
         s.store.clone(),
-        "search",
-        req.query.clone(),
-        hit_paths,
-        vec![],
-        mapped
-            .first()
-            .map(|h| h.snippet.chars().take(200).collect())
-            .unwrap_or_default(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "search",
+            query: req.query.clone(),
+            hit_paths,
+            sources: vec![],
+            answer_snippet: mapped
+                .first()
+                .map(|h| h.snippet.chars().take(200).collect())
+                .unwrap_or_default(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(SearchResp { hits: mapped }))
+}
+
+/// Code-graph search — AST symbols (tree-sitter indexed) matching the query substring,
+/// plus wiki notes the user linked to those symbols via `remember_code`.
+/// The code lane is pgvector-only (graph store), so it rejects under `BORING_VECTOR=off`.
+pub(crate) async fn handle_code_search(
+    State(s): State<AppState>,
+    Json(req): Json<CodeSearchReq>,
+) -> Result<Json<CodeSearchResp>, AppError> {
+    let started = Instant::now();
+    let store = s.store.as_ref().ok_or_else(vector_disabled)?; // code graph is pgvector-only
+    let max_symbols = req.max_symbols.clamp(1, CODE_SEARCH_MAX_SYMBOLS);
+    let symbols = store
+        .search_code_symbols(&req.query, i64::try_from(max_symbols).unwrap_or(20))
+        .await?;
+    let node_ids: Vec<String> = symbols
+        .iter()
+        .map(crate::codegraph::CodeSymbol::node_id)
+        .collect();
+    let hits: Vec<CodeSymbolHit> = symbols
+        .into_iter()
+        .map(|sym| CodeSymbolHit {
+            kind: sym.kind.as_str().to_owned(),
+            name: sym.name,
+            source_path: sym.source_path,
+            signature: sym.signature,
+        })
+        .collect();
+    let notes: Vec<CodeNoteHit> = store
+        .code_notes_for_symbols(&node_ids)
+        .await?
+        .into_iter()
+        .take(max_symbols)
+        .map(|link| {
+            let (symbol_name, symbol_path) = split_code_note_symbol(&link.symbol_node_id);
+            CodeNoteHit {
+                source_path: link.source_path,
+                title: link.title,
+                snippet: link.snippet,
+                symbol_name,
+                symbol_path,
+            }
+        })
+        .collect();
+    spawn_query_log(
+        s.store.clone(),
+        QueryLogInput {
+            endpoint: "code-search",
+            query: req.query.clone(),
+            hit_paths: hits.iter().map(|h| h.source_path.clone()).collect(),
+            sources: vec![],
+            answer_snippet: hits
+                .first()
+                .map(|h| h.name.chars().take(200).collect())
+                .unwrap_or_default(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
+    );
+    Ok(Json(CodeSearchResp { hits, notes }))
+}
+
+/// Split a `code:<kind>:<path>:<name>` node id into (name, path) for display.
+/// Mirrors `CodeSymbol::from_node_id` but never rejects — a note link must surface
+/// even when the symbol's extension is outside the indexed language set.
+fn split_code_note_symbol(node_id: &str) -> (String, String) {
+    let rest = node_id.strip_prefix("code:").unwrap_or(node_id);
+    let mut parts = rest.splitn(3, ':');
+    let _kind = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    (name.to_owned(), path.to_owned())
 }
 
 pub(crate) async fn handle_graph(
@@ -360,7 +542,8 @@ pub(crate) async fn handle_graph(
 ) -> Result<Json<GraphResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?; // graph is pgvector-only
-    let out = graph::query(store, &s.llm, &req.query).await?;
+    let depth = req.depth.unwrap_or(2);
+    let out = graph::query(store, &s.llm, &req.query, depth).await?;
     let hit = if out.hit.is_empty() {
         vec![]
     } else {
@@ -368,12 +551,15 @@ pub(crate) async fn handle_graph(
     };
     spawn_query_log(
         s.store.clone(),
-        "graph",
-        req.query.clone(),
-        hit,
-        vec![],
-        out.hit.chars().take(200).collect(),
-        started.elapsed(),
+        QueryLogInput {
+            endpoint: "graph",
+            query: req.query.clone(),
+            hit_paths: hit,
+            sources: vec![],
+            answer_snippet: out.hit.chars().take(200).collect(),
+            elapsed: started.elapsed(),
+            meta: None,
+        },
     );
     Ok(Json(GraphResp {
         hit: out.hit,
@@ -396,7 +582,7 @@ pub(crate) async fn handle_query_log(
     Query(params): Query<QueryLogReq>,
 ) -> Result<Json<QueryLogResp>, AppError> {
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
-    let limit = params.limit.clamp(1, 1000);
+    let limit = bounded_limit(params.limit, "limit", QUERY_LOG_MAX_LIMIT)?;
     let rows = store.recent_queries(limit).await?;
     let entries = rows
         .into_iter()
@@ -420,9 +606,9 @@ pub(crate) async fn handle_events(
     State(s): State<AppState>,
     Query(params): Query<EventLogReq>,
 ) -> Result<Json<EventLogResp>, AppError> {
-    validate_event_since_hours(params.since_hours)?;
+    let since_hours = nonnegative_since_hours(params.since_hours)?;
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
-    let limit = params.limit.clamp(1, EVENT_LOG_MAX_LIMIT);
+    let limit = bounded_limit(params.limit, "limit", EVENT_LOG_MAX_LIMIT)?;
     let rows = store
         .recent_events(EventLogFilter {
             limit,
@@ -431,7 +617,7 @@ pub(crate) async fn handle_events(
             status: params.status.as_deref(),
             run_id: params.run_id.as_deref(),
             workflow: params.workflow.as_deref(),
-            since_hours: params.since_hours,
+            since_hours,
         })
         .await?;
     let entries = rows
@@ -521,11 +707,18 @@ fn system_time_rfc3339(value: SystemTime) -> String {
     datetime.to_rfc3339()
 }
 
-fn validate_event_since_hours(since_hours: Option<i32>) -> Result<(), AppError> {
+fn nonnegative_since_hours(since_hours: Option<i32>) -> Result<Option<i32>, AppError> {
     if since_hours.is_some_and(|hours| hours < 0) {
         return Err(AppError::bad_request("since_hours must be >= 0"));
     }
-    Ok(())
+    Ok(since_hours)
+}
+
+fn bounded_limit(value: i64, key: &str, cap: i64) -> Result<i64, AppError> {
+    if value < 0 {
+        return Err(AppError::bad_request(format!("{key} must be >= 0")));
+    }
+    Ok(value.clamp(1, cap))
 }
 
 fn event_batch(req: Value) -> Result<Vec<Value>, AppError> {
@@ -566,14 +759,36 @@ mod tests {
     use axum::response::IntoResponse;
     use serde_json::json;
 
-    use super::{EVENT_INGEST_MAX_BATCH, event_batch, validate_event_since_hours};
+    use super::{EVENT_INGEST_MAX_BATCH, bounded_limit, event_batch, nonnegative_since_hours};
 
     #[test]
     fn event_since_hours_rejects_negative_window() {
-        let Err(err) = validate_event_since_hours(Some(-1)) else {
+        let Err(err) = nonnegative_since_hours(Some(-1)) else {
             panic!("negative since_hours should fail");
         };
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        let Ok(hours) = nonnegative_since_hours(Some(24)) else {
+            panic!("positive since_hours should pass");
+        };
+        assert_eq!(hours, Some(24));
+    }
+
+    #[test]
+    fn bounded_limit_rejects_negative_and_preserves_existing_bounds() {
+        let Err(err) = bounded_limit(-1, "limit", 1000) else {
+            panic!("negative limit should fail");
+        };
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let Ok(min_limit) = bounded_limit(0, "limit", 1000) else {
+            panic!("zero limit should preserve the existing minimum");
+        };
+        assert_eq!(min_limit, 1);
+
+        let Ok(capped_limit) = bounded_limit(1500, "limit", 1000) else {
+            panic!("oversized limit should preserve the existing cap");
+        };
+        assert_eq!(capped_limit, 1000);
     }
 
     #[test]

@@ -11,9 +11,10 @@
 //!   - `run_lint` / `run_audit`: I/O shell — collect files then delegate to pure functions
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 
 use super::AuditSummary;
 use crate::vault::{
@@ -22,9 +23,109 @@ use crate::vault::{
     split_frontmatter,
 };
 
+const RAW_WITNESS_PREFIX: &str = "raw-witness/";
+
+#[derive(Debug)]
+struct SourceRoots {
+    raw_witness: PathBuf,
+}
+
+impl SourceRoots {
+    fn default_for(vault_root: &Path) -> Self {
+        Self {
+            raw_witness: default_raw_witness_root(vault_root),
+        }
+    }
+
+    fn from_env(vault_root: &Path) -> Self {
+        Self {
+            raw_witness: std::env::var_os("BORING_RAW_WITNESS_DIR")
+                .map_or_else(|| default_raw_witness_root(vault_root), PathBuf::from),
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Lint — pure sub-functions (SRP: each check as a separate function)
 // ─────────────────────────────────────────────────────────────
+
+/// Check OKF compatibility fields. Pure.
+fn check_okf_fields(raw_fm: &RawFrontMatter, stem: &str, issues: &mut Vec<Issue>) {
+    // OKF v0.1 requires `type`. omb's legacy `kind` maps to OKF `type`; tolerate legacy notes
+    // but warn so migration can add the explicit field.
+    let has_type = raw_fm
+        .okf_type
+        .as_ref()
+        .is_some_and(|t| !t.trim().is_empty());
+    let has_kind = raw_fm.kind.is_some();
+    if !has_type {
+        if has_kind {
+            issues.push(Issue::warn(
+                "okf-legacy-map",
+                stem,
+                "OKF `type` is missing; `kind` will be treated as `type` — run migrate-okf to make it explicit",
+            ));
+        } else {
+            issues.push(Issue::error(
+                "okf-type-missing",
+                stem,
+                "OKF required field `type` is missing and no legacy `kind` exists",
+            ));
+        }
+    }
+
+    let has_description = raw_fm
+        .description
+        .as_ref()
+        .is_some_and(|d| !d.trim().is_empty())
+        || raw_fm
+            .summary
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+    if !has_description {
+        issues.push(Issue::warn(
+            "okf-description-missing",
+            stem,
+            "OKF recommended field `description`/`summary` is missing",
+        ));
+    }
+
+    if raw_fm
+        .timestamp
+        .as_ref()
+        .is_none_or(|t| t.trim().is_empty())
+    {
+        issues.push(Issue::warn(
+            "okf-timestamp-missing",
+            stem,
+            "OKF recommended field `timestamp` is missing",
+        ));
+    }
+}
+
+/// Check session metadata fields for placeholder/empty values. Pure.
+fn check_session_metadata(raw_fm: &RawFrontMatter, stem: &str, issues: &mut Vec<Issue>) {
+    for (field, values) in [
+        ("skills", &raw_fm.skills),
+        ("contracts", &raw_fm.contracts),
+        ("incidents", &raw_fm.incidents),
+    ] {
+        for value in values {
+            let v = value.trim();
+            if v.is_empty()
+                || v.eq_ignore_ascii_case("none")
+                || v.eq_ignore_ascii_case("n/a")
+                || v.eq_ignore_ascii_case("unknown")
+            {
+                issues.push(Issue::warn(
+                    "session-metadata-placeholder",
+                    stem,
+                    format!("{field} contains a placeholder/empty value: '{value}'"),
+                ));
+            }
+        }
+    }
+}
 
 /// Check existence of required_frontmatter keys. Pure.
 fn check_required_fields(
@@ -89,15 +190,30 @@ fn check_sources(
     raw_fm: &RawFrontMatter,
     allowed_prefixes: &[String],
     vault_root: &Path,
+    source_roots: &SourceRoots,
     stem: &str,
     issues: &mut Vec<Issue>,
 ) {
     for src in &raw_fm.sources {
         let has_valid_prefix = allowed_prefixes.iter().any(|p| src.starts_with(p.as_str()));
         if has_valid_prefix {
-            let file_part = src.split('#').next().unwrap_or(src);
-            let full_path = vault_root.join(file_part);
-            if !full_path.exists() {
+            if source_path_escapes_root(src) {
+                issues.push(Issue::error(
+                    "source-path-escape",
+                    stem,
+                    format!("sources path must stay under its allowed root: {src}"),
+                ));
+                continue;
+            }
+            let full_path = resolve_source_path(src, vault_root, source_roots);
+            let source_exists = full_path.exists();
+            check_source_hash(
+                src,
+                source_exists.then_some(full_path.as_path()),
+                stem,
+                issues,
+            );
+            if !source_exists {
                 issues.push(Issue::warn(
                     "source-missing",
                     stem,
@@ -114,6 +230,104 @@ fn check_sources(
             ));
         }
     }
+}
+
+fn check_source_hash(src: &str, full_path: Option<&Path>, stem: &str, issues: &mut Vec<Issue>) {
+    let file_part = source_file_part(src);
+    let expected = source_sha256(src);
+    if file_part.starts_with(RAW_WITNESS_PREFIX) && expected.is_none() {
+        issues.push(Issue::error(
+            "source-sha-missing",
+            stem,
+            format!("raw witness source must include #sha256=: {src}"),
+        ));
+        return;
+    }
+
+    let Some(expected) = expected else {
+        return;
+    };
+    if !is_sha256_hex(expected) {
+        issues.push(Issue::error(
+            "source-sha-invalid",
+            stem,
+            format!("source sha256 fragment is invalid: {src}"),
+        ));
+        return;
+    }
+
+    let Some(full_path) = full_path else {
+        return;
+    };
+
+    let data = match std::fs::read(full_path) {
+        Ok(data) => data,
+        Err(e) => {
+            issues.push(Issue::warn(
+                "source-unreadable",
+                stem,
+                format!("sources file could not be read for sha256 verification: {src}: {e}"),
+            ));
+            return;
+        }
+    };
+    let actual = hex::encode(Sha256::digest(&data));
+    if actual != expected {
+        issues.push(Issue::error(
+            "source-sha-mismatch",
+            stem,
+            format!("source sha256 does not match local evidence bytes: {src}"),
+        ));
+    }
+}
+
+fn resolve_source_path(src: &str, vault_root: &Path, source_roots: &SourceRoots) -> PathBuf {
+    let file_part = source_file_part(src);
+    if let Some(raw_witness) = file_part.strip_prefix(RAW_WITNESS_PREFIX) {
+        return source_roots.raw_witness.join(raw_witness);
+    }
+    vault_root.join(file_part)
+}
+
+fn source_file_part(src: &str) -> &str {
+    src.split('#').next().map_or(src, |part| part)
+}
+
+fn source_path_escapes_root(src: &str) -> bool {
+    Path::new(source_file_part(src))
+        .components()
+        .any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+}
+
+fn source_sha256(src: &str) -> Option<&str> {
+    let mut parts = src.split('#');
+    let file_part = parts.next().unwrap_or(src);
+    let first_fragment = parts.next()?;
+    if file_part.starts_with(RAW_WITNESS_PREFIX) {
+        if parts.next().is_some() {
+            return Some("");
+        }
+        return first_fragment.strip_prefix("sha256=");
+    }
+    std::iter::once(first_fragment)
+        .chain(parts)
+        .find_map(|fragment| fragment.strip_prefix("sha256="))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn default_raw_witness_root(vault_root: &Path) -> PathBuf {
+    vault_root.parent().map_or_else(
+        || PathBuf::from("data").join("raw-witness"),
+        |home| home.join("data").join("raw-witness"),
+    )
 }
 
 /// Check wikilinks (cross-layer + dangling). Pure.
@@ -156,11 +370,38 @@ pub fn lint_page(
     vault_root: &Path,
     known_ids: &HashSet<String>,
 ) -> (Option<Page>, Vec<Issue>) {
+    lint_page_with_source_roots(
+        abs_path,
+        content,
+        schema,
+        vault_root,
+        &SourceRoots::default_for(vault_root),
+        known_ids,
+    )
+}
+
+#[allow(clippy::too_many_lines)] // many integrity checks per page — a procedural list within a single responsibility (lint)
+fn lint_page_with_source_roots(
+    abs_path: &Path,
+    content: &str,
+    schema: &Schema,
+    vault_root: &Path,
+    source_roots: &SourceRoots,
+    known_ids: &HashSet<String>,
+) -> (Option<Page>, Vec<Issue>) {
     let stem = abs_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_owned();
+
+    // OKF reserves index.md / log.md as directory/listing files; they are not concept documents.
+    // daily-brief-* files are generated output artifacts, not source memory, and do not follow
+    // the wiki-NNNN schema.
+    if stem == "index" || stem == "log" || stem.starts_with("daily-brief-") {
+        return (None, Vec::new());
+    }
+
     let mut issues = Vec::new();
 
     // ── id-format: filename pattern check ──
@@ -213,6 +454,8 @@ pub fn lint_page(
     // ── checks (UX boundary — accumulated) ──
     check_required_fields(&raw_fm, &schema.required_frontmatter, &stem, &mut issues);
     check_id_value(&raw_fm, &id_re, &stem, &mut issues);
+    check_okf_fields(&raw_fm, &stem, &mut issues);
+    check_session_metadata(&raw_fm, &stem, &mut issues);
 
     // ── kind parsing ──
     let kind = raw_fm.kind.as_ref().and_then(parse_kind);
@@ -221,7 +464,7 @@ pub fn lint_page(
         issues.push(Issue::error(
             "kind-invalid",
             &stem,
-            format!("kind '{raw_str}' is not an allowed value (note/memory/session/decision)"),
+            format!("kind '{raw_str}' is not an allowed value (note/memory/session/decision/code)"),
         ));
     }
 
@@ -245,6 +488,7 @@ pub fn lint_page(
         &raw_fm,
         &schema.sources.allowed_prefixes,
         vault_root,
+        source_roots,
         &stem,
         &mut issues,
     );
@@ -494,12 +738,20 @@ pub fn run_lint(vault_root: &Path, strict: bool) -> anyhow::Result<i32> {
     }
 
     let (known_ids, entries) = collect_wiki_pages(&wiki_dir)?;
+    let source_roots = SourceRoots::from_env(vault_root);
     let mut all_issues: Vec<Issue> = Vec::new();
 
     for path in &entries {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read file: {}", path.display()))?;
-        let (_page, issues) = lint_page(path, &content, &schema, vault_root, &known_ids);
+        let (_page, issues) = lint_page_with_source_roots(
+            path,
+            &content,
+            &schema,
+            vault_root,
+            &source_roots,
+            &known_ids,
+        );
         all_issues.extend(issues);
     }
 
@@ -520,13 +772,21 @@ pub fn run_audit(vault_root: &Path, strict: bool) -> anyhow::Result<i32> {
     }
 
     let (known_ids, entries) = collect_wiki_pages(&wiki_dir)?;
+    let source_roots = SourceRoots::from_env(vault_root);
     let mut pages: Vec<Page> = Vec::new();
     let mut parse_issues: Vec<Issue> = Vec::new();
 
     for path in &entries {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read file: {}", path.display()))?;
-        let (page, issues) = lint_page(path, &content, &schema, vault_root, &known_ids);
+        let (page, issues) = lint_page_with_source_roots(
+            path,
+            &content,
+            &schema,
+            vault_root,
+            &source_roots,
+            &known_ids,
+        );
         parse_issues.extend(issues);
         if let Some(p) = page {
             pages.push(p);
@@ -611,9 +871,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        audit_pages, extract_wikilinks, find_cross_layer_wikilinks, lint_page, normalize_link_id,
+        SourceRoots, audit_pages, extract_wikilinks, find_cross_layer_wikilinks, lint_page,
+        lint_page_with_source_roots, normalize_link_id,
     };
     use crate::vault::{Kind, Origin, Page, PageIdSchema, Schema, Severity, SourcesSchema};
+    use sha2::{Digest, Sha256};
 
     fn test_schema() -> Schema {
         Schema {
@@ -621,7 +883,12 @@ mod tests {
                 pattern: r"^wiki-\d{4,5}$".to_owned(),
             },
             sources: SourcesSchema {
-                allowed_prefixes: vec!["raw/".to_owned(), "meta/".to_owned(), ".rules/".to_owned()],
+                allowed_prefixes: vec![
+                    "raw/".to_owned(),
+                    "raw-witness/".to_owned(),
+                    "meta/".to_owned(),
+                    ".rules/".to_owned(),
+                ],
             },
             required_frontmatter: vec![
                 "id".to_owned(),
@@ -651,6 +918,10 @@ mod tests {
             body: body.to_owned(),
             path: PathBuf::from(format!("/vault/wiki/{id}.md")),
         }
+    }
+
+    fn sha256_hex(body: &str) -> String {
+        hex::encode(Sha256::digest(body.as_bytes()))
     }
 
     // ── extract_wikilinks ──
@@ -691,6 +962,268 @@ mod tests {
             .collect();
         assert!(errors.is_empty(), "there should be no errors: {errors:?}");
         assert!(page.is_some(), "Page parse failed");
+    }
+
+    #[test]
+    fn code_kind_is_allowed() {
+        // `remember_code` notes carry `kind: code` + code_symbols frontmatter.
+        let schema = test_schema();
+        let content = "---\nid: wiki-0001\ntitle: Test\nkind: code\norigin: personal\ndate: \"2026-01-01\"\n---\nbody";
+        let ids = known_ids(&["wiki-0001"]);
+        let path = Path::new("/vault/wiki/wiki-0001.md");
+        let (page, issues) = lint_page(path, content, &schema, Path::new("/vault"), &ids);
+        assert!(
+            !issues.iter().any(|i| i.rule == "kind-invalid"),
+            "kind: code must lint clean: {issues:?}"
+        );
+        assert!(page.is_some(), "Page parse failed");
+    }
+
+    #[test]
+    fn raw_witness_source_resolves_to_local_evidence_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+        let raw_body = "{}\n";
+        let witness = tmp
+            .path()
+            .join("data")
+            .join("raw-witness")
+            .join("codex")
+            .join("20260703")
+            .join("session.jsonl");
+        std::fs::create_dir_all(witness.parent().unwrap()).unwrap();
+        std::fs::write(&witness, raw_body).unwrap();
+
+        let schema = test_schema();
+        let content = format!(
+            "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/codex/20260703/session.jsonl#sha256={}\n---\nbody",
+            sha256_hex(raw_body)
+        );
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let (_page, issues) = lint_page(&path, &content, &schema, &vault_root, &ids);
+
+        assert!(
+            !issues.iter().any(|i| i.rule == "source-prefix-violation"),
+            "raw-witness prefix must be allowed: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.rule == "source-missing"),
+            "raw-witness source should resolve outside vault/ to data/raw-witness: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.rule.starts_with("source-sha")),
+            "raw-witness source should verify sha256: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn raw_witness_source_resolves_to_configured_evidence_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+        let raw_witness_root = tmp.path().join("custom-witness-root");
+        let raw_body = "{}\n";
+        let witness = raw_witness_root
+            .join("codex")
+            .join("20260703")
+            .join("session.jsonl");
+        std::fs::create_dir_all(witness.parent().unwrap()).unwrap();
+        std::fs::write(&witness, raw_body).unwrap();
+
+        let schema = test_schema();
+        let content = format!(
+            "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/codex/20260703/session.jsonl#sha256={}\n---\nbody",
+            sha256_hex(raw_body)
+        );
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let source_roots = SourceRoots {
+            raw_witness: raw_witness_root,
+        };
+        let (_page, issues) =
+            lint_page_with_source_roots(&path, &content, &schema, &vault_root, &source_roots, &ids);
+
+        assert!(
+            !issues.iter().any(|i| i.rule == "source-missing"),
+            "raw-witness source should resolve through the injected source root: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.rule.starts_with("source-sha")),
+            "raw-witness source should verify sha256 through the injected source root: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn raw_witness_source_rejects_parent_dir_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+        let escaped_body = "outside evidence\n";
+        let escaped = tmp.path().join("data").join("outside.jsonl");
+        std::fs::create_dir_all(escaped.parent().unwrap()).unwrap();
+        std::fs::write(&escaped, escaped_body).unwrap();
+
+        let schema = test_schema();
+        let content = format!(
+            "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/../outside.jsonl#sha256={}\n---\nbody",
+            sha256_hex(escaped_body)
+        );
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let (_page, issues) = lint_page(&path, &content, &schema, &vault_root, &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "source-path-escape" && i.severity == Severity::Error),
+            "raw witness parent-dir traversal should be rejected: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.rule == "source-sha-mismatch"),
+            "escaped file should not be read for sha verification: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn raw_witness_source_requires_sha256_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+        let witness = tmp
+            .path()
+            .join("data")
+            .join("raw-witness")
+            .join("codex")
+            .join("20260703")
+            .join("session.jsonl");
+        std::fs::create_dir_all(witness.parent().unwrap()).unwrap();
+        std::fs::write(&witness, "{}\n").unwrap();
+
+        let schema = test_schema();
+        let content = "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/codex/20260703/session.jsonl\n---\nbody";
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let (_page, issues) = lint_page(&path, content, &schema, &vault_root, &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "source-sha-missing" && i.severity == Severity::Error),
+            "missing raw witness sha should be an error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn raw_witness_missing_file_still_requires_sha256_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+
+        let schema = test_schema();
+        let content = "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/codex/20260703/session.jsonl\n---\nbody";
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let (_page, issues) = lint_page(&path, content, &schema, &vault_root, &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "source-sha-missing" && i.severity == Severity::Error),
+            "missing raw witness sha should remain an error even after retention: {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "source-missing" && i.severity == Severity::Warn),
+            "retained pointer with missing witness bytes should still report missing source: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn raw_witness_source_rejects_invalid_sha256_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+        let witness = tmp
+            .path()
+            .join("data")
+            .join("raw-witness")
+            .join("codex")
+            .join("20260703")
+            .join("session.jsonl");
+        std::fs::create_dir_all(witness.parent().unwrap()).unwrap();
+        std::fs::write(&witness, "{}\n").unwrap();
+
+        let schema = test_schema();
+        let content = "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/codex/20260703/session.jsonl#sha256=abc123\n---\nbody";
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let (_page, issues) = lint_page(&path, content, &schema, &vault_root, &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "source-sha-invalid" && i.severity == Severity::Error),
+            "invalid raw witness sha should be an error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn raw_witness_source_rejects_extra_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+        let witness = tmp
+            .path()
+            .join("data")
+            .join("raw-witness")
+            .join("codex")
+            .join("20260703")
+            .join("session.jsonl");
+        std::fs::create_dir_all(witness.parent().unwrap()).unwrap();
+        std::fs::write(&witness, "{}\n").unwrap();
+
+        let schema = test_schema();
+        let digest = sha256_hex("{}\n");
+        let content = format!(
+            "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/codex/20260703/session.jsonl#note=extra#sha256={digest}\n---\nbody"
+        );
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let (_page, issues) = lint_page(&path, &content, &schema, &vault_root, &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "source-sha-invalid" && i.severity == Severity::Error),
+            "extra raw witness fragments should be invalid: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn raw_witness_source_detects_sha256_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().join("vault");
+        let witness = tmp
+            .path()
+            .join("data")
+            .join("raw-witness")
+            .join("codex")
+            .join("20260703")
+            .join("session.jsonl");
+        std::fs::create_dir_all(witness.parent().unwrap()).unwrap();
+        std::fs::write(&witness, "{}\n").unwrap();
+
+        let schema = test_schema();
+        let wrong = "0".repeat(64);
+        let content = format!(
+            "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsources:\n  - raw-witness/codex/20260703/session.jsonl#sha256={wrong}\n---\nbody"
+        );
+        let ids = known_ids(&["wiki-0001"]);
+        let path = vault_root.join("wiki").join("wiki-0001.md");
+        let (_page, issues) = lint_page(&path, &content, &schema, &vault_root, &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "source-sha-mismatch" && i.severity == Severity::Error),
+            "mismatched raw witness sha should be an error: {issues:?}"
+        );
     }
 
     #[test]
@@ -822,5 +1355,74 @@ mod tests {
         assert_eq!(normalize_link_id("\"[[wiki-0002|alias]]\""), "wiki-0002");
         assert_eq!(normalize_link_id("[[wiki-0002]]"), "wiki-0002");
         assert_eq!(normalize_link_id("wiki-0002"), "wiki-0002");
+    }
+
+    // ── OKF compatibility lint ──
+
+    #[test]
+    fn okf_type_missing_with_legacy_kind_emits_warn_not_error() {
+        let schema = test_schema();
+        let content = "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\n---\nbody";
+        let ids = known_ids(&["wiki-0001"]);
+        let path = Path::new("/vault/wiki/wiki-0001.md");
+        let (_page, issues) = lint_page(path, content, &schema, Path::new("/vault"), &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "okf-legacy-map" && i.severity == Severity::Warn),
+            "expected okf-legacy-map warn: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.rule == "okf-type-missing"),
+            "legacy kind must not produce okf-type-missing error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn okf_type_missing_without_kind_is_error() {
+        let schema = test_schema();
+        let content =
+            "---\nid: wiki-0001\ntitle: Test\norigin: personal\ndate: \"2026-01-01\"\n---\nbody";
+        let ids = known_ids(&["wiki-0001"]);
+        let path = Path::new("/vault/wiki/wiki-0001.md");
+        let (_page, issues) = lint_page(path, content, &schema, Path::new("/vault"), &ids);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "okf-type-missing" && i.severity == Severity::Error),
+            "expected okf-type-missing error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn okf_reserved_files_are_skipped() {
+        let schema = test_schema();
+        let ids = known_ids(&[]);
+        let index_path = Path::new("/vault/wiki/index.md");
+        let log_path = Path::new("/vault/wiki/log.md");
+        let (_page, index_issues) = lint_page(
+            index_path,
+            "---\n---\n# Index",
+            &schema,
+            Path::new("/vault"),
+            &ids,
+        );
+        let (_page, log_issues) = lint_page(
+            log_path,
+            "---\n---\n# Log",
+            &schema,
+            Path::new("/vault"),
+            &ids,
+        );
+        assert!(
+            index_issues.is_empty(),
+            "index.md should be skipped: {index_issues:?}"
+        );
+        assert!(
+            log_issues.is_empty(),
+            "log.md should be skipped: {log_issues:?}"
+        );
     }
 }

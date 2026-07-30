@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::store::Store;
+use crate::{config, store::Store};
 
 fn tally<'a>(it: impl Iterator<Item = &'a str>) -> Vec<(&'a str, usize)> {
     let mut m: HashMap<&str, usize> = HashMap::new();
@@ -20,6 +20,14 @@ fn tally<'a>(it: impl Iterator<Item = &'a str>) -> Vec<(&'a str, usize)> {
     let mut v: Vec<(&str, usize)> = m.into_iter().collect();
     v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     v
+}
+
+fn origin_key(origin: &str) -> &str {
+    if origin.is_empty() {
+        config::Origin::Personal.as_str()
+    } else {
+        origin
+    }
 }
 
 fn print_group(label: &str, rows: &[(String, usize)]) {
@@ -68,7 +76,7 @@ pub async fn stats(store: &Store, allow_company: bool) -> Result<AuditStats> {
     let files: HashSet<&str> = metas.iter().map(|m| m.source_path.as_str()).collect();
     let total_files = files.len();
 
-    let by_origin: Vec<(String, usize)> = tally(metas.iter().map(|m| m.origin.as_str()))
+    let by_origin: Vec<(String, usize)> = tally(metas.iter().map(|m| origin_key(&m.origin)))
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
         .collect();

@@ -45,6 +45,7 @@ Key paths:
 - happy path: `session_discovered -> transcript_prepared -> distill_requested -> resolution_verified -> remember_requested -> done_marked -> resolution_event_recorded -> readiness_projected`
 - repair path: `resolution_verified --fail--> resolution_repaired --pass--> remember_requested`
 - retry path: `resolution_repaired --fail--> retry_marked -> resolution_event_recorded -> readiness_projected`
+- duplicate path: `remember_requested --duplicate--> done_marked`
 - skip path: `transcript_prepared --skip--> skipped -> resolution_event_recorded -> readiness_projected`
 
 ## Acceptance Gate

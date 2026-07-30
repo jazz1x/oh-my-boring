@@ -7,15 +7,21 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use crate::ask;
 use crate::audit;
 use crate::config;
+use crate::frontmatter::GENERATED_BRIEF_TAG;
 use crate::ingest;
 use crate::llm::Llm;
 use crate::store::{CompactSummary, Store};
 use crate::vault;
+
+const SECONDS_PER_HOUR: u64 = 3_600;
+const SCHEDULER_DEFAULT_SYNC_HOURS: u64 = 4;
+const SCHEDULER_DEFAULT_COMPACT_HOURS: u64 = 24;
+const SCHEDULER_DEFAULT_BRIEF_HOUR: u32 = 8;
 
 pub(crate) struct SyncOutcome {
     pub(crate) ingest: ingest::Stats,
@@ -186,7 +192,7 @@ async fn run_brief(
         eprintln!("[scheduler] daily brief already exists: {}", path.display());
         return;
     }
-    let out = match ask::brief(store, llm, &[], cfg.note_lang.as_str()).await {
+    let out = match ask::brief(store, llm, &[], cfg.note_lang.as_str(), None).await {
         Ok(o) => o,
         Err(e) => {
             eprintln!("[scheduler] brief generation error: {e:#}");
@@ -194,28 +200,64 @@ async fn run_brief(
         }
     };
     let frontmatter = format!(
-        "---\ntitle: \"Daily Brief — {today}\"\norigin: personal\ndate: {today}\nkind: note\ntags: [daily-brief]\n---\n\n"
+        "---\ntitle: \"Daily Brief — {today}\"\norigin: personal\ndate: {today}\nkind: note\ntags: [{GENERATED_BRIEF_TAG}]\n---\n\n"
     );
     let content = format!("{frontmatter}{}\n", out.answer);
-    match std::fs::write(&path, content) {
+    match vault::write_new_atomic(&path, content) {
         Ok(()) => eprintln!("[scheduler] daily brief written: {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("[scheduler] daily brief already exists: {}", path.display());
+        }
         Err(e) => eprintln!("[scheduler] brief write error: {e:#}"),
     }
 }
 
-fn sleep_until_next_local_hour(hour: u32) -> tokio::time::Sleep {
+fn parse_scheduler_hours(name: &str, raw: Option<String>, default: u64) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let hours = raw
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a positive integer hour count"))?;
+    if hours == 0 {
+        bail!("{name} must be at least 1 hour");
+    }
+    Ok(hours)
+}
+
+fn scheduler_hours_duration(name: &str, hours: u64) -> Result<Duration> {
+    let secs = hours
+        .checked_mul(SECONDS_PER_HOUR)
+        .with_context(|| format!("{name} exceeds Duration seconds"))?;
+    Ok(Duration::from_secs(secs))
+}
+
+fn parse_scheduler_hour_of_day(name: &str, raw: Option<String>, default: u32) -> Result<u32> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let hour = raw
+        .parse::<u32>()
+        .with_context(|| format!("{name} must be an integer hour in 0..=23"))?;
+    if hour > 23 {
+        bail!("{name} must be an integer hour in 0..=23");
+    }
+    Ok(hour)
+}
+
+fn sleep_until_next_local_hour(hour: u32) -> Result<tokio::time::Sleep> {
     let now = chrono::Local::now();
     let mut target = now
         .date_naive()
         .and_hms_opt(hour, 0, 0)
-        .unwrap_or_else(|| now.naive_local());
+        .with_context(|| format!("scheduler brief hour {hour} is outside 0..=23"))?;
     if target <= now.naive_local() {
         target += chrono::Duration::days(1);
     }
     let dur = (target - now.naive_local())
         .to_std()
-        .unwrap_or_else(|_| Duration::from_mins(1));
-    tokio::time::sleep(dur)
+        .context("scheduler brief target must be in the future")?;
+    Ok(tokio::time::sleep(dur))
 }
 
 pub(crate) fn spawn_scheduler(
@@ -225,20 +267,26 @@ pub(crate) fn spawn_scheduler(
     cfg: Arc<config::BoringConfig>,
     sync_lock: Arc<Mutex<()>>,
     last_compact: Arc<Mutex<Option<Instant>>>,
-) {
-    // `.max(1)` — `BORING_SYNC_HOURS=0` would make a zero Duration, and
-    // tokio::time::interval panics on a zero period. Clamp to ≥1h.
-    let sync_hours: u64 = config::env_set("BORING_SYNC_HOURS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4)
-        .max(1);
-    let sync_interval = Duration::from_secs(sync_hours * 3600);
+) -> Result<()> {
+    let sync_hours = parse_scheduler_hours(
+        "BORING_SYNC_HOURS",
+        config::env_set("BORING_SYNC_HOURS"),
+        SCHEDULER_DEFAULT_SYNC_HOURS,
+    )?;
+    let sync_interval = scheduler_hours_duration("BORING_SYNC_HOURS", sync_hours)?;
 
-    let compact_hours: u64 = config::env_set("BORING_COMPACT_HOURS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(24)
-        .max(1);
-    let compact_interval = Duration::from_secs(compact_hours * 3600);
+    let compact_hours = parse_scheduler_hours(
+        "BORING_COMPACT_HOURS",
+        config::env_set("BORING_COMPACT_HOURS"),
+        SCHEDULER_DEFAULT_COMPACT_HOURS,
+    )?;
+    let compact_interval = scheduler_hours_duration("BORING_COMPACT_HOURS", compact_hours)?;
+
+    let brief_hour = parse_scheduler_hour_of_day(
+        "BORING_BRIEF_HOUR",
+        config::env_set("BORING_BRIEF_HOUR"),
+        SCHEDULER_DEFAULT_BRIEF_HOUR,
+    )?;
 
     tokio::spawn(async move {
         let store_ref = store.as_deref();
@@ -255,23 +303,24 @@ pub(crate) fn spawn_scheduler(
 
         // Daily briefing scheduler: runs once at BORING_BRIEF_HOUR local time.
         // The generated note is tagged `daily-brief` so future briefs do not ingest themselves.
-        if let Ok(hour) = config::env_set("BORING_BRIEF_HOUR")
-            .unwrap_or_else(|| "8".to_owned())
-            .parse::<u32>()
-            && (0..=23).contains(&hour)
-        {
-            let store2 = store.clone();
-            let llm2 = Arc::clone(&llm);
-            let vault_dir2 = Arc::clone(&vault_dir);
-            let cfg2 = Arc::clone(&cfg);
-            tokio::spawn(async move {
-                loop {
-                    sleep_until_next_local_hour(hour).await;
-                    eprintln!("[scheduler] generating daily brief");
-                    run_brief(store2.as_deref(), &llm2, (*vault_dir2).as_ref(), &cfg2).await;
-                }
-            });
-        }
+        let store2 = store.clone();
+        let llm2 = Arc::clone(&llm);
+        let vault_dir2 = Arc::clone(&vault_dir);
+        let cfg2 = Arc::clone(&cfg);
+        tokio::spawn(async move {
+            loop {
+                let sleep = match sleep_until_next_local_hour(brief_hour) {
+                    Ok(sleep) => sleep,
+                    Err(e) => {
+                        eprintln!("[scheduler] brief schedule error: {e:#}");
+                        return;
+                    }
+                };
+                sleep.await;
+                eprintln!("[scheduler] generating daily brief");
+                run_brief(store2.as_deref(), &llm2, (*vault_dir2).as_ref(), &cfg2).await;
+            }
+        });
 
         let mut sync_ticker = tokio::time::interval(sync_interval);
         sync_ticker.tick().await; // the first tick is immediate — discard it (already ran above)
@@ -292,4 +341,80 @@ pub(crate) fn spawn_scheduler(
             }
         }
     });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SCHEDULER_DEFAULT_BRIEF_HOUR, SCHEDULER_DEFAULT_SYNC_HOURS, parse_scheduler_hour_of_day,
+        parse_scheduler_hours, scheduler_hours_duration,
+    };
+
+    #[test]
+    fn scheduler_interval_env_uses_default_only_when_absent() {
+        assert_eq!(
+            parse_scheduler_hours("BORING_SYNC_HOURS", None, SCHEDULER_DEFAULT_SYNC_HOURS).ok(),
+            Some(SCHEDULER_DEFAULT_SYNC_HOURS)
+        );
+        assert_eq!(
+            parse_scheduler_hours("BORING_SYNC_HOURS", Some("6".to_owned()), 4).ok(),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn scheduler_rejects_malformed_interval_env() {
+        let err = parse_scheduler_hours("BORING_SYNC_HOURS", Some("abc".to_owned()), 4).err();
+
+        assert!(err.is_some_and(|err| {
+            format!("{err:#}").contains("BORING_SYNC_HOURS must be a positive integer hour count")
+        }));
+    }
+
+    #[test]
+    fn scheduler_rejects_zero_interval_env() {
+        let err = parse_scheduler_hours("BORING_SYNC_HOURS", Some("0".to_owned()), 4).err();
+
+        assert!(err.is_some_and(|err| {
+            format!("{err:#}").contains("BORING_SYNC_HOURS must be at least 1 hour")
+        }));
+    }
+
+    #[test]
+    fn scheduler_rejects_duration_overflow() {
+        let err = scheduler_hours_duration("BORING_SYNC_HOURS", u64::MAX).err();
+
+        assert!(err.is_some_and(|err| {
+            format!("{err:#}").contains("BORING_SYNC_HOURS exceeds Duration seconds")
+        }));
+    }
+
+    #[test]
+    fn scheduler_brief_hour_env_uses_default_only_when_absent() {
+        assert_eq!(
+            parse_scheduler_hour_of_day("BORING_BRIEF_HOUR", None, SCHEDULER_DEFAULT_BRIEF_HOUR)
+                .ok(),
+            Some(SCHEDULER_DEFAULT_BRIEF_HOUR)
+        );
+        assert_eq!(
+            parse_scheduler_hour_of_day("BORING_BRIEF_HOUR", Some("9".to_owned()), 8).ok(),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn scheduler_rejects_invalid_brief_hour_env() {
+        let malformed =
+            parse_scheduler_hour_of_day("BORING_BRIEF_HOUR", Some("soon".to_owned()), 8).err();
+        assert!(malformed.is_some_and(|err| {
+            format!("{err:#}").contains("BORING_BRIEF_HOUR must be an integer hour in 0..=23")
+        }));
+
+        let out_of_range =
+            parse_scheduler_hour_of_day("BORING_BRIEF_HOUR", Some("24".to_owned()), 8).err();
+        assert!(out_of_range.is_some_and(|err| {
+            format!("{err:#}").contains("BORING_BRIEF_HOUR must be an integer hour in 0..=23")
+        }));
+    }
 }

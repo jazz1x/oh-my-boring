@@ -6,7 +6,7 @@
 //!   - **Graph is deterministic** (kernel A): semantic nodes/edges (tool·concept·claim) come from the
 //!     note's frontmatter — agent-curated — NOT from an LLM extraction pass. drudge only embeds (bge-m3)
 //!     and links. `ingest_file` is the SSOT per-file pipeline shared by `run` (walk) and `remember` (one file).
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -158,7 +158,7 @@ impl GraphExtractor for FrontmatterGraphExtractor {
             if t.is_empty() || has_han(t) {
                 continue;
             }
-            let slug = slugify(t);
+            let slug = frontmatter::semantic_key(t);
             if slug.is_empty() || !seen_tool.insert(slug.clone()) {
                 continue;
             }
@@ -175,7 +175,7 @@ impl GraphExtractor for FrontmatterGraphExtractor {
             if c.is_empty() || has_han(c) {
                 continue;
             }
-            let slug = slugify(c);
+            let slug = frontmatter::semantic_key(c);
             if slug.is_empty() || !seen_concept.insert(slug.clone()) {
                 continue;
             }
@@ -188,19 +188,14 @@ impl GraphExtractor for FrontmatterGraphExtractor {
         // temporal-fact claims — (subject,predicate)→value, a new value supersedes the old.
         // valid_from = document mtime (chronological ordering). value embedding via bge-m3 (no generation).
         if !front.claims.is_empty() {
-            let valid_from = store.doc_updated_at(path).await?;
+            let valid_from = store
+                .doc_updated_at(path)
+                .await?
+                .with_context(|| format!("missing document row for claim valid_from: {path}"))?;
             for cl in &front.claims {
-                let subject = canon(&cl.subject);
-                let predicate = canon(&cl.predicate);
-                let value = cl.value.trim();
-                if subject.is_empty()
-                    || predicate.is_empty()
-                    || value.is_empty()
-                    || has_han(&subject)
-                    || has_han(value)
-                {
+                let Some((subject, predicate, value)) = claim_ingest_fields(cl) else {
                     continue;
-                }
+                };
                 let emb = llm.embed(&format!("{subject} {predicate} {value}")).await?;
                 store
                     .upsert_claim(
@@ -263,26 +258,14 @@ fn has_han(s: &str) -> bool {
     s.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
 }
 
-/// Slug: lowercase + keep only `[a-z0-9]` (remove all separators) → prevents variant-spelling collisions.
-/// Alias map: `c++`→`cpp`, `c#`→`csharp`, `.net`→`dotnet` (left as-is they would collapse and collide).
-fn slugify(s: &str) -> String {
-    let lower = s.to_lowercase();
-    let normalized = lower
-        .replace("c++", "cpp")
-        .replace("c#", "csharp")
-        .replace(".net", "dotnet");
-    normalized
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect()
-}
-
-/// claim subject/predicate normalization — lowercase, trim, collapse whitespace (matching consistency).
-fn canon(s: &str) -> String {
-    s.to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+fn claim_ingest_fields(cl: &frontmatter::Claim) -> Option<(String, String, &str)> {
+    let subject = frontmatter::claim_key(&cl.subject);
+    let predicate = frontmatter::claim_key(&cl.predicate);
+    let value = cl.value.trim();
+    if subject.is_empty() || predicate.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((subject, predicate, value))
 }
 
 /// Strip NUL (0x00) — Postgres `text` cannot store NUL. Strip once at the IO boundary (lossless,
@@ -303,6 +286,14 @@ fn is_target(path: &Path, exclude: &[String]) -> bool {
         .is_some_and(|e| EXTS.contains(&e.to_lowercase().as_str()));
     let pstr = path.to_string_lossy();
     ext_ok && !exclude.iter().any(|s| pstr.contains(s))
+}
+
+fn file_modified_time(path: impl AsRef<Path>) -> Result<SystemTime> {
+    let path = path.as_ref();
+    std::fs::metadata(path)
+        .with_context(|| format!("stat note mtime: {}", path.display()))?
+        .modified()
+        .with_context(|| format!("read note mtime: {}", path.display()))
 }
 
 /// Ingest one note file into the vector store + deterministic graph. The SSOT per-file pipeline.
@@ -337,14 +328,20 @@ pub async fn ingest_file_with<C: Chunker, G: GraphExtractor>(
     };
     let data = strip_nul(&data);
 
-    // Recency signal = file mtime. IO boundary: if unreadable, now() (treated as just-seen, graceful).
-    let mtime = std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .unwrap_or_else(SystemTime::now);
+    let prev = store.get_doc_sha(path).await?;
+    if frontmatter::raw_has_generated_brief_tag(&data) {
+        if prev.is_some() {
+            store.delete_document(path).await?;
+            stats.deleted += 1;
+        }
+        stats.skipped += 1;
+        return Ok(FileOutcome::Skipped);
+    }
+
+    // Recency signal = file mtime. If the timestamp cannot be read, fail this note honestly.
+    let mtime = file_modified_time(path)?;
 
     let sha = sha256(&data);
-    let prev = store.get_doc_sha(path).await?;
     if prev.as_deref() == Some(sha.as_str()) {
         // Content identical — backfill only recency without re-embedding (graph already built).
         store.set_updated_at(path, mtime).await?;
@@ -476,7 +473,28 @@ pub async fn run_with<C: Chunker, G: GraphExtractor>(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use super::{canon, has_han, slugify, strip_nul};
+    use super::{
+        Chunker, DefaultChunker, claim_ingest_fields, file_modified_time, has_han, strip_nul,
+    };
+    use crate::frontmatter::Claim;
+
+    #[test]
+    fn default_chunker_keeps_short_notes_whole() {
+        let chunks = DefaultChunker::with_size(10, 3).chunk("short");
+
+        assert_eq!(chunks, vec!["short".to_owned()]);
+    }
+
+    #[test]
+    fn default_chunker_preserves_configured_overlap() {
+        let chunks = DefaultChunker::with_size(10, 3).chunk("abcdefghijklmnop");
+
+        assert_eq!(
+            chunks,
+            vec!["abcdefghij".to_owned(), "hijklmnop".to_owned()]
+        );
+        assert_eq!(&chunks[0][7..], &chunks[1][..3]);
+    }
 
     #[test]
     fn strip_nul_removes_null_bytes() {
@@ -490,10 +508,13 @@ mod tests {
     }
 
     #[test]
-    fn slugify_collapses_separators() {
-        assert_eq!(slugify("macos keychain"), "macoskeychain");
-        assert_eq!(slugify("macos_keychain"), "macoskeychain");
-        assert_eq!(slugify("c++"), "cpp");
+    fn file_modified_time_reports_missing_path_without_now_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.md");
+
+        let err = file_modified_time(&missing).unwrap_err();
+
+        assert!(format!("{err:#}").contains("stat note mtime"), "{err:#}");
     }
 
     #[test]
@@ -503,7 +524,32 @@ mod tests {
     }
 
     #[test]
-    fn canon_normalizes() {
-        assert_eq!(canon("  OH-my  Boring  DB "), "oh-my boring db");
+    fn claim_ingest_fields_preserves_cjk_claim_identity() {
+        let claim = Claim {
+            subject: "障害 対応".to_owned(),
+            predicate: "状態".to_owned(),
+            value: "完了".to_owned(),
+            kind: "fact".to_owned(),
+            confidence: "certain".to_owned(),
+        };
+
+        let (subject, predicate, value) = claim_ingest_fields(&claim).unwrap();
+
+        assert_eq!(subject, "障害 対応");
+        assert_eq!(predicate, "状態");
+        assert_eq!(value, "完了");
+    }
+
+    #[test]
+    fn claim_ingest_fields_rejects_empty_claim_axis() {
+        let claim = Claim {
+            subject: " ".to_owned(),
+            predicate: "status".to_owned(),
+            value: "done".to_owned(),
+            kind: "fact".to_owned(),
+            confidence: "certain".to_owned(),
+        };
+
+        assert!(claim_ingest_fields(&claim).is_none());
     }
 }

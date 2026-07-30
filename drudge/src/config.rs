@@ -24,6 +24,8 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "embed_dim",
     "allow_company_origin",
     "llm",
+    "hermes_cron_jobs",
+    "code_index",
 ];
 /// Default embedder (bge-m3 = 1024-dim) — the kernel's sole model dependency.
 const DEFAULT_EMBED_MODEL: &str = "bge-m3";
@@ -35,7 +37,7 @@ const DEFAULT_EMBED_DIM: u32 = 1024;
 /// `BORING_LLM_BASE_URL=http://localhost:11434/v1`, since `host.docker.internal` resolves only in-container.
 const DEFAULT_LLM_BASE_URL: &str = "http://host.docker.internal:11434/v1";
 /// Default synthesis (chat) model — used only by the `ask`/`brief` generation path.
-const DEFAULT_CHAT_MODEL: &str = "gemma4:12b";
+const DEFAULT_CHAT_MODEL: &str = "qwen3:14b";
 /// Default env var name holding the LLM API key (providers that need auth — OpenAI etc.).
 /// Named (not the key itself) so the secret never lands in boring.json.
 const DEFAULT_API_KEY_ENV: &str = "BORING_LLM_API_KEY";
@@ -71,6 +73,10 @@ pub struct BoringConfig {
     /// `Llm::from_config`). embed_model/embed_dim here are authoritative when set (v2 SSOT); they are
     /// resolved into the top-level fields at parse time so the rest of the kernel reads one place.
     pub llm: LlmConfig,
+    /// Code indexing policy (v2). When enabled, drudge parses source files with tree-sitter and
+    /// stores symbols/relations in the same node/edge graph used for wiki semantics. Disabled by
+    /// default so the wiki-first path stays lean; enable it when you want code context recall.
+    pub code_index: crate::codegraph::CodeIndexConfig,
 }
 
 impl Default for BoringConfig {
@@ -84,6 +90,7 @@ impl Default for BoringConfig {
             embed_dim: DEFAULT_EMBED_DIM,
             allow_company_origin: false,
             llm: LlmConfig::default(),
+            code_index: crate::codegraph::CodeIndexConfig::default(),
         }
     }
 }
@@ -363,11 +370,12 @@ impl BoringConfig {
         let value: serde_json::Value =
             serde_json::from_str(raw).context("parse boring.json as JSON")?;
 
-        let version = value
+        let raw_version = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
-            .map(|v| u32::try_from(v).unwrap_or(0))
             .context("boring.json must have schema_version")?;
+        let version =
+            u32::try_from(raw_version).context("boring.json schema_version exceeds u32")?;
 
         if version > CURRENT_SCHEMA_VERSION {
             eprintln!(
@@ -542,7 +550,7 @@ pub fn upsert_repo_rule_at(
         "{}\n",
         serde_json::to_string_pretty(&v).context("serialize boring.json")?
     );
-    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
+    crate::vault::write_atomic(path, out).with_context(|| format!("write {}", path.display()))?;
     Ok(path.to_path_buf())
 }
 
@@ -602,6 +610,7 @@ mod tests {
 
     use super::{
         Adapter, AgentSource, Bootstrap, BoringConfig, NoteLang, Origin, Provider, RepoRule,
+        upsert_repo_rule_at,
     };
 
     #[test]
@@ -671,7 +680,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.llm.provider, Provider::Ollama);
         assert_eq!(cfg.llm.base_url, "http://host.docker.internal:11434/v1");
-        assert_eq!(cfg.llm.model, "gemma4:12b");
+        assert_eq!(cfg.llm.model, "qwen3:14b");
         assert_eq!(cfg.llm.api_key_env, "BORING_LLM_API_KEY");
         assert_eq!(cfg.llm.bootstrap, Bootstrap::Auto);
         // top-level embed is backfilled into the llm block so `drudge config` is consistent.
@@ -793,6 +802,16 @@ mod tests {
     }
 
     #[test]
+    fn schema_version_overflow_is_rejected_loudly() {
+        let raw = r#"{"schema_version": 4294967296}"#;
+        let err = BoringConfig::from_str(raw).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("boring.json schema_version exceeds u32"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn unknown_top_level_field_warns_but_parses() {
         let raw = r#"{"schema_version": 1, "future_field": true}"#;
         let cfg = BoringConfig::from_str(raw).unwrap();
@@ -904,5 +923,38 @@ mod tests {
         assert!(cfg.repos.iter().all(|r| r.origin == Origin::Company));
         assert_eq!(cfg.agents.len(), 1);
         assert_eq!(cfg.agents[0].paths, vec!["/x", "/y"]);
+    }
+
+    #[test]
+    fn upsert_repo_rule_preserves_unknown_fields_and_replaces_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boring.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema_version": 2,
+                "future_field": {"kept": true},
+                "agents": [{"id": "codex", "enabled": true}],
+                "repos": [
+                    {"match": "acme", "origin": "company", "name": "old"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let saved = upsert_repo_rule_at("acme", "personal", Some("mine"), &path).unwrap();
+        assert_eq!(saved, path);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["future_field"]["kept"], true);
+        assert_eq!(value["agents"][0]["id"], "codex");
+        assert_eq!(
+            value["repos"],
+            serde_json::json!([
+                {"match": "acme", "origin": "personal", "name": "mine"}
+            ])
+        );
+        assert!(raw.ends_with('\n'));
     }
 }

@@ -14,7 +14,9 @@
 //! - **ADT**: `Kind`, `Origin`, `Severity` as enums. Make impossible states unrepresentable.
 //! - **SRP**: separate pure logic (parse/graph) from I/O (file reading).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -25,7 +27,87 @@ pub mod remember;
 
 pub use audit::{audit_pages, lint_page, run_audit, run_lint};
 pub use projection::{project_links, project_note};
-pub use remember::{allocate_wiki_path, normalize_body, render_wiki_note, sanitize_tag, today_utc};
+pub use remember::{
+    allocate_wiki_path, normalize_body, persist_new_wiki_note, render_wiki_note, sanitize_tag,
+    today_utc,
+};
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_temp_path(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic write target has no parent: {}", path.display()),
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic write target has no file name: {}", path.display()),
+        )
+    })?;
+    let seq = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(
+        ".{}.omb-write-{}-{seq}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
+fn write_atomic_temp(path: &Path, content: &[u8]) -> std::io::Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic write target has no parent: {}", path.display()),
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    loop {
+        let tmp = atomic_temp_path(path)?;
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+        {
+            Ok(mut file) => {
+                file.write_all(content)?;
+                file.sync_all()?;
+                return Ok(tmp);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Replace a file through a same-directory temp file + rename so readers never observe a
+/// truncate-then-write half state.
+pub(crate) fn write_atomic(path: &Path, content: impl AsRef<[u8]>) -> Result<()> {
+    let tmp = write_atomic_temp(path, content.as_ref())
+        .with_context(|| format!("atomic write temp: {}", path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!("atomic rename: {}", path.display())));
+    }
+    Ok(())
+}
+
+/// Publish a new vault file only if the final path is still absent. The final path appears only
+/// after the complete temp file is linked into place; concurrent allocators get `AlreadyExists`.
+pub(crate) fn write_new_atomic(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let tmp = write_atomic_temp(path, content.as_ref())?;
+    match std::fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(tmp);
+            Err(e)
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // ADT — make impossible states unrepresentable
@@ -39,6 +121,8 @@ pub enum Kind {
     Memory,
     Session,
     Decision,
+    /// `remember_code` code-context note linked to an AST symbol (`code_symbols` frontmatter).
+    Code,
 }
 
 /// Allowed values for page origin.
@@ -139,8 +223,11 @@ pub struct RawFrontMatter {
     pub id: Option<String>,
     pub title: Option<String>,
     pub kind: Option<serde_yaml::Value>,
+    #[serde(rename = "type")]
+    pub okf_type: Option<String>,
     pub origin: Option<serde_yaml::Value>,
     pub date: Option<String>,
+    pub timestamp: Option<String>,
     #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
@@ -148,8 +235,15 @@ pub struct RawFrontMatter {
     #[serde(default)]
     pub tags: Vec<String>,
     pub superseded_by: Option<String>,
-    #[allow(dead_code)] // optional field — used when extending audit/output
     pub summary: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub contracts: Vec<String>,
+    #[serde(default)]
+    pub incidents: Vec<String>,
+    pub okf_version: Option<String>,
 }
 
 /// A wiki page parsed into typed form at the boundary (PDV-complete state — no re-validation needed afterward).
@@ -300,6 +394,7 @@ pub(crate) fn parse_kind(val: &serde_yaml::Value) -> Option<Kind> {
         "memory" => Some(Kind::Memory),
         "session" => Some(Kind::Session),
         "decision" => Some(Kind::Decision),
+        "code" => Some(Kind::Code),
         _ => None,
     }
 }
@@ -373,11 +468,169 @@ pub(crate) fn days_to_date(days: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// Best-effort OKF v0.1 field backfill for one wiki note. Returns Some(new_content) if changes
+/// are needed, None if the note already conforms. Body is preserved verbatim.
+pub fn migrate_okf_note(content: &str) -> Option<String> {
+    let (yaml, body) = split_frontmatter(content)?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let mapping = value.as_mapping_mut()?;
+
+    let kind = mapping
+        .get(serde_yaml::Value::String("kind".to_owned()))
+        .and_then(|v| v.as_str())
+        .unwrap_or("note")
+        .to_owned();
+    let date = mapping
+        .get(serde_yaml::Value::String("date".to_owned()))
+        .and_then(|v| v.as_str())
+        .unwrap_or("1970-01-01")
+        .to_owned();
+
+    let mut changed = false;
+
+    if !mapping.contains_key(serde_yaml::Value::String("type".to_owned())) {
+        mapping.insert(
+            serde_yaml::Value::String("type".to_owned()),
+            serde_yaml::Value::String(kind.clone()),
+        );
+        changed = true;
+    }
+
+    let has_description = mapping.contains_key(serde_yaml::Value::String("description".to_owned()))
+        || mapping.contains_key(serde_yaml::Value::String("summary".to_owned()));
+    if !has_description {
+        let first_line = body.trim().lines().next().unwrap_or("").trim();
+        if !first_line.is_empty() {
+            mapping.insert(
+                serde_yaml::Value::String("description".to_owned()),
+                serde_yaml::Value::String(first_line.chars().take(200).collect()),
+            );
+            changed = true;
+        }
+    }
+
+    if !mapping.contains_key(serde_yaml::Value::String("timestamp".to_owned())) {
+        mapping.insert(
+            serde_yaml::Value::String("timestamp".to_owned()),
+            serde_yaml::Value::String(format!("{date}T00:00:00Z")),
+        );
+        changed = true;
+    }
+
+    for field in ["skills", "contracts", "incidents"] {
+        if !mapping.contains_key(serde_yaml::Value::String(field.to_owned())) {
+            mapping.insert(
+                serde_yaml::Value::String(field.to_owned()),
+                serde_yaml::Value::Sequence(Vec::new()),
+            );
+            changed = true;
+        }
+    }
+
+    if !mapping.contains_key(serde_yaml::Value::String("okf_version".to_owned())) {
+        mapping.insert(
+            serde_yaml::Value::String("okf_version".to_owned()),
+            serde_yaml::Value::String("0.1".to_owned()),
+        );
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let new_yaml = serde_yaml::to_string(&value).ok()?;
+    Some(format!("---\n{new_yaml}---\n{body}"))
+}
+
+/// Walk `vault/wiki` and backfill OKF/session-metadata fields on legacy notes.
+/// Returns `(examined_count, changed_count)`. Changed files are backed up under
+/// `<vault-root>/../data/backups/vault-migrate-okf-<epoch>/` before rewriting.
+pub fn run_migrate_okf(vault_root: &Path, dry_run: bool) -> Result<(usize, usize)> {
+    let wiki_dir = vault_root.join("wiki");
+    if !wiki_dir.exists() {
+        anyhow::bail!(
+            "vault/wiki directory does not exist: {}",
+            wiki_dir.display()
+        );
+    }
+
+    let backup_dir = vault_root.parent().map_or_else(
+        || vault_root.join("backups"),
+        |p| p.join("data").join("backups"),
+    );
+    let backup_subdir = backup_dir.join(format!(
+        "vault-migrate-okf-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    ));
+
+    let mut examined = 0_usize;
+    let mut changed = 0_usize;
+
+    let entries = std::fs::read_dir(&wiki_dir)
+        .with_context(|| format!("failed to read wiki dir: {}", wiki_dir.display()))?;
+    for entry in entries {
+        let entry = entry.context("failed to read wiki directory entry")?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name == "index.md" || name == "log.md" || name.starts_with("daily-brief-") {
+            continue;
+        }
+        examined += 1;
+
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read file: {}", path.display()))?;
+        let Some(new_content) = migrate_okf_note(&content) else {
+            continue;
+        };
+
+        println!(
+            "{}: {}",
+            if dry_run {
+                "would migrate"
+            } else {
+                "migrating"
+            },
+            path.display()
+        );
+        changed += 1;
+
+        if dry_run {
+            continue;
+        }
+
+        std::fs::create_dir_all(&backup_subdir)
+            .with_context(|| format!("failed to create backup dir: {}", backup_subdir.display()))?;
+        let backup_path = backup_subdir.join(name);
+        std::fs::copy(&path, &backup_path).with_context(|| {
+            format!(
+                "failed to back up {} to {}",
+                path.display(),
+                backup_path.display()
+            )
+        })?;
+        write_atomic(&path, new_content)
+            .with_context(|| format!("failed to write migrated note: {}", path.display()))?;
+    }
+
+    Ok((examined, changed))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{days_to_date, is_seed_note, repair_note_frontmatter, split_frontmatter};
+    use super::{
+        days_to_date, is_seed_note, migrate_okf_note, repair_note_frontmatter, split_frontmatter,
+        write_atomic, write_new_atomic,
+    };
 
     // ── split_frontmatter ──
 
@@ -431,6 +684,37 @@ mod tests {
         assert!(!is_seed_note("wiki-0000-draft"));
     }
 
+    // ── atomic vault writes ──
+
+    #[test]
+    fn write_atomic_replaces_existing_file_without_temp_leftover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wiki-0001.md");
+        std::fs::write(&path, "old").unwrap();
+
+        write_atomic(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".omb-write-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_new_atomic_never_overwrites_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wiki-0001.md");
+        std::fs::write(&path, "old").unwrap();
+
+        let err = write_new_atomic(&path, "new").unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+    }
+
     // ── days_to_date ──
 
     #[test]
@@ -441,5 +725,46 @@ mod tests {
     #[test]
     fn days_to_date_known_date() {
         assert_eq!(days_to_date(10_957), "2000-01-01");
+    }
+
+    // ── migrate_okf_note ──
+
+    #[test]
+    fn migrate_okf_note_adds_okf_and_session_fields() {
+        let content = "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\n---\n## Background\nBody line.";
+        let migrated = migrate_okf_note(content).expect("should migrate legacy note");
+        assert!(migrated.contains("type: note"), "{migrated}");
+        assert!(
+            migrated.contains("timestamp: 2026-01-01T00:00:00Z"),
+            "{migrated}"
+        );
+        assert!(
+            migrated.contains("description: '## Background'"),
+            "{migrated}"
+        );
+        assert!(migrated.contains("skills: []"), "{migrated}");
+        assert!(migrated.contains("contracts: []"), "{migrated}");
+        assert!(migrated.contains("incidents: []"), "{migrated}");
+        assert!(migrated.contains("okf_version: '0.1'"), "{migrated}");
+    }
+
+    #[test]
+    fn migrate_okf_note_is_noop_when_conformant() {
+        let content = "---\nid: wiki-0001\ntitle: Test\ntype: note\nkind: note\norigin: personal\ndate: \"2026-01-01\"\ntimestamp: 2026-01-01T00:00:00Z\ndescription: summary\nskills: []\ncontracts: []\nincidents: []\nokf_version: \"0.1\"\n---\nbody";
+        assert!(
+            migrate_okf_note(content).is_none(),
+            "conformant note should not be rewritten"
+        );
+    }
+
+    #[test]
+    fn migrate_okf_note_preserves_existing_summary() {
+        let content = "---\nid: wiki-0001\ntitle: Test\nkind: note\norigin: personal\ndate: \"2026-01-01\"\nsummary: existing summary\n---\nbody";
+        let migrated = migrate_okf_note(content).expect("should migrate");
+        assert!(
+            !migrated.contains("description:"),
+            "summary present → do not add description: {migrated}"
+        );
+        assert!(migrated.contains("okf_version:"), "{migrated}");
     }
 }

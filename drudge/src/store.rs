@@ -6,7 +6,8 @@
 //! - **pgvector** (`document`, `chunk`): vector (HNSW) + FTS (tsvector) + frontmatter columns.
 //! - **graph** (`node`, `edge`): semantic ontology. node = entity, edge = typed relation.
 //!   - node id convention: `doc:<source_path>` · `project:<name>` · `topic:<tag>`
-//!     · `problem|solution|tool|concept:<slug>` · `attempt:<path>#<idx>`.
+//!     · `tool:<slug>` · `concept:<slug>` · `claim:<subject>:<predicate>`
+//!     · typed claim nodes `decision|risk|assumption|blocked|goal|term|next:<subject>:<predicate>`.
 //!   - the `document` table is the SSOT for documents; the graph references them by `doc:<path>` id (no duplicate storage).
 //! - **traversal**: recursive CTE (`neighbors_khop`) — k-hop works even when the engine is not a graph DB.
 //!   If the CTE proves insufficient, lift-and-shift to AGE/SurrealDB (schema is identical).
@@ -21,7 +22,7 @@ use serde_json::{Value, json};
 use tokio_postgres::types::Json as PgJson;
 use tokio_postgres::{Client, NoTls};
 
-use crate::frontmatter::{Claim, FrontMatter};
+use crate::frontmatter::{Claim, FrontMatter, GENERATED_BRIEF_TAG};
 
 /// Ingest input (one chunk).
 pub struct Doc {
@@ -41,6 +42,7 @@ pub struct Hit {
     pub project: String,
     pub source_path: String,
     pub dist: f32,
+    pub score: f64,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,37 @@ pub struct RecentDoc {
     pub project: String,
     pub content: String,
     pub tags: Vec<String>,
+}
+
+/// Relation lane that produced a related document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelatedEvidenceKind {
+    Graph,
+    Claim,
+}
+
+/// Why a document was retrieved as related to another document.
+#[derive(Debug)]
+pub struct RelatedEvidence {
+    pub kind: RelatedEvidenceKind,
+    pub shared_count: i64,
+    pub shared_nodes: Vec<String>,
+}
+
+/// A related document plus the deterministic graph evidence that linked it.
+#[derive(Debug)]
+pub struct RelatedDoc {
+    pub doc: RecentDoc,
+    pub evidence: RelatedEvidence,
+}
+
+/// A claim row plus its owning wiki/source document.
+/// `frontmatter::Claim` remains the semantic fact shape; provenance belongs to
+/// the store row so API `sources` can point at files rather than claim subjects.
+#[derive(Debug, Clone)]
+pub struct ClaimRecord {
+    pub claim: Claim,
+    pub source_path: String,
 }
 
 /// Graph size summary (for audit).
@@ -80,6 +113,15 @@ pub struct GcStats {
     pub concept: usize,
 }
 
+/// Graph-signal features for reranking a candidate against the top vector hit.
+#[derive(Debug)]
+pub struct GraphScore {
+    pub shared_tools: i32,
+    pub shared_claims: i32,
+    pub degree: i32,
+    pub recency_hours: f64,
+}
+
 impl GcStats {
     pub const fn total(&self) -> usize {
         self.tool + self.concept
@@ -97,6 +139,15 @@ pub struct QueryLogRow {
     pub sources: Vec<String>,
     pub answer_snippet: String,
     pub latency_ms: Option<i32>,
+    pub meta: Value,
+}
+
+/// One repeated query line mined from `query_log` (see `Store::repeated_queries`).
+#[derive(Debug)]
+pub struct QueryHotspot {
+    pub query: String,
+    pub count: i64,
+    pub last_at: SystemTime,
 }
 
 /// One structured workflow event stored in Postgres. Shape follows the OpenTelemetry log model
@@ -161,6 +212,19 @@ pub struct SemanticStats {
     pub about: usize,
 }
 
+/// A wiki note linked to a code symbol by `remember_code` (`doc:…` → `code:…` `code_uses` edge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeNoteLink {
+    /// `code:<kind>:<path>:<name>` node id of the linked symbol.
+    pub symbol_node_id: String,
+    /// Note document path (`vault/wiki/wiki-XXXX.md`).
+    pub source_path: String,
+    /// Note title (empty when the frontmatter has none).
+    pub title: String,
+    /// First-chunk preview of the note body (may be empty).
+    pub snippet: String,
+}
+
 pub struct Store {
     db: Client,
     /// Embedding dimension (= `boring.json` `embed_dim`; bge-m3 = 1024). Enforced at every embedding
@@ -172,9 +236,29 @@ pub struct Store {
 /// Kernel A: graph is tool/concept only (`uses`/`about`). Narrative (problem/attempt/solution) lives in
 /// the note body markdown, not as graph nodes — so those edge kinds are gone.
 const SEMANTIC_EDGE_KINDS: [&str; 3] = ["uses", "about", "claims"];
+/// Exact graph-related documents use durable tool/concept overlap plus project/topic
+/// proximity (`in_project`, `tagged`). Claim-axis continuity is ranked separately by
+/// `claim_related_docs`; keeping it out here prevents the same claim signal from
+/// consuming both relation lanes.
+const RELATED_DOC_EDGE_KINDS: [&str; 2] = ["uses", "about"];
+/// Code graph edge kinds — AST-derived relations between code symbols. These are
+/// deterministic (tree-sitter parse), not LLM-generated, and stay in their own lane
+/// so wiki semantic queries can filter them out by kind when needed.
+#[allow(dead_code)] // wired in Phase 2/3 when code ingest/retrieve lands
+const CODE_EDGE_KINDS: [&str; 5] = [
+    "code_calls",
+    "code_imports",
+    "code_inherits",
+    "code_contains",
+    "code_uses",
+];
 /// Internal eval fixtures must remain searchable while `make eval` is running, but they are not
 /// user memory. Recency and claim surfaces feed briefings/status, so exclude that fixture namespace.
 const INTERNAL_EVAL_FIXTURE_RE: &str = r"(^|/)eval-[^/]*\.md$";
+
+fn default_origin_key() -> &'static str {
+    crate::config::Origin::Personal.as_str()
+}
 
 /// chunk id ("path#idx") → graph document node id ("doc:path").
 fn doc_node_id(chunk_or_path: &str) -> String {
@@ -184,10 +268,60 @@ fn doc_node_id(chunk_or_path: &str) -> String {
     format!("doc:{path}")
 }
 
+fn doc_path_from_node_id(node_id: &str) -> Result<String> {
+    node_id
+        .strip_prefix("doc:")
+        .map(str::to_owned)
+        .with_context(|| format!("document node id missing doc: prefix: {node_id}"))
+}
+
+fn claim_node_id(claim: &Claim) -> String {
+    let subject_key = crate::frontmatter::claim_key(&claim.subject);
+    let predicate_key = crate::frontmatter::claim_key(&claim.predicate);
+    format!("claim:{subject_key}:{predicate_key}")
+}
+
+fn canonical_claim_axis(subject: &str, predicate: &str) -> (String, String) {
+    (
+        crate::frontmatter::claim_key(subject),
+        crate::frontmatter::claim_key(predicate),
+    )
+}
+
+fn typed_claim_node_id(kind: &str, claim: &Claim) -> String {
+    let subject_key = crate::frontmatter::claim_key(&claim.subject);
+    let predicate_key = crate::frontmatter::claim_key(&claim.predicate);
+    format!("{kind}:{subject_key}:{predicate_key}")
+}
+
+fn typed_claim_axis_node_ids(subject_key: &str, predicate_key: &str) -> Vec<String> {
+    crate::frontmatter::CLAIM_KINDS
+        .iter()
+        .filter(|kind| **kind != "fact")
+        .map(|kind| format!("{kind}:{subject_key}:{predicate_key}"))
+        .collect()
+}
+
+fn db_i64_count_to_usize(n: i64, label: &str) -> Result<usize> {
+    usize::try_from(n).with_context(|| format!("{label} count cannot fit usize"))
+}
+
+fn db_u64_rows_to_usize(n: u64, label: &str) -> Result<usize> {
+    usize::try_from(n).with_context(|| format!("{label} affected row count cannot fit usize"))
+}
+
+fn store_usize_to_i32(n: usize, label: &str) -> Result<i32> {
+    i32::try_from(n).with_context(|| format!("{label} cannot fit i32"))
+}
+
+fn store_usize_to_i64(n: usize, label: &str) -> Result<i64> {
+    i64::try_from(n).with_context(|| format!("{label} cannot fit i64"))
+}
+
 async fn pg_count(db: &Client, sql: &str) -> Result<usize> {
     let row = db.query_one(sql, &[]).await?;
     let n: i64 = row.get(0);
-    Ok(usize::try_from(n).unwrap_or(0))
+    db_i64_count_to_usize(n, "postgres")
 }
 
 async fn count_node_kind(db: &Client, kind: &str) -> Result<usize> {
@@ -195,7 +329,7 @@ async fn count_node_kind(db: &Client, kind: &str) -> Result<usize> {
         .query_one("SELECT count(*) FROM node WHERE kind = $1;", &[&kind])
         .await?;
     let n: i64 = row.get(0);
-    Ok(usize::try_from(n).unwrap_or(0))
+    db_i64_count_to_usize(n, "node kind")
 }
 
 async fn count_edge_kind(db: &Client, kind: &str) -> Result<usize> {
@@ -203,7 +337,7 @@ async fn count_edge_kind(db: &Client, kind: &str) -> Result<usize> {
         .query_one("SELECT count(*) FROM edge WHERE kind = $1;", &[&kind])
         .await?;
     let n: i64 = row.get(0);
-    Ok(usize::try_from(n).unwrap_or(0))
+    db_i64_count_to_usize(n, "edge kind")
 }
 
 impl Store {
@@ -285,7 +419,10 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS edge_src ON edge(src);
                  CREATE INDEX IF NOT EXISTS edge_dst ON edge(dst);
+                 CREATE INDEX IF NOT EXISTS node_kind ON node(kind);
+                 CREATE INDEX IF NOT EXISTS edge_kind ON edge(kind);
                  ALTER TABLE document ADD COLUMN IF NOT EXISTS extracted_sha text NOT NULL DEFAULT '';
+                 ALTER TABLE document ADD COLUMN IF NOT EXISTS code_sha text NOT NULL DEFAULT '';
                  ALTER TABLE document ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
                  CREATE INDEX IF NOT EXISTS document_updated ON document(updated_at DESC);
                  -- claim: temporal fact authority (Graphiti-style invalidation, scaled down for personal use).
@@ -318,8 +455,14 @@ impl Store {
                      hit_paths     text[] NOT NULL DEFAULT '{{}}',
                      sources       text[] NOT NULL DEFAULT '{{}}',
                      answer_snippet text NOT NULL DEFAULT '',
-                     latency_ms    int
+                     latency_ms    int,
+                     meta          jsonb NOT NULL DEFAULT '{{}}'
                  );
+                 /* Migration guard: existing deployments created before the `meta` column was added
+                    keep their table (CREATE TABLE IF NOT EXISTS is a no-op) but lack the column.
+                    This ALTER is idempotent and cheap; it prevents the runtime column-does-not-exist
+                    error without requiring a manual migration script. */
+                 ALTER TABLE query_log ADD COLUMN IF NOT EXISTS meta jsonb NOT NULL DEFAULT '{{}}';
                  CREATE INDEX IF NOT EXISTS query_log_created ON query_log(created_at DESC);
                  CREATE TABLE IF NOT EXISTS event_log (
                      id               bigserial PRIMARY KEY,
@@ -389,8 +532,8 @@ impl Store {
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
-    /// Document mtime — the `valid_from` of a claim (temporal sort key). Falls back to now() if absent (graceful).
-    pub async fn doc_updated_at(&self, path: &str) -> Result<SystemTime> {
+    /// Document mtime — the `valid_from` of a claim (temporal sort key).
+    pub async fn doc_updated_at(&self, path: &str) -> Result<Option<SystemTime>> {
         let rows = self
             .db
             .query(
@@ -398,9 +541,7 @@ impl Store {
                 &[&path],
             )
             .await?;
-        Ok(rows
-            .first()
-            .map_or_else(SystemTime::now, |r| r.get::<_, SystemTime>(0)))
+        Ok(rows.first().map(|r| r.get::<_, SystemTime>(0)))
     }
 
     /// Update only the recency of documents whose content is unchanged (same sha) — mtime backfill without re-embedding.
@@ -420,25 +561,59 @@ impl Store {
     /// Top-N documents by recency — full body (chunks joined). Retrieval for the recency-first/supersede briefing.
     /// Ordered by `updated_at` descending rather than semantic similarity = "most recently changed knowledge on top".
     /// If `since_hours` is Some, only documents updated within that window are returned.
+    /// If `until_hours` is also Some, documents updated after `now() - make_interval(hours => $until)`
+    /// are excluded, producing a hard date window.
     pub async fn recent_docs(
         &self,
         limit: i64,
         exclude_origins: &[String],
         since_hours: Option<i32>,
+        until_hours: Option<i32>,
         project: Option<&str>,
     ) -> Result<Vec<RecentDoc>> {
-        let rows = match since_hours {
-            Some(hours) => self
+        let default_origin = default_origin_key();
+        let rows = match (since_hours, until_hours) {
+            (Some(since), Some(until)) => self
                 .db
                 .query(
                     "SELECT d.source_path, d.project, d.tags,
                                 string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content
                          FROM document d
                          JOIN chunk c ON c.source_path = d.source_path
-                         WHERE NOT (d.origin = ANY($2))
-                           AND d.updated_at >= now() - make_interval(hours => $3)
-                           AND ($4::text IS NULL OR d.project = $4)
-                           AND d.source_path !~ $5
+                         WHERE NOT (COALESCE(NULLIF(d.origin, ''), $8) = ANY($2))
+                            AND d.updated_at >= now() - make_interval(hours => $3)
+                            AND d.updated_at <= now() - make_interval(hours => $4)
+                            AND ($5::text IS NULL OR d.project = $5)
+                            AND d.source_path !~ $6
+                            AND NOT ($7 = ANY(d.tags))
+                         GROUP BY d.source_path, d.project, d.tags, d.updated_at
+                         ORDER BY d.updated_at DESC
+                         LIMIT $1;",
+                    &[
+                        &limit,
+                        &exclude_origins,
+                        &since,
+                        &until,
+                        &project,
+                        &INTERNAL_EVAL_FIXTURE_RE,
+                        &GENERATED_BRIEF_TAG,
+                        &default_origin,
+                    ],
+                )
+                .await
+                .context("recent docs with time window")?,
+            (Some(hours), None) => self
+                .db
+                .query(
+                    "SELECT d.source_path, d.project, d.tags,
+                                string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content
+                         FROM document d
+                         JOIN chunk c ON c.source_path = d.source_path
+                         WHERE NOT (COALESCE(NULLIF(d.origin, ''), $7) = ANY($2))
+                            AND d.updated_at >= now() - make_interval(hours => $3)
+                            AND ($4::text IS NULL OR d.project = $4)
+                            AND d.source_path !~ $5
+                           AND NOT ($6 = ANY(d.tags))
                          GROUP BY d.source_path, d.project, d.tags, d.updated_at
                          ORDER BY d.updated_at DESC
                          LIMIT $1;",
@@ -448,20 +623,23 @@ impl Store {
                         &hours,
                         &project,
                         &INTERNAL_EVAL_FIXTURE_RE,
+                        &GENERATED_BRIEF_TAG,
+                        &default_origin,
                     ],
                 )
                 .await
                 .context("recent docs with time window")?,
-            None => self
+            (None, _) => self
                 .db
                 .query(
                     "SELECT d.source_path, d.project, d.tags,
                                 string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content
                          FROM document d
                          JOIN chunk c ON c.source_path = d.source_path
-                         WHERE NOT (d.origin = ANY($2))
-                           AND ($3::text IS NULL OR d.project = $3)
-                           AND d.source_path !~ $4
+                         WHERE NOT (COALESCE(NULLIF(d.origin, ''), $6) = ANY($2))
+                            AND ($3::text IS NULL OR d.project = $3)
+                            AND d.source_path !~ $4
+                            AND NOT ($5 = ANY(d.tags))
                          GROUP BY d.source_path, d.project, d.tags, d.updated_at
                          ORDER BY d.updated_at DESC
                          LIMIT $1;",
@@ -470,6 +648,8 @@ impl Store {
                         &exclude_origins,
                         &project,
                         &INTERNAL_EVAL_FIXTURE_RE,
+                        &GENERATED_BRIEF_TAG,
+                        &default_origin,
                     ],
                 )
                 .await
@@ -486,137 +666,620 @@ impl Store {
             .collect())
     }
 
-    /// Document↔document relations — other documents that share **concrete** semantic nodes
-    /// (concept·tool·problem·solution), ordered by shared count descending. The basis for the Obsidian relates_to projection.
+    /// Document↔document relations — other documents that share **concrete** tool/concept nodes,
+    /// ordered by shared count descending. The basis for the Obsidian relates_to projection.
     /// 2-hop over the graph (edge): doc → (shared dst) ← otherDoc.
-    /// `project:`/`topic:` are excluded — the same project / common tags would link everything and create a hairball.
+    /// Project/topic and claim-axis links are excluded here; those have separate relation lanes.
+    /// Projection candidates stay inside the source document's origin boundary.
     /// Requires at least 2 shared nodes to link (cuts the noise of an accidental single overlap).
     pub async fn related_docs(&self, source_path: &str, limit: i64) -> Result<Vec<String>> {
         let doc_id = doc_node_id(source_path);
+        let edge_kinds = RELATED_DOC_EDGE_KINDS.to_vec();
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "WITH self_nodes AS (
-                     SELECT dst FROM edge WHERE src = $1
-                     AND dst NOT LIKE 'project:%' AND dst NOT LIKE 'topic:%'
+                "WITH source_doc AS (
+                     SELECT COALESCE(NULLIF(origin, ''), $7) AS origin
+                     FROM document
+                     WHERE source_path = $6
+                  ),
+                  self_nodes AS (
+                      SELECT dst, kind FROM edge WHERE src = $1 AND kind = ANY($3)
                  )
-                 SELECT e.src, count(*) AS shared
-                 FROM edge e JOIN self_nodes sn ON e.dst = sn.dst
+                 SELECT e.src, count(DISTINCT e.dst) AS shared
+                 FROM edge e
+                 JOIN self_nodes sn ON e.dst = sn.dst AND e.kind = sn.kind
+                 JOIN document d ON ('doc:' || d.source_path) = e.src
+                 JOIN source_doc sd ON COALESCE(NULLIF(d.origin, ''), $7) = sd.origin
                  WHERE e.src <> $1 AND e.src LIKE 'doc:%'
+                   AND d.source_path !~ $4
+                   AND NOT ($5 = ANY(d.tags))
                  GROUP BY e.src
-                 HAVING count(*) >= 2
+                 HAVING count(DISTINCT e.dst) >= 2
                  ORDER BY shared DESC, e.src ASC
                  LIMIT $2;",
-                &[&doc_id, &limit],
+                &[
+                    &doc_id,
+                    &limit,
+                    &edge_kinds,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &source_path,
+                    &default_origin,
+                ],
             )
             .await
             .context("related docs")?;
         // 'doc:<source_path>' → restore source_path
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|r| {
                 let id: String = r.get(0);
-                id.strip_prefix("doc:").unwrap_or(&id).to_owned()
+                doc_path_from_node_id(&id)
+            })
+            .collect()
+    }
+
+    /// Documents that share at least one claim identity with `source_path`.
+    /// A shared `(subject,predicate)` is a strong temporal-continuity signal, so
+    /// this complements `related_docs` without lowering its >=2 shared-node noise gate.
+    /// Projection candidates stay inside the source document's origin boundary.
+    pub async fn claim_related_docs(&self, source_path: &str, limit: i64) -> Result<Vec<String>> {
+        let doc_id = doc_node_id(source_path);
+        let default_origin = default_origin_key();
+        let rows = self
+            .db
+            .query(
+                "WITH source_doc AS (
+                     SELECT COALESCE(NULLIF(origin, ''), $6) AS origin
+                     FROM document
+                     WHERE source_path = $5
+                  ),
+                  self_claims AS (
+                      SELECT dst FROM edge WHERE src = $1 AND kind = 'claims'
+                 )
+                 SELECT e.src, count(DISTINCT e.dst) AS shared
+                 FROM edge e
+                 JOIN self_claims sc ON e.dst = sc.dst
+                 JOIN document d ON ('doc:' || d.source_path) = e.src
+                 JOIN source_doc sd ON COALESCE(NULLIF(d.origin, ''), $6) = sd.origin
+                 WHERE e.src <> $1 AND e.src LIKE 'doc:%' AND e.kind = 'claims'
+                   AND d.source_path !~ $3
+                   AND NOT ($4 = ANY(d.tags))
+                 GROUP BY e.src
+                 ORDER BY shared DESC, e.src ASC
+                 LIMIT $2;",
+                &[
+                    &doc_id,
+                    &limit,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &source_path,
+                    &default_origin,
+                ],
+            )
+            .await
+            .context("claim related docs")?;
+        rows.iter()
+            .map(|r| {
+                let id: String = r.get(0);
+                doc_path_from_node_id(&id)
+            })
+            .collect()
+    }
+
+    /// k-hop graph expansion over the document↔entity↔document path using a recursive CTE.
+    /// Returns distinct document source_paths ordered by minimum doc-hop distance and then
+    /// by the number of shared first-hop entities. Stays inside the source document's origin
+    /// boundary and excludes eval fixtures / generated briefs.
+    pub async fn related_docs_khop(
+        &self,
+        source_path: &str,
+        k: usize,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .khop_doc_rows(
+                source_path,
+                &RELATED_DOC_EDGE_KINDS,
+                k,
+                limit,
+                &[],
+                None,
+                2,
+                false,
+            )
+            .await?
+            .into_iter()
+            .map(|rd| rd.doc.source_path)
+            .collect())
+    }
+
+    /// k-hop claim-axis expansion over `claims` edges. Same boundary/filter rules as
+    /// `related_docs_khop`, but a single shared claim axis is enough to link documents.
+    pub async fn claim_related_docs_khop(
+        &self,
+        source_path: &str,
+        k: usize,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .khop_doc_rows(source_path, &["claims"], k, limit, &[], None, 1, true)
+            .await?
+            .into_iter()
+            .map(|rd| rd.doc.source_path)
+            .collect())
+    }
+
+    /// Shared recursive CTE implementation for graph/claim k-hop related documents.
+    /// `min_shared` is the number of distinct shared first-hop entities required for a
+    /// candidate to be returned (>=2 for the durable graph lane, >=1 for claim axis).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn khop_doc_rows(
+        &self,
+        source_path: &str,
+        edge_kinds: &[&str],
+        k: usize,
+        limit: i64,
+        exclude_origins: &[String],
+        project: Option<&str>,
+        min_shared: i64,
+        claim_axis: bool,
+    ) -> Result<Vec<RelatedDoc>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let doc_id = doc_node_id(source_path);
+        let max_edge_hop = store_usize_to_i32(k * 2, "khop max edge hop")?;
+        let kinds = edge_kinds.to_vec();
+        let default_origin = default_origin_key();
+        let rows = self
+            .db
+            .query(
+                "WITH RECURSIVE source_doc AS (
+                     SELECT COALESCE(NULLIF(origin, ''), $8) AS origin
+                     FROM document
+                     WHERE source_path = $7
+                  ),
+                  walk AS (
+                      SELECT $1::text AS node, 0 AS hop, NULL::text AS shared_node,
+                             ARRAY[$1]::text[] AS path
+                      UNION ALL
+                      SELECT nxt.node,
+                             w.hop + 1,
+                             CASE WHEN w.hop = 0 THEN nxt.node ELSE w.shared_node END,
+                             w.path || nxt.node
+                      FROM walk w
+                      JOIN LATERAL (
+                          SELECT e.dst AS node FROM edge e
+                           WHERE e.src = w.node AND e.kind = ANY($2)
+                          UNION
+                          SELECT e.src AS node FROM edge e
+                           WHERE e.dst = w.node AND e.kind = ANY($2)
+                      ) nxt ON NOT nxt.node = ANY(w.path)
+                      WHERE w.hop < $3
+                  ),
+                  ranked AS (
+                      SELECT d.source_path,
+                             MIN(w.hop / 2) AS doc_hop,
+                             COUNT(DISTINCT w.shared_node) AS shared,
+                             array_agg(
+                               DISTINCT CASE WHEN $9
+                                 THEN replace(regexp_replace(w.shared_node, '^claim:', ''), ':', ' / ')
+                                 ELSE COALESCE(n.label, w.shared_node)
+                               END
+                               ORDER BY CASE WHEN $9
+                                 THEN replace(regexp_replace(w.shared_node, '^claim:', ''), ':', ' / ')
+                                 ELSE COALESCE(n.label, w.shared_node)
+                               END
+                             ) AS shared_nodes
+                       FROM walk w
+                       JOIN document d ON ('doc:' || d.source_path) = w.node
+                       JOIN source_doc sd ON COALESCE(NULLIF(d.origin, ''), $8) = sd.origin
+                       LEFT JOIN node n ON n.id = w.shared_node
+                       WHERE w.node LIKE 'doc:%'
+                         AND w.node <> $1
+                         AND w.hop > 0
+                         AND w.hop <= $4
+                         AND NOT (COALESCE(NULLIF(d.origin, ''), $8) = ANY($5))
+                         AND ($6::text IS NULL OR d.project = $6)
+                         AND d.source_path !~ $10
+                         AND NOT ($11 = ANY(d.tags))
+                       GROUP BY d.source_path
+                       HAVING COUNT(DISTINCT w.shared_node) >= $12
+                       ORDER BY doc_hop, shared DESC, d.source_path ASC
+                       LIMIT $13
+                  )
+                 SELECT d.source_path, d.project, d.tags,
+                        string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content,
+                        r.shared,
+                        r.shared_nodes
+                 FROM ranked r
+                 JOIN document d ON d.source_path = r.source_path
+                 JOIN chunk c ON c.source_path = d.source_path
+                 GROUP BY d.source_path, d.project, d.tags, r.doc_hop, r.shared, r.shared_nodes
+                 ORDER BY r.doc_hop, r.shared DESC, d.source_path ASC;",
+                &[
+                    &doc_id,
+                    &kinds,
+                    &max_edge_hop,
+                    &max_edge_hop,
+                    &exclude_origins,
+                    &project,
+                    &source_path,
+                    &default_origin,
+                    &claim_axis,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &min_shared,
+                    &limit,
+                ],
+            )
+            .await
+            .context("khop related doc rows")?;
+        Ok(rows
+            .iter()
+            .map(|r| RelatedDoc {
+                doc: RecentDoc {
+                    source_path: r.get(0),
+                    project: r.get(1),
+                    tags: r.get(2),
+                    content: r.get(3),
+                },
+                evidence: RelatedEvidence {
+                    kind: if claim_axis {
+                        RelatedEvidenceKind::Claim
+                    } else {
+                        RelatedEvidenceKind::Graph
+                    },
+                    shared_count: r.get(4),
+                    shared_nodes: r.get(5),
+                },
+            })
+            .collect())
+    }
+
+    /// Claim-axis related document bodies for briefing context. This stays separate from
+    /// `related_doc_content` so tool/concept GraphRAG and claim-continuity evidence cannot
+    /// masquerade as the same relation lane.
+    pub async fn claim_related_doc_content(
+        &self,
+        source_path: &str,
+        limit: i64,
+        exclude_origins: &[String],
+        project: Option<&str>,
+        depth: Option<usize>,
+    ) -> Result<Vec<RelatedDoc>> {
+        if let Some(k) = depth {
+            return self
+                .khop_doc_rows(
+                    source_path,
+                    &["claims"],
+                    k,
+                    limit,
+                    exclude_origins,
+                    project,
+                    1,
+                    true,
+                )
+                .await;
+        }
+        let doc_id = doc_node_id(source_path);
+        let default_origin = default_origin_key();
+        let rows = self
+            .db
+            .query(
+                "WITH source_doc AS (
+                     SELECT COALESCE(NULLIF(origin, ''), $8) AS origin
+                     FROM document
+                     WHERE source_path = $7
+                  ),
+                  self_claims AS (
+                      SELECT dst FROM edge WHERE src = $1 AND kind = 'claims'
+                  ),
+                  ranked AS (
+                      SELECT e.src AS doc_node,
+                             count(DISTINCT e.dst) AS shared,
+                             array_agg(
+                               DISTINCT replace(regexp_replace(sc.dst, '^claim:', ''), ':', ' / ')
+                               ORDER BY replace(regexp_replace(sc.dst, '^claim:', ''), ':', ' / ')
+                             ) AS shared_nodes
+                       FROM edge e
+                       JOIN self_claims sc ON e.dst = sc.dst
+                       JOIN document d ON ('doc:' || d.source_path) = e.src
+                       JOIN source_doc sd ON COALESCE(NULLIF(d.origin, ''), $8) = sd.origin
+                       WHERE e.src <> $1 AND e.src LIKE 'doc:%' AND e.kind = 'claims'
+                         AND NOT (COALESCE(NULLIF(d.origin, ''), $8) = ANY($3))
+                         AND ($4::text IS NULL OR d.project = $4)
+                         AND d.source_path !~ $5
+                         AND NOT ($6 = ANY(d.tags))
+                       GROUP BY e.src ORDER BY shared DESC, e.src ASC LIMIT $2
+                  )
+                 SELECT d.source_path, d.project, d.tags,
+                        string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content,
+                        r.shared,
+                        r.shared_nodes
+                 FROM ranked r
+                 JOIN document d ON ('doc:' || d.source_path) = r.doc_node
+                 JOIN chunk c ON c.source_path = d.source_path
+                 GROUP BY d.source_path, d.project, d.tags, r.shared, r.shared_nodes
+                 ORDER BY r.shared DESC, d.source_path ASC;",
+                &[
+                    &doc_id,
+                    &limit,
+                    &exclude_origins,
+                    &project,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &source_path,
+                    &default_origin,
+                ],
+            )
+            .await
+            .context("claim related doc content")?;
+        Ok(rows
+            .iter()
+            .map(|r| RelatedDoc {
+                doc: RecentDoc {
+                    source_path: r.get(0),
+                    project: r.get(1),
+                    tags: r.get(2),
+                    content: r.get(3),
+                },
+                evidence: RelatedEvidence {
+                    kind: RelatedEvidenceKind::Claim,
+                    shared_count: r.get(4),
+                    shared_nodes: r.get(5),
+                },
             })
             .collect())
     }
 
     /// Documents semantically nearest to `source_path` by chunk-embedding cosine — the MEANING-based
-    /// complement to `related_docs`. `related_docs` only links docs sharing >=2 EXACT concept/tool slugs,
-    /// so it misses notes about the same thing in DIFFERENT words (and older / cross-project notes). For
-    /// each other doc this takes its single closest chunk to any of this doc's chunks, keeps docs within
-    /// `max_dist` (pgvector cosine DISTANCE = 1 - cosine_sim), and returns the nearest `limit`, first.
+    /// complement to `related_docs`. The vector index is only a candidate finder for visible
+    /// `relates_to` links: a candidate must also share the same project or at least one deterministic
+    /// graph edge (`uses`/`about`/`claims`) with the source. This keeps Obsidian links from becoming
+    /// embedding-only guesses while still catching same-project notes written in different words.
+    /// Projection candidates stay inside the source document's origin boundary.
     pub async fn semantic_related_docs(
         &self,
         source_path: &str,
         limit: i64,
         max_dist: f64,
     ) -> Result<Vec<String>> {
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
                 "WITH src AS (
-                     SELECT embedding FROM chunk WHERE source_path = $1 AND embedding IS NOT NULL
-                 )
-                 SELECT c.source_path, MIN(c.embedding <=> s.embedding)::float8 AS dist
-                 FROM chunk c, src s
-                 WHERE c.source_path <> $1 AND c.embedding IS NOT NULL
-                 GROUP BY c.source_path
-                 HAVING MIN(c.embedding <=> s.embedding) <= $2
-                 ORDER BY dist ASC
+                     SELECT c.embedding, d.project, COALESCE(NULLIF(d.origin, ''), $6) AS origin
+                      FROM chunk c JOIN document d ON d.source_path = c.source_path
+                      WHERE c.source_path = $1 AND c.embedding IS NOT NULL
+                    )
+                   SELECT c.source_path, MIN(c.embedding <=> s.embedding)::float8 AS dist
+                   FROM chunk c
+                   JOIN document d ON d.source_path = c.source_path
+                   CROSS JOIN src s
+                   WHERE c.source_path <> $1 AND c.embedding IS NOT NULL
+                      AND c.source_path !~ $4
+                      AND NOT ($5 = ANY(d.tags))
+                      AND COALESCE(NULLIF(d.origin, ''), $6) = s.origin
+                      AND (
+                          (d.project <> '' AND d.project = s.project)
+                          OR EXISTS (
+                             SELECT 1
+                             FROM edge self_edge
+                             JOIN edge other_edge
+                               ON other_edge.dst = self_edge.dst
+                              AND other_edge.kind = self_edge.kind
+                             WHERE self_edge.src = ('doc:' || $1)
+                               AND other_edge.src = ('doc:' || c.source_path)
+                               AND self_edge.kind IN ('uses', 'about', 'claims')
+                         )
+                     )
+                   GROUP BY c.source_path
+                   HAVING MIN(c.embedding <=> s.embedding) <= $2
+                   ORDER BY dist ASC
                  LIMIT $3;",
-                &[&source_path, &max_dist, &limit],
+                &[
+                    &source_path,
+                    &max_dist,
+                    &limit,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
+                ],
             )
             .await
             .context("semantic related docs")?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// Graph-signal features for every candidate relative to the top vector hit.
+    /// Counts shared tool/concept nodes, shared claim-axis nodes, total graph degree,
+    /// and recency decay (1.0 = just updated).
+    pub async fn graph_rerank_features(
+        &self,
+        query_top: &Hit,
+        candidates: &[Hit],
+    ) -> Result<Vec<GraphScore>> {
+        let top_id = doc_node_id(&query_top.source_path);
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let candidate_id = doc_node_id(&candidate.source_path);
+            let row = self
+                .db
+                .query_one(
+                    "SELECT
+                        (SELECT count(DISTINCT e1.dst)
+                           FROM edge e1
+                           JOIN edge e2
+                             ON e2.dst = e1.dst AND e2.kind = e1.kind
+                          WHERE e1.src = $1 AND e2.src = $2 AND e1.kind IN ('uses', 'about'))
+                          AS shared_tools,
+                        (SELECT count(DISTINCT e1.dst)
+                           FROM edge e1
+                           JOIN edge e2 ON e2.dst = e1.dst
+                          WHERE e1.src = $1 AND e2.src = $2 AND e1.kind = 'claims')
+                          AS shared_claims,
+                        (SELECT count(*) FROM edge WHERE src = $2 OR dst = $2) AS degree,
+                        (SELECT updated_at FROM document WHERE source_path = $3) AS updated_at;",
+                    &[&top_id, &candidate_id, &candidate.source_path],
+                )
+                .await
+                .context("graph rerank features")?;
+            let shared_tools: i64 = row.get(0);
+            let shared_claims: i64 = row.get(1);
+            let degree: i64 = row.get(2);
+            let updated_at: Option<SystemTime> = row.get(3);
+            let recency_hours = updated_at.map_or(f64::INFINITY, |t| {
+                let elapsed = SystemTime::now().duration_since(t).unwrap_or_default();
+                elapsed.as_secs_f64() / 3600.0
+            });
+            out.push(GraphScore {
+                shared_tools: i32::try_from(shared_tools).unwrap_or(i32::MAX),
+                shared_claims: i32::try_from(shared_claims).unwrap_or(i32::MAX),
+                degree: i32::try_from(degree).unwrap_or(i32::MAX),
+                recency_hours,
+            });
+        }
+        Ok(out)
+    }
+
     /// GraphRAG retrieval: the body of the top-N connected documents that **share a concrete concept/tool** with a document.
-    /// Surfaces, via the graph (concept links), the right answer that the vector buried in noise. project/topic excluded.
+    /// Surfaces, via the graph, the right answer that the vector buried in noise.
+    /// Claim-axis continuity is injected separately as current-claim authority, not duplicated as graph context.
     pub async fn related_doc_content(
         &self,
         source_path: &str,
         limit: i64,
-    ) -> Result<Vec<RecentDoc>> {
+        exclude_origins: &[String],
+        project: Option<&str>,
+        depth: Option<usize>,
+    ) -> Result<Vec<RelatedDoc>> {
+        if let Some(k) = depth {
+            return self
+                .khop_doc_rows(
+                    source_path,
+                    &RELATED_DOC_EDGE_KINDS,
+                    k,
+                    limit,
+                    exclude_origins,
+                    project,
+                    2,
+                    false,
+                )
+                .await;
+        }
         let doc_id = doc_node_id(source_path);
+        let edge_kinds = RELATED_DOC_EDGE_KINDS.to_vec();
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "WITH self_nodes AS (
-                     SELECT dst FROM edge WHERE src = $1
-                     AND dst NOT LIKE 'project:%' AND dst NOT LIKE 'topic:%'
-                 ),
-                 ranked AS (
-                     SELECT e.src AS doc_node, count(*) AS shared
-                     FROM edge e JOIN self_nodes sn ON e.dst = sn.dst
-                     WHERE e.src <> $1 AND e.src LIKE 'doc:%'
-                     GROUP BY e.src HAVING count(*) >= 2 ORDER BY shared DESC, e.src ASC LIMIT $2
+                "WITH source_doc AS (
+                     SELECT COALESCE(NULLIF(origin, ''), $9) AS origin
+                     FROM document
+                     WHERE source_path = $8
+                  ),
+                  self_nodes AS (
+                      SELECT dst, kind FROM edge WHERE src = $1 AND kind = ANY($3)
+                  ),
+                  ranked AS (
+                      SELECT e.src AS doc_node,
+                             count(DISTINCT COALESCE(n.label, sn.dst)) AS shared,
+                             array_agg(
+                               DISTINCT COALESCE(n.label, sn.dst)
+                               ORDER BY COALESCE(n.label, sn.dst)
+                             ) AS shared_nodes
+                       FROM edge e
+                       JOIN self_nodes sn ON e.dst = sn.dst AND e.kind = sn.kind
+                       LEFT JOIN node n ON n.id = e.dst
+                       JOIN document d ON ('doc:' || d.source_path) = e.src
+                       JOIN source_doc sd ON COALESCE(NULLIF(d.origin, ''), $9) = sd.origin
+                       WHERE e.src <> $1 AND e.src LIKE 'doc:%'
+                         AND NOT (COALESCE(NULLIF(d.origin, ''), $9) = ANY($4))
+                         AND ($5::text IS NULL OR d.project = $5)
+                         AND d.source_path !~ $6
+                         AND NOT ($7 = ANY(d.tags))
+                       GROUP BY e.src
+                       HAVING count(DISTINCT COALESCE(n.label, sn.dst)) >= 2
+                       ORDER BY shared DESC, e.src ASC LIMIT $2
                  )
                  SELECT d.source_path, d.project, d.tags,
-                        string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content
+                        string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content,
+                        r.shared,
+                        r.shared_nodes
                  FROM ranked r
                  JOIN document d ON ('doc:' || d.source_path) = r.doc_node
                  JOIN chunk c ON c.source_path = d.source_path
-                 GROUP BY d.source_path, d.project, d.tags, r.shared
-                 ORDER BY r.shared DESC;",
-                &[&doc_id, &limit],
+                 GROUP BY d.source_path, d.project, d.tags, r.shared, r.shared_nodes
+                 ORDER BY r.shared DESC, d.source_path ASC;",
+                &[
+                    &doc_id,
+                    &limit,
+                    &edge_kinds,
+                    &exclude_origins,
+                    &project,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &source_path,
+                    &default_origin,
+                ],
             )
             .await
             .context("related doc content")?;
         Ok(rows
             .iter()
-            .map(|r| RecentDoc {
-                source_path: r.get(0),
-                project: r.get(1),
-                tags: r.get(2),
-                content: r.get(3),
+            .map(|r| RelatedDoc {
+                doc: RecentDoc {
+                    source_path: r.get(0),
+                    project: r.get(1),
+                    tags: r.get(2),
+                    content: r.get(3),
+                },
+                evidence: RelatedEvidence {
+                    kind: RelatedEvidenceKind::Graph,
+                    shared_count: r.get(4),
+                    shared_nodes: r.get(5),
+                },
             })
             .collect())
     }
 
     /// The most recent other documents in the same project — fallback links for isolated documents (0 concept overlap).
     /// Supplements only when there are no concept-based links to prevent orphans, but only a few so it doesn't become a mesh.
+    /// Projection candidates stay inside the source document's origin boundary.
     pub async fn recent_project_docs(&self, source_path: &str, limit: i64) -> Result<Vec<String>> {
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
                 "SELECT d2.source_path FROM document d1
                  JOIN document d2 ON d2.project = d1.project
+                     AND COALESCE(NULLIF(d2.origin, ''), $5) = COALESCE(NULLIF(d1.origin, ''), $5)
                      AND d2.source_path <> d1.source_path
-                 WHERE d1.source_path = $1 AND d1.project <> ''
+                  WHERE d1.source_path = $1 AND d1.project <> ''
+                   AND d2.source_path !~ $3
+                   AND NOT ($4 = ANY(d2.tags))
                  ORDER BY d2.updated_at DESC
                  LIMIT $2;",
-                &[&source_path, &limit],
+                &[
+                    &source_path,
+                    &limit,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
+                ],
             )
             .await
             .context("recent project docs")?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
-    /// Temporal fact claim upsert + supersede. For the same `(subject,predicate)`, old values are
+    /// Temporal fact claim upsert + supersede. For the same canonical `(subject,predicate)`, old values are
     /// sealed via `superseded_at`, and only the latest `valid_from` row is current (NULL). Idempotent (re-ingesting the same row is harmless).
-    /// 0 extra gemma calls — takes the claims that extract already produced as-is.
+    /// 0 extra gemma calls — takes the claims that extract already produced and canonicalizes the identity axis at the store boundary.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_claim(
         &self,
@@ -630,6 +1293,7 @@ impl Store {
         confidence: &str,
     ) -> Result<()> {
         let vec = self.checked_vector(embedding)?; // dim guard (shared with upsert_chunk)
+        let (subject_key, predicate_key) = canonical_claim_axis(subject, predicate);
         self.db
             .execute(
                 "INSERT INTO claim (subject, predicate, value, source_path, valid_from, embedding, kind, confidence)
@@ -638,8 +1302,8 @@ impl Store {
                      value = EXCLUDED.value, source_path = EXCLUDED.source_path,
                      embedding = EXCLUDED.embedding, kind = EXCLUDED.kind, confidence = EXCLUDED.confidence;",
                 &[
-                    &subject,
-                    &predicate,
+                    &subject_key,
+                    &predicate_key,
                     &value,
                     &source_path,
                     &valid_from,
@@ -658,7 +1322,7 @@ impl Store {
                        WHERE subject = $1 AND predicate = $2 GROUP BY subject, predicate) m
                  WHERE c.subject = m.subject AND c.predicate = m.predicate
                    AND c.valid_from < m.mx AND c.superseded_at IS DISTINCT FROM m.mx;",
-                &[&subject, &predicate],
+                &[&subject_key, &predicate_key],
             )
             .await
             .context("seal old claims")?;
@@ -668,7 +1332,7 @@ impl Store {
                  WHERE subject = $1 AND predicate = $2 AND superseded_at IS NOT NULL
                    AND valid_from = (SELECT max(valid_from) FROM claim
                                      WHERE subject = $1 AND predicate = $2);",
-                &[&subject, &predicate],
+                &[&subject_key, &predicate_key],
             )
             .await
             .context("unseal latest claim")?;
@@ -684,7 +1348,7 @@ impl Store {
         project: &str,
         claim: &crate::frontmatter::Claim,
     ) -> Result<()> {
-        let claim_id = format!("claim:{}:{}", claim.subject, claim.predicate);
+        let claim_id = claim_node_id(claim);
         let label = format!("{}: {}", claim.predicate, claim.value);
         let kind = claim.kind();
         let confidence = claim.confidence();
@@ -695,7 +1359,7 @@ impl Store {
 
         // typed node for decisions/risks/etc.
         if kind != "fact" {
-            let typed_id = format!("{}:{}:{}", kind, claim.subject, claim.predicate);
+            let typed_id = typed_claim_node_id(kind, claim);
             let typed_label = format!("{} — {}", claim.subject, claim.value);
             self.upsert_node(&typed_id, kind, &typed_label, Some(confidence))
                 .await?;
@@ -715,6 +1379,88 @@ impl Store {
         Ok(())
     }
 
+    async fn refresh_claim_axis_projection(
+        &self,
+        subject_key: &str,
+        predicate_key: &str,
+    ) -> Result<()> {
+        let claim_id = format!("claim:{subject_key}:{predicate_key}");
+        let typed_ids = typed_claim_axis_node_ids(subject_key, predicate_key);
+        let row = self
+            .db
+            .query_opt(
+                "SELECT c.value, c.kind, c.confidence, COALESCE(d.project, '') AS project
+                 FROM claim c
+                 LEFT JOIN document d ON d.source_path = c.source_path
+                 WHERE c.subject = $1 AND c.predicate = $2 AND c.superseded_at IS NULL
+                 ORDER BY c.valid_from DESC
+                 LIMIT 1;",
+                &[&subject_key, &predicate_key],
+            )
+            .await
+            .context("read current claim for graph projection")?;
+        let Some(row) = row else {
+            let mut node_ids = typed_ids;
+            node_ids.push(claim_id);
+            self.db
+                .execute(
+                    "DELETE FROM edge WHERE src = ANY($1::text[]) OR dst = ANY($1::text[]);",
+                    &[&node_ids],
+                )
+                .await
+                .context("delete empty claim-axis graph edges")?;
+            self.db
+                .execute("DELETE FROM node WHERE id = ANY($1::text[]);", &[&node_ids])
+                .await
+                .context("delete empty claim-axis graph nodes")?;
+            return Ok(());
+        };
+
+        let value: String = row.get(0);
+        let kind: String = row.get(1);
+        let confidence: String = row.get(2);
+        let project: String = row.get(3);
+        self.db
+            .execute(
+                "DELETE FROM edge WHERE src = $1 AND kind IN ('is_a', 'about');",
+                &[&claim_id],
+            )
+            .await
+            .context("clear stale claim-axis outgoing graph edges")?;
+        self.db
+            .execute(
+                "DELETE FROM edge WHERE src = ANY($1::text[]) OR dst = ANY($1::text[]);",
+                &[&typed_ids],
+            )
+            .await
+            .context("clear stale typed claim graph edges")?;
+        self.db
+            .execute(
+                "DELETE FROM node WHERE id = ANY($1::text[]);",
+                &[&typed_ids],
+            )
+            .await
+            .context("clear stale typed claim graph nodes")?;
+
+        let label = format!("{predicate_key}: {value}");
+        self.upsert_node(&claim_id, "claim", &label, Some(&kind))
+            .await?;
+        if kind != "fact" {
+            let typed_id = format!("{kind}:{subject_key}:{predicate_key}");
+            let typed_label = format!("{subject_key} — {value}");
+            self.upsert_node(&typed_id, &kind, &typed_label, Some(&confidence))
+                .await?;
+            self.upsert_edge(&claim_id, &typed_id, "is_a").await?;
+        }
+        if !project.is_empty() {
+            let project_id = format!("project:{project}");
+            self.upsert_node(&project_id, "project", &project, None)
+                .await?;
+            self.upsert_edge(&claim_id, &project_id, "about").await?;
+        }
+        Ok(())
+    }
+
     /// Top-k **current** claims (superseded_at IS NULL) by recency (valid_from desc). For injecting authority into the briefing.
     pub async fn recent_claims(
         &self,
@@ -723,17 +1469,35 @@ impl Store {
         kinds: Option<&[String]>,
         exclude_origins: &[String],
     ) -> Result<Vec<Claim>> {
+        Ok(self
+            .recent_claim_records(k, project, kinds, exclude_origins)
+            .await?
+            .into_iter()
+            .map(|record| record.claim)
+            .collect())
+    }
+
+    /// Top-k **current** claims with source provenance preserved.
+    pub async fn recent_claim_records(
+        &self,
+        k: i64,
+        project: Option<&str>,
+        kinds: Option<&[String]>,
+        exclude_origins: &[String],
+    ) -> Result<Vec<ClaimRecord>> {
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence FROM claim c
+                "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence, c.source_path FROM claim c
                  JOIN document d ON d.source_path = c.source_path
-                 WHERE c.superseded_at IS NULL
-                   AND ($2::text IS NULL OR d.project = $2)
-                   AND ($3::text[] IS NULL OR c.kind = ANY($3))
-                   AND NOT (d.origin = ANY($4))
-                   AND d.source_path !~ $5
-                 ORDER BY c.valid_from DESC
+                  WHERE c.superseded_at IS NULL
+                    AND ($2::text IS NULL OR d.project = $2)
+                    AND ($3::text[] IS NULL OR c.kind = ANY($3))
+                    AND NOT (COALESCE(NULLIF(d.origin, ''), $7) = ANY($4))
+                    AND d.source_path !~ $5
+                    AND NOT ($6 = ANY(d.tags))
+                  ORDER BY c.valid_from DESC
                  LIMIT $1;",
                 &[
                     &k,
@@ -741,20 +1505,13 @@ impl Store {
                     &kinds,
                     &exclude_origins,
                     &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
                 ],
             )
             .await
             .context("recent claims")?;
-        Ok(rows
-            .iter()
-            .map(|r| Claim {
-                subject: r.get(0),
-                predicate: r.get(1),
-                value: r.get(2),
-                kind: r.get(3),
-                confidence: r.get(4),
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_claim_record).collect())
     }
 
     /// Stalled claims: current claims whose valid_from is older than `older_than_days`.
@@ -767,18 +1524,37 @@ impl Store {
         exclude_origins: &[String],
         older_than_days: i64,
     ) -> Result<Vec<Claim>> {
+        Ok(self
+            .stalled_claim_records(k, project, kinds, exclude_origins, older_than_days)
+            .await?
+            .into_iter()
+            .map(|record| record.claim)
+            .collect())
+    }
+
+    /// Stalled claims with source provenance preserved.
+    pub async fn stalled_claim_records(
+        &self,
+        k: i64,
+        project: Option<&str>,
+        kinds: Option<&[String]>,
+        exclude_origins: &[String],
+        older_than_days: i64,
+    ) -> Result<Vec<ClaimRecord>> {
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence FROM claim c
+                "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence, c.source_path FROM claim c
                  JOIN document d ON d.source_path = c.source_path
                  WHERE c.superseded_at IS NULL
-                   AND c.valid_from < (NOW() - INTERVAL '1 day' * ($5::bigint))
-                   AND ($2::text IS NULL OR d.project = $2)
-                   AND ($3::text[] IS NULL OR c.kind = ANY($3))
-                   AND NOT (d.origin = ANY($4))
-                   AND d.source_path !~ $6
-                 ORDER BY c.valid_from ASC
+                    AND c.valid_from < (NOW() - INTERVAL '1 day' * ($5::bigint))
+                    AND ($2::text IS NULL OR d.project = $2)
+                    AND ($3::text[] IS NULL OR c.kind = ANY($3))
+                    AND NOT (COALESCE(NULLIF(d.origin, ''), $8) = ANY($4))
+                    AND d.source_path !~ $6
+                    AND NOT ($7 = ANY(d.tags))
+                  ORDER BY c.valid_from ASC
                  LIMIT $1;",
                 &[
                     &k,
@@ -787,20 +1563,13 @@ impl Store {
                     &exclude_origins,
                     &older_than_days,
                     &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
                 ],
             )
             .await
             .context("stalled claims")?;
-        Ok(rows
-            .iter()
-            .map(|r| Claim {
-                subject: r.get(0),
-                predicate: r.get(1),
-                value: r.get(2),
-                kind: r.get(3),
-                confidence: r.get(4),
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_claim_record).collect())
     }
 
     /// Query embedding → top-k **current** claims (superseded_at IS NULL). Authority retrieval.
@@ -812,22 +1581,41 @@ impl Store {
         project: Option<&str>,
         kinds: Option<&[String]>,
     ) -> Result<Vec<Claim>> {
+        Ok(self
+            .current_claim_records(query_emb, k, exclude_origins, project, kinds)
+            .await?
+            .into_iter()
+            .map(|record| record.claim)
+            .collect())
+    }
+
+    /// Query embedding → top-k **current** claims with source provenance preserved.
+    pub async fn current_claim_records(
+        &self,
+        query_emb: &[f32],
+        k: i64,
+        exclude_origins: &[String],
+        project: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<ClaimRecord>> {
         let vec = Vector::from(query_emb.to_vec());
         // Honor the SAME origin boundary the recall path applies (retrieve::merge_hits filters by
         // exclude_origins). Claims carry no origin column, but their parent document does — JOIN and
         // filter on it so an injected/cross-origin claim cannot bypass an exclusion that the recalled
         // chunks in the same answer respect (Layer 1: one answer, one consistent origin boundary).
-        // `origin = ANY('{}')` is false, so an empty exclusion passes every claim (no behavior change).
+        // Empty legacy origins are normalized to the same default-personal key the wiki recall path uses.
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence FROM claim c
+                "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence, c.source_path FROM claim c
                  JOIN document d ON d.source_path = c.source_path
                  WHERE c.superseded_at IS NULL AND c.embedding IS NOT NULL
-                   AND NOT (d.origin = ANY($3))
-                   AND ($4::text IS NULL OR d.project = $4)
-                   AND ($5::text[] IS NULL OR c.kind = ANY($5))
-                   AND d.source_path !~ $6
+                   AND NOT (COALESCE(NULLIF(d.origin, ''), $8) = ANY($3))
+                    AND ($4::text IS NULL OR d.project = $4)
+                    AND ($5::text[] IS NULL OR c.kind = ANY($5))
+                    AND d.source_path !~ $6
+                   AND NOT ($7 = ANY(d.tags))
                  ORDER BY c.embedding <=> $1
                  LIMIT $2;",
                 &[
@@ -837,20 +1625,13 @@ impl Store {
                     &project,
                     &kinds,
                     &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
                 ],
             )
             .await
             .context("current claims")?;
-        Ok(rows
-            .iter()
-            .map(|r| Claim {
-                subject: r.get(0),
-                predicate: r.get(1),
-                value: r.get(2),
-                kind: r.get(3),
-                confidence: r.get(4),
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_claim_record).collect())
     }
 
     /// document upsert + project/topic nodes + in_project/tagged edge regeneration (idempotent).
@@ -914,7 +1695,7 @@ impl Store {
     /// note has FEWER chunks than before. Used by the upsert-then-prune re-ingest so a reader never
     /// sees an empty/half-deleted chunk set (no delete-first window). `from_idx == new chunk count`.
     pub async fn prune_chunks_from(&self, path: &str, from_idx: usize) -> Result<()> {
-        let from = i32::try_from(from_idx).unwrap_or(i32::MAX);
+        let from = store_usize_to_i32(from_idx, "chunk prune start index")?;
         self.db
             .execute(
                 "DELETE FROM chunk WHERE source_path = $1 AND chunk_idx >= $2;",
@@ -933,16 +1714,48 @@ impl Store {
         self.db
             .execute("DELETE FROM edge WHERE src = $1 OR dst = $1;", &[&doc_id])
             .await?;
-        // claim has NO FK to document (unlike chunk's ON DELETE CASCADE) so the document delete does not
-        // cascade here — mirror the explicit edge delete above. Provenance is single-valued (source_path
-        // is overwritten last-writer-wins on conflict and is not part of the PK), so every claim row
-        // carrying this path is owned by THIS document → remove it (current + its own sealed history).
-        // Caveat: if this doc owned the latest value of a (subject,predicate) while an OLDER row from
-        // another doc stays sealed, that pair loses its current pointer (a MISSING claim, never an
-        // orphaned/WRONG one) — inherent to single-valued provenance; the remedy is a re-seal pass.
+        // claim has NO FK to document (unlike chunk's ON DELETE CASCADE) so the document delete does
+        // not cascade here. Capture affected axes first, then re-seal their remaining history after
+        // deleting this source path so exactly one latest row stays current.
+        let affected_axes: Vec<(String, String)> = self
+            .db
+            .query(
+                "SELECT DISTINCT subject, predicate FROM claim WHERE source_path = $1;",
+                &[&path],
+            )
+            .await?
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect();
         self.db
             .execute("DELETE FROM claim WHERE source_path = $1;", &[&path])
             .await?;
+        for (subject_key, predicate_key) in affected_axes {
+            self.db
+                .execute(
+                    "UPDATE claim c SET superseded_at = m.mx
+                     FROM (SELECT subject, predicate, max(valid_from) AS mx FROM claim
+                           WHERE subject = $1 AND predicate = $2 GROUP BY subject, predicate) m
+                     WHERE c.subject = m.subject AND c.predicate = m.predicate
+                       AND c.valid_from < m.mx AND c.superseded_at IS DISTINCT FROM m.mx;",
+                    &[&subject_key, &predicate_key],
+                )
+                .await
+                .context("re-seal remaining claims after document delete")?;
+            self.db
+                .execute(
+                    "UPDATE claim SET superseded_at = NULL
+                     WHERE subject = $1 AND predicate = $2 AND superseded_at IS NOT NULL
+                       AND valid_from = (SELECT max(valid_from) FROM claim
+                                         WHERE subject = $1 AND predicate = $2);",
+                    &[&subject_key, &predicate_key],
+                )
+                .await
+                .context("unseal latest remaining claim after document delete")?;
+            self.refresh_claim_axis_projection(&subject_key, &predicate_key)
+                .await
+                .context("refresh claim graph projection after document delete")?;
+        }
         Ok(())
     }
 
@@ -950,7 +1763,7 @@ impl Store {
 
     pub async fn upsert_chunk(&self, d: &Doc) -> Result<()> {
         let vec = self.checked_vector(&d.embedding)?; // dim guard (shared with upsert_claim)
-        let idx = i32::try_from(d.chunk_idx).unwrap_or(i32::MAX);
+        let idx = store_usize_to_i32(d.chunk_idx, "chunk index")?;
         self.db
             .execute(
                 "INSERT INTO chunk (id, source_path, content, embedding, origin, project, kind, chunk_idx)
@@ -972,28 +1785,53 @@ impl Store {
 
     pub async fn vector_search(&self, vec: &[f32], k: usize) -> Result<Vec<Hit>> {
         let qvec = Vector::from(vec.to_vec());
-        let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
+        let k_i64 = store_usize_to_i64(k, "vector search limit")?;
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "SELECT id, content, origin, project, source_path, (embedding <=> $1)::float4 AS dist
-                 FROM chunk ORDER BY embedding <=> $1 LIMIT $2;",
-                &[&qvec, &k_i64],
+                "SELECT c.id, c.content, COALESCE(NULLIF(c.origin, ''), $5), c.project, c.source_path,
+                        (c.embedding <=> $1)::float4 AS dist
+                 FROM chunk c
+                 JOIN document d ON d.source_path = c.source_path
+                 WHERE NOT ($3 = ANY(d.tags))
+                   AND d.source_path !~ $4
+                 ORDER BY c.embedding <=> $1
+                 LIMIT $2;",
+                &[
+                    &qvec,
+                    &k_i64,
+                    &GENERATED_BRIEF_TAG,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &default_origin,
+                ],
             )
             .await?;
         Ok(rows.iter().map(row_to_hit).collect())
     }
 
     pub async fn text_search(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
-        let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
+        let k_i64 = store_usize_to_i64(k, "text search limit")?;
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "SELECT id, content, origin, project, source_path,
-                        ts_rank(tsv, plainto_tsquery('simple', $1))::float4 AS dist
-                 FROM chunk WHERE tsv @@ plainto_tsquery('simple', $1)
-                 ORDER BY dist DESC LIMIT $2;",
-                &[&query, &k_i64],
+                "SELECT c.id, c.content, COALESCE(NULLIF(c.origin, ''), $5), c.project, c.source_path,
+                        ts_rank(c.tsv, plainto_tsquery('simple', $1))::float4 AS dist
+                 FROM chunk c
+                 JOIN document d ON d.source_path = c.source_path
+                 WHERE c.tsv @@ plainto_tsquery('simple', $1)
+                   AND NOT ($3 = ANY(d.tags))
+                   AND d.source_path !~ $4
+                 ORDER BY dist DESC
+                 LIMIT $2;",
+                &[
+                    &query,
+                    &k_i64,
+                    &GENERATED_BRIEF_TAG,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &default_origin,
+                ],
             )
             .await?;
         Ok(rows.iter().map(row_to_hit).collect())
@@ -1001,80 +1839,172 @@ impl Store {
 
     /// Vector search with optional project and recency filters.
     /// `since_hours` restricts to chunks whose parent document was updated within the window.
+    /// Filtered `/search` retrieval intentionally leaves eval fixtures searchable:
+    /// `make eval` copies `eval-*.md` into `vault/wiki` and calls `/search`.
+    /// Source-memory and briefing surfaces filter fixtures at their own boundaries.
     pub async fn vector_search_filtered(
         &self,
         vec: &[f32],
         k: usize,
+        exclude_origins: &[String],
         project: Option<&str>,
         since_hours: Option<i32>,
     ) -> Result<Vec<Hit>> {
         let qvec = Vector::from(vec.to_vec());
-        let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
+        let k_i64 = store_usize_to_i64(k, "filtered vector search limit")?;
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "SELECT c.id, c.content, c.origin, c.project, c.source_path,
+                "SELECT c.id, c.content, COALESCE(NULLIF(c.origin, ''), $7), c.project, c.source_path,
                         (c.embedding <=> $1)::float4 AS dist
                  FROM chunk c
                  JOIN document d ON d.source_path = c.source_path
-                 WHERE ($3::text IS NULL OR c.project = $3)
-                   AND ($4::int IS NULL OR d.updated_at >= now() - make_interval(hours => $4))
-                 ORDER BY c.embedding <=> $1
-                 LIMIT $2;",
-                &[&qvec, &k_i64, &project, &since_hours],
+                 WHERE NOT (COALESCE(NULLIF(d.origin, ''), $7) = ANY($3))
+                   AND ($4::text IS NULL OR c.project = $4)
+                   AND ($5::int IS NULL OR d.updated_at >= now() - make_interval(hours => $5))
+                   AND NOT ($6 = ANY(d.tags))
+                  ORDER BY c.embedding <=> $1
+                  LIMIT $2;",
+                &[
+                    &qvec,
+                    &k_i64,
+                    &exclude_origins,
+                    &project,
+                    &since_hours,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
+                ],
             )
             .await?;
         Ok(rows.iter().map(row_to_hit).collect())
     }
 
     /// Find the single nearest document by mean chunk distance. Used at the remember write gate
-    /// to skip near-duplicate session notes. Returns `(source_path, distance)` if within `max_dist`.
+    /// as a candidate finder; callers must corroborate against the wiki SSOT before skipping.
+    /// Returns `(source_path, distance)` if within `max_dist`.
     pub async fn nearest_document(
         &self,
         vec: &[f32],
         max_dist: f64,
     ) -> Result<Option<(String, f64)>> {
+        Ok(self.nearest_documents(vec, max_dist, 1).await?.pop())
+    }
+
+    /// Find nearest documents by mean chunk distance. Used when vector similarity is a
+    /// candidate finder and a caller needs to inspect more than the closest embedding hit.
+    pub async fn nearest_documents(
+        &self,
+        vec: &[f32],
+        max_dist: f64,
+        limit: i64,
+    ) -> Result<Vec<(String, f64)>> {
         let qvec = Vector::from(vec.to_vec());
         let rows = self
             .db
             .query(
                 "SELECT d.source_path, MIN(c.embedding <=> $1)::float8 AS dist
-                 FROM document d
-                 JOIN chunk c ON c.source_path = d.source_path
-                 WHERE c.embedding IS NOT NULL
-                 GROUP BY d.source_path
-                 HAVING MIN(c.embedding <=> $1) <= $2
-                 ORDER BY dist ASC
-                 LIMIT 1;",
-                &[&qvec, &max_dist],
+                   FROM document d
+                   JOIN chunk c ON c.source_path = d.source_path
+                     WHERE c.embedding IS NOT NULL
+                       AND NOT ($4 = ANY(d.tags))
+                       AND d.source_path !~ $5
+                     GROUP BY d.source_path
+                     HAVING MIN(c.embedding <=> $1) <= $2
+                     ORDER BY dist ASC, d.source_path ASC
+                     LIMIT $3;",
+                &[
+                    &qvec,
+                    &max_dist,
+                    &limit,
+                    &GENERATED_BRIEF_TAG,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                ],
             )
             .await
-            .context("nearest document")?;
-        Ok(rows.first().map(|r| (r.get(0), r.get(1))))
+            .context("nearest documents")?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Find nearest documents inside the duplicate gate's origin/project boundary.
+    /// This keeps incompatible candidates from consuming the SQL `LIMIT` before
+    /// the caller corroborates the match against the wiki SSOT.
+    pub async fn nearest_documents_for_duplicate_boundary(
+        &self,
+        vec: &[f32],
+        max_dist: f64,
+        limit: i64,
+        origin: &str,
+        project: Option<&str>,
+    ) -> Result<Vec<(String, f64)>> {
+        let qvec = Vector::from(vec.to_vec());
+        let default_origin = default_origin_key();
+        let rows = self
+            .db
+            .query(
+                "SELECT d.source_path, MIN(c.embedding <=> $1)::float8 AS dist
+                   FROM document d
+                   JOIN chunk c ON c.source_path = d.source_path
+                   WHERE c.embedding IS NOT NULL
+                      AND COALESCE(NULLIF(d.origin, ''), $8) = $4
+                      AND ($5::text IS NULL OR d.project = $5 OR d.project = '')
+                      AND d.source_path !~ $6
+                      AND NOT ($7 = ANY(d.tags))
+                   GROUP BY d.source_path
+                   HAVING MIN(c.embedding <=> $1) <= $2
+                   ORDER BY dist ASC, d.source_path ASC
+                   LIMIT $3;",
+                &[
+                    &qvec,
+                    &max_dist,
+                    &limit,
+                    &origin,
+                    &project,
+                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
+                ],
+            )
+            .await
+            .context("nearest documents for duplicate boundary")?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     /// Full-text search with optional project and recency filters.
+    /// Keeps the same eval-gate exception as `vector_search_filtered`.
     pub async fn text_search_filtered(
         &self,
         query: &str,
         k: usize,
+        exclude_origins: &[String],
         project: Option<&str>,
         since_hours: Option<i32>,
     ) -> Result<Vec<Hit>> {
-        let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
+        let k_i64 = store_usize_to_i64(k, "filtered text search limit")?;
+        let default_origin = default_origin_key();
         let rows = self
             .db
             .query(
-                "SELECT c.id, c.content, c.origin, c.project, c.source_path,
+                "SELECT c.id, c.content, COALESCE(NULLIF(c.origin, ''), $7), c.project, c.source_path,
                         ts_rank(c.tsv, plainto_tsquery('simple', $1))::float4 AS dist
                  FROM chunk c
                  JOIN document d ON d.source_path = c.source_path
                  WHERE c.tsv @@ plainto_tsquery('simple', $1)
-                   AND ($3::text IS NULL OR c.project = $3)
-                   AND ($4::int IS NULL OR d.updated_at >= now() - make_interval(hours => $4))
+                   AND NOT (COALESCE(NULLIF(d.origin, ''), $7) = ANY($3))
+                   AND ($4::text IS NULL OR c.project = $4)
+                   AND ($5::int IS NULL OR d.updated_at >= now() - make_interval(hours => $5))
+                   AND NOT ($6 = ANY(d.tags))
                  ORDER BY dist DESC
                  LIMIT $2;",
-                &[&query, &k_i64, &project, &since_hours],
+                &[
+                    &query,
+                    &k_i64,
+                    &exclude_origins,
+                    &project,
+                    &since_hours,
+                    &GENERATED_BRIEF_TAG,
+                    &default_origin,
+                ],
             )
             .await?;
         Ok(rows.iter().map(row_to_hit).collect())
@@ -1103,6 +2033,7 @@ impl Store {
     // ── query log (memory usage analytics) ────────────────────────────────────
 
     #[allow(clippy::needless_borrow)] // tokio-postgres params need &&str to coerce to &dyn ToSql.
+    #[allow(clippy::too_many_arguments)] // TODO: bundle into a LogQueryInput struct when the surface stabilizes.
     pub async fn log_query(
         &self,
         endpoint: &str,
@@ -1111,21 +2042,18 @@ impl Store {
         sources: &[String],
         answer_snippet: &str,
         latency_ms: Option<i32>,
+        meta: &Value,
     ) -> Result<()> {
         // Scrub secrets a user may have pasted into a question/answer BEFORE they persist — the same
         // leak-boundary the remember path applies. query_log is exported by backup-db and served by
         // /query-log, so storing raw Q&A would leak tokens outside the redaction guarantee.
-        let (query, answer_snippet) = match crate::redact::build_secret_re() {
-            Ok(re) => (
-                crate::redact::redact(re, query),
-                crate::redact::redact(re, answer_snippet),
-            ),
-            Err(_) => (query.to_owned(), answer_snippet.to_owned()),
-        };
+        let re = crate::redact::build_secret_re().context("build query_log secret scrub regex")?;
+        let query = crate::redact::redact(re, query);
+        let answer_snippet = crate::redact::redact(re, answer_snippet);
         self.db
             .execute(
-                "INSERT INTO query_log (endpoint, query, hit_paths, sources, answer_snippet, latency_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6);",
+                "INSERT INTO query_log (endpoint, query, hit_paths, sources, answer_snippet, latency_ms, meta)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7);",
                 &[
                     &endpoint,
                     &query,
@@ -1133,6 +2061,7 @@ impl Store {
                     &sources,
                     &answer_snippet,
                     &latency_ms,
+                    &PgJson(meta),
                 ],
             )
             .await
@@ -1144,7 +2073,7 @@ impl Store {
         let rows = self
             .db
             .query(
-                "SELECT id, created_at, endpoint, query, hit_paths, sources, answer_snippet, latency_ms
+                "SELECT id, created_at, endpoint, query, hit_paths, sources, answer_snippet, latency_ms, meta
                  FROM query_log ORDER BY created_at DESC LIMIT $1;",
                 &[&limit],
             )
@@ -1161,6 +2090,42 @@ impl Store {
                 sources: r.get(5),
                 answer_snippet: r.get(6),
                 latency_ms: r.get(7),
+                meta: r.get(8),
+            })
+            .collect())
+    }
+
+    /// Queries asked at least `min_count` times within the last `days` days,
+    /// most frequent first. Raw aggregate — the caller filters the lane
+    /// (e.g. code queries via `retrieve::is_code_query`).
+    pub async fn repeated_queries(
+        &self,
+        days: i64,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<QueryHotspot>> {
+        let days_i32 = i32::try_from(days).context("repeated queries days overflow")?;
+        let rows = self
+            .db
+            .query(
+                "SELECT lower(btrim(query)) AS q, count(*) AS n, max(created_at) AS last_at
+                 FROM query_log
+                 WHERE created_at > now() - make_interval(days => $1)
+                   AND length(btrim(query)) > 0
+                 GROUP BY q
+                 HAVING count(*) >= $2
+                 ORDER BY n DESC, last_at DESC
+                 LIMIT $3;",
+                &[&days_i32, &min_count, &limit],
+            )
+            .await
+            .context("repeated queries")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| QueryHotspot {
+                query: r.get(0),
+                count: r.get(1),
+                last_at: r.get(2),
             })
             .collect())
     }
@@ -1369,7 +2334,7 @@ impl Store {
             )
             .await
             .context("prune query_log")?;
-        report.prune_query_log = usize::try_from(pruned).unwrap_or(0);
+        report.prune_query_log = db_u64_rows_to_usize(pruned, "query_log prune")?;
 
         let gc = self.gc_orphans().await.context("gc orphans")?;
         report.gc_tool = gc.tool;
@@ -1463,7 +2428,7 @@ impl Store {
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
-    /// Semantic neighbors (problem/solution/tool/concept/attempt) — 1-hop from the document. Returns labels.
+    /// Semantic neighbors (tool/concept/claim) — 1-hop from the document. Returns labels.
     pub async fn semantic_neighbors(&self, chunk_id: &str) -> Result<Vec<String>> {
         let doc_id = doc_node_id(chunk_id);
         let rows = self
@@ -1513,13 +2478,275 @@ impl Store {
                     &[&kind],
                 )
                 .await?;
-            let c = usize::try_from(n).unwrap_or(0);
+            let c = db_u64_rows_to_usize(n, "semantic orphan gc")?;
             match kind {
                 "tool" => gc.tool = c,
                 _ => gc.concept = c,
             }
         }
         Ok(gc)
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Code graph lane (Phase 3) — deterministic AST symbols + relations
+    // ─────────────────────────────────────────────────────────────
+
+    /// Upsert one AST-parsed code symbol as a graph node.
+    pub async fn upsert_code_symbol(&self, symbol: &crate::codegraph::CodeSymbol) -> Result<()> {
+        let id = symbol.node_id();
+        self.db
+            .execute(
+                "INSERT INTO node (id, kind, label, outcome)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label, outcome = EXCLUDED.outcome;",
+                &[
+                    &id,
+                    &format!("code_{}", symbol.kind.as_str()),
+                    &symbol.name,
+                    &symbol.signature,
+                ],
+            )
+            .await
+            .context("upsert code symbol")?;
+        Ok(())
+    }
+
+    /// Insert a code symbol node only when missing (`ON CONFLICT DO NOTHING`).
+    /// Used by `remember_code`, which knows only path+name+kind and must never clobber
+    /// the parsed signature of an already-indexed symbol (the upsert above would).
+    pub async fn ensure_code_symbol_stub(
+        &self,
+        symbol: &crate::codegraph::CodeSymbol,
+    ) -> Result<()> {
+        let id = symbol.node_id();
+        self.db
+            .execute(
+                "INSERT INTO node (id, kind, label, outcome)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (id) DO NOTHING;",
+                &[
+                    &id,
+                    &format!("code_{}", symbol.kind.as_str()),
+                    &symbol.name,
+                    &symbol.signature,
+                ],
+            )
+            .await
+            .context("ensure code symbol stub")?;
+        Ok(())
+    }
+
+    /// Distinct source files currently present in the code graph (parsed out of
+    /// `code:<kind>:<path>:<name>` node ids). Used by `code-index` to refuse replacing
+    /// the graph with a walk that shares no files — the wrong-root footgun.
+    pub async fn code_indexed_files(&self) -> Result<std::collections::BTreeSet<String>> {
+        let rows = self
+            .db
+            .query("SELECT id FROM node WHERE id LIKE 'code:%';", &[])
+            .await
+            .context("code indexed files")?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let id: String = r.get(0);
+                let rest = id.strip_prefix("code:")?;
+                let mut parts = rest.splitn(3, ':');
+                parts.next()?; // kind
+                parts.next().map(str::to_owned) // path (names may contain ':', paths cannot)
+            })
+            .collect())
+    }
+
+    /// Upsert one code relation edge between two symbols.
+    pub async fn upsert_code_relation(
+        &self,
+        relation: &crate::codegraph::CodeRelation,
+    ) -> Result<()> {
+        let src = relation.from.node_id();
+        let dst = relation.to.node_id();
+        let kind = relation.kind.as_str();
+        self.db
+            .execute(
+                "INSERT INTO edge (src, dst, kind)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (src, dst, kind) DO NOTHING;",
+                &[&src, &dst, &kind],
+            )
+            .await
+            .context("upsert code relation")?;
+        Ok(())
+    }
+
+    /// Upsert an edge from a wiki document node to a code symbol node.
+    /// Used by `remember_code` to link a note to the AST code graph.
+    pub async fn upsert_doc_code_relation(
+        &self,
+        doc_source_path: &str,
+        symbol: &crate::codegraph::CodeSymbol,
+        kind: crate::codegraph::CodeRelationKind,
+    ) -> Result<()> {
+        let src = doc_node_id(doc_source_path);
+        let dst = symbol.node_id();
+        let kind = kind.as_str();
+        self.db
+            .execute(
+                "INSERT INTO edge (src, dst, kind)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (src, dst, kind) DO NOTHING;",
+                &[&src, &dst, &kind],
+            )
+            .await
+            .context("upsert doc code relation")?;
+        Ok(())
+    }
+
+    /// Wipe the whole code graph (`code:*` nodes + code↔code edges) so a re-index pass
+    /// replaces it with the current walk result — stale symbols of renamed/deleted files
+    /// disappear instead of accumulating. Doc→code `code_uses` edges written by
+    /// `remember_code` are deliberately preserved: symbol node ids are deterministic, so
+    /// they re-attach after re-upsert; edges to renamed-away symbols dangle inertly
+    /// (the edge table has no FK) until `gc_dangling_code_note_edges` reclaims them.
+    pub async fn clear_code_graph_preserving_doc_edges(&self) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM edge WHERE src LIKE 'code:%' AND dst LIKE 'code:%';",
+                &[],
+            )
+            .await
+            .context("clear code-code edges")?;
+        self.db
+            .execute("DELETE FROM node WHERE id LIKE 'code:%';", &[])
+            .await
+            .context("clear code nodes")?;
+        Ok(())
+    }
+
+    /// Delete doc→code `code_uses` edges whose symbol node no longer exists (the symbol
+    /// was renamed or its file removed). Returns the number of reclaimed edges. Runs at
+    /// the end of a re-index pass, when the code graph reflects the current tree.
+    pub async fn gc_dangling_code_note_edges(&self) -> Result<usize> {
+        let n = self
+            .db
+            .execute(
+                "DELETE FROM edge
+                 WHERE kind = 'code_uses' AND src LIKE 'doc:%' AND dst LIKE 'code:%'
+                   AND dst NOT IN (SELECT id FROM node);",
+                &[],
+            )
+            .await
+            .context("gc dangling code note edges")?;
+        db_u64_rows_to_usize(n, "code note edge gc")
+    }
+
+    /// Wiki notes linked to any of the given code symbol node ids (`code:…`) via
+    /// `code_uses` edges. Title comes from the document row, the snippet from chunk #0.
+    pub async fn code_notes_for_symbols(
+        &self,
+        symbol_node_ids: &[String],
+    ) -> Result<Vec<CodeNoteLink>> {
+        if symbol_node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .db
+            .query(
+                "SELECT e.dst, d.source_path, COALESCE(d.title, ''), COALESCE(left(c.content, 200), '')
+                 FROM edge e
+                 JOIN document d ON d.source_path = substring(e.src from 5)
+                 LEFT JOIN chunk c ON c.source_path = d.source_path AND c.chunk_idx = 0
+                 WHERE e.dst = ANY($1) AND e.kind = 'code_uses' AND e.src LIKE 'doc:%'
+                 ORDER BY d.source_path, e.dst;",
+                &[&symbol_node_ids],
+            )
+            .await
+            .context("code notes for symbols")?;
+        Ok(rows
+            .iter()
+            .map(|r| CodeNoteLink {
+                symbol_node_id: r.get(0),
+                source_path: r.get(1),
+                title: r.get(2),
+                snippet: r.get(3),
+            })
+            .collect())
+    }
+
+    /// K-hop neighbors of a code symbol through code edges.
+    pub async fn code_neighbors_khop(
+        &self,
+        symbol_node_id: &str,
+        k: usize,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let max_hop = store_usize_to_i32(k * 2, "code khop max edge hop")?;
+        let rows = self
+            .db
+            .query(
+                "WITH RECURSIVE walk AS (
+                     SELECT $1::text AS node, 0 AS hop, ARRAY[$1]::text[] AS path
+                     UNION ALL
+                     SELECT nxt.node,
+                            w.hop + 1,
+                            w.path || nxt.node
+                     FROM walk w
+                     JOIN LATERAL (
+                         SELECT e.dst AS node FROM edge e
+                          WHERE e.src = w.node AND e.kind = ANY($2)
+                         UNION
+                         SELECT e.src AS node FROM edge e
+                          WHERE e.dst = w.node AND e.kind = ANY($2)
+                     ) nxt ON NOT nxt.node = ANY(w.path)
+                     WHERE w.hop < $3
+                 )
+                 SELECT DISTINCT node FROM walk
+                 WHERE node LIKE 'code:%' AND node <> $1 AND hop > 0 AND hop <= $4
+                 ORDER BY node
+                 LIMIT $5;",
+                &[
+                    &symbol_node_id,
+                    &CODE_EDGE_KINDS.to_vec(),
+                    &max_hop,
+                    &max_hop,
+                    &limit,
+                ],
+            )
+            .await
+            .context("code neighbors khop")?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    /// Find code symbols whose name or signature matches a query substring.
+    /// Used by recall to surface code context for coding questions.
+    pub async fn search_code_symbols(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::codegraph::CodeSymbol>> {
+        let pattern = format!("%{query}%");
+        let rows = self
+            .db
+            .query(
+                "SELECT id, label, outcome
+                 FROM node
+                 WHERE id LIKE 'code:%' AND (label ILIKE $1 OR outcome ILIKE $1)
+                 ORDER BY label
+                 LIMIT $2;",
+                &[&pattern, &limit],
+            )
+            .await
+            .context("search code symbols")?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let id: String = r.get(0);
+                let label: String = r.get(1);
+                let outcome: Option<String> = r.get(2);
+                crate::codegraph::CodeSymbol::from_node_id(&id, &label, outcome)
+            })
+            .collect())
     }
 }
 
@@ -1577,5 +2804,93 @@ fn row_to_hit(r: &tokio_postgres::Row) -> Hit {
         project: r.get(3),
         source_path: r.get(4),
         dist: r.get(5),
+        score: 0.0,
+    }
+}
+
+fn row_to_claim_record(r: &tokio_postgres::Row) -> ClaimRecord {
+    ClaimRecord {
+        claim: Claim {
+            subject: r.get(0),
+            predicate: r.get(1),
+            value: r.get(2),
+            kind: r.get(3),
+            confidence: r.get(4),
+        },
+        source_path: r.get(5),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        canonical_claim_axis, claim_node_id, db_i64_count_to_usize, db_u64_rows_to_usize,
+        doc_path_from_node_id, store_usize_to_i32, store_usize_to_i64, typed_claim_node_id,
+    };
+    use crate::frontmatter::Claim;
+
+    #[test]
+    fn db_count_conversion_rejects_impossible_negative_count() {
+        let err = db_i64_count_to_usize(-1, "postgres").err();
+
+        assert!(
+            err.is_some_and(|err| format!("{err:#}").contains("postgres count cannot fit usize"))
+        );
+    }
+
+    #[test]
+    fn db_row_conversion_preserves_reported_rows() {
+        assert_eq!(db_u64_rows_to_usize(3, "query_log prune").ok(), Some(3));
+    }
+
+    #[test]
+    fn store_index_conversion_rejects_unrepresentable_chunk_index() {
+        let err = store_usize_to_i32(usize::MAX, "chunk index").err();
+
+        assert!(err.is_some_and(|err| format!("{err:#}").contains("chunk index cannot fit i32")));
+    }
+
+    #[test]
+    fn store_limit_conversion_preserves_requested_limit() {
+        assert_eq!(store_usize_to_i64(7, "search limit").ok(), Some(7));
+    }
+
+    #[test]
+    fn doc_path_parser_rejects_missing_doc_prefix() {
+        assert_eq!(
+            doc_path_from_node_id("doc:vault/wiki/wiki-0001.md").ok(),
+            Some("vault/wiki/wiki-0001.md".to_owned())
+        );
+
+        let err = doc_path_from_node_id("claim:omb:status").err();
+
+        assert!(err.is_some_and(|err| {
+            format!("{err:#}").contains("document node id missing doc: prefix")
+        }));
+    }
+
+    #[test]
+    fn claim_graph_ids_are_canonical() {
+        let claim = Claim {
+            subject: "  OH-my   Boring ".to_owned(),
+            predicate: "Release   Version".to_owned(),
+            value: "0.1.0".to_owned(),
+            kind: "decision".to_owned(),
+            confidence: "certain".to_owned(),
+        };
+
+        assert_eq!(claim_node_id(&claim), "claim:oh my boring:release version");
+        assert_eq!(
+            typed_claim_node_id("decision", &claim),
+            "decision:oh my boring:release version"
+        );
+    }
+
+    #[test]
+    fn claim_storage_axis_is_canonical() {
+        assert_eq!(
+            canonical_claim_axis("  OH-my   Boring ", "raw_witness"),
+            ("oh my boring".to_owned(), "raw witness".to_owned())
+        );
     }
 }
