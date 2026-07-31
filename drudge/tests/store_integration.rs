@@ -476,6 +476,100 @@ async fn next_claim_is_recallable() {
     store.delete_document(&path).await.expect("cleanup");
 }
 
+/// Regression test for the 2026-07-25 outage: a single `tokio_postgres::Client` wedged permanently
+/// once its underlying connection died, and every subsequent write failed silently for 5.5 days.
+/// `Store` now holds a `deadpool_postgres::Pool` (`RecyclingMethod::Verified`), which must
+/// transparently reconnect — both reads and writes must keep working after the connection is killed.
+///
+/// Scope guard on the kill: only backends for `current_database()`, excluding the admin connection
+/// issuing the kill (`pid <> pg_backend_pid()`) and restricted to `backend_type = 'client backend'` —
+/// this must never terminate another database's connections or non-client backends on a shared
+/// Postgres instance.
+#[tokio::test]
+async fn pool_recovers_after_connection_kill() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+
+    // Baseline: pool is functional before the kill.
+    store.liveness_probe().await.expect("baseline liveness probe");
+    let path = unique_path("pool-kill");
+    let front = dummy_frontmatter(&path);
+    store
+        .upsert_document(&front, "sha-before-kill", SystemTime::now())
+        .await
+        .expect("baseline write should succeed");
+
+    // Terminate every backend the pool holds for this database, from a separate admin connection.
+    let admin = connect(&dsn).await;
+    let killed = admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+             AND backend_type = 'client backend';",
+            &[],
+        )
+        .await
+        .expect("terminate backends");
+    // Assert on the kill's own return value, not just a pre-kill row count — asserting only the
+    // latter and discarding this value let a 0-connections-actually-killed run pass as green before.
+    assert!(
+        killed > 0,
+        "kill must actually terminate at least one backend, or this test is vacuous"
+    );
+
+    // Both a write and a read must succeed post-kill — the pool must transparently reconnect.
+    store
+        .upsert_document(&front, "sha-after-kill", SystemTime::now())
+        .await
+        .expect("write after connection kill should succeed (pool must reconnect)");
+    let sha = store
+        .get_doc_sha(&path)
+        .await
+        .expect("read after connection kill should succeed (pool must reconnect)");
+    assert_eq!(sha.as_deref(), Some("sha-after-kill"));
+
+    store.delete_document(&path).await.expect("cleanup");
+}
+
+/// Control group for `pool_recovers_after_connection_kill`: a bare, un-pooled `tokio_postgres::Client`
+/// (the pre-fix design) does NOT recover from its connection being terminated. This is the shape of
+/// the code that caused the 5.5-day outage — nothing in it re-establishes the connection.
+#[tokio::test]
+async fn bare_client_does_not_recover_after_connection_kill() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let target = connect(&dsn).await;
+    let admin = connect(&dsn).await;
+
+    let pid: i32 = target
+        .query_one("SELECT pg_backend_pid();", &[])
+        .await
+        .expect("get target pid")
+        .get(0);
+
+    let killed = admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE pid = $1 AND backend_type = 'client backend';",
+            &[&pid],
+        )
+        .await
+        .expect("terminate target backend");
+    assert_eq!(killed, 1, "kill must terminate exactly the target connection");
+
+    let result = target.query_one("SELECT 1;", &[]).await;
+    assert!(
+        result.is_err(),
+        "a bare tokio_postgres::Client must NOT recover from a terminated connection — this is \
+         the regression the deadpool-postgres pool (Store::pool) fixes"
+    );
+}
+
 /// Stalled backlog should respect the requested action kinds; old decisions stay in the decision register.
 #[tokio::test]
 async fn stalled_claims_honor_requested_kinds() {

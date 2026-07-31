@@ -1,4 +1,4 @@
-.PHONY: help up down build logs agent-logs events ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality self-verify-check deny eval bench-llm psql reset
+.PHONY: help up down build logs agent-logs events ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality test-db self-verify-check deny eval bench-llm psql reset
 
 # Some Docker Desktop installs have a broken `docker compose` plugin while the
 # standalone `docker-compose` binary works. Fall back transparently.
@@ -128,6 +128,30 @@ guard: ## Structural gate (fmt+clippy+test+py-compile+py-unit-tests) + vault dat
 
 quality: ## Release acceptance gate (MCP contract + docs drift + removed dangerous surface)
 	cd drudge && cargo test --quiet quality_gate
+
+test-db: ## Run the DB gate suites (origin_boundary/store_integration/context_integration/data_integrity/redact_fuzz/code_index_integration) against a disposable local pgvector container. Needs docker; the container is always removed on exit.
+	@command -v docker >/dev/null 2>&1 || { echo 'docker not found — required for make test-db (spins up a disposable pgvector container)'; exit 1; }
+	@name="drudge-test-db-$$$$"; \
+	trap 'docker rm -f "$$name" >/dev/null 2>&1 || true' EXIT INT TERM; \
+	echo "▶ starting disposable pgvector container ($$name) …"; \
+	docker run -d --name "$$name" -p 127.0.0.1::5432 \
+	  -e POSTGRES_USER=boring -e POSTGRES_PASSWORD=boring -e POSTGRES_DB=boring \
+	  pgvector/pgvector:pg16 >/dev/null || { echo "failed to start $$name"; exit 1; }; \
+	ready=0; \
+	for _ in $$(seq 1 30); do \
+	  docker exec "$$name" pg_isready -U boring -d boring >/dev/null 2>&1 && { ready=1; break; }; \
+	  sleep 1; \
+	done; \
+	[ "$$ready" = 1 ] || { echo "pgvector container never became ready"; exit 1; }; \
+	port="$$(docker port "$$name" 5432/tcp | cut -d: -f2)"; \
+	export BORING_TEST_DATABASE_URL="postgresql://boring:boring@127.0.0.1:$$port/boring"; \
+	echo "▶ running DB gate suites against $$BORING_TEST_DATABASE_URL …"; \
+	fail=0; \
+	for suite in origin_boundary store_integration context_integration data_integrity redact_fuzz code_index_integration; do \
+	  echo "── $$suite ──"; \
+	  (cd drudge && cargo test -p drudge --test "$$suite" -- --test-threads=1) || { echo "FAILED: $$suite"; fail=1; }; \
+	done; \
+	exit "$$fail"
 
 self-verify-check: ## Check self-verification stage contract: make self-verify-check [STAGE=bootstrap] [SUMMARY=/path/summary.tsv]
 	@python3 scripts/self-verify-contract.py --stage "$${STAGE:-bootstrap}" $${SUMMARY:+--summary "$$SUMMARY"}
