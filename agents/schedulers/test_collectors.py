@@ -100,6 +100,9 @@ def test_kimi_collector_fails_when_distill_fails():
 
             with (
                 mock.patch.object(kimi_collect, "_distill", return_value=False) as distill,
+                # Stub the client so the write-door preflight does not make this test depend on
+                # a reachable engine — it owns the distill-failure path, not readiness.
+                mock.patch.object(kimi_collect, "DrudgeClient"),
                 mock.patch.dict(os.environ, {"BORING_EVENT_LOG": str(event_path), "BORING_EVENT_SINK": "spool"}),
             ):
                 rc = kimi_collect.main()

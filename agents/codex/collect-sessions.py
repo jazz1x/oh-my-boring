@@ -585,7 +585,7 @@ def main(argv: list[str] | None = None):
     # door first so a degraded engine leaves the session pending instead of burning the model
     # on input that cannot be stored — that loop re-ran the same session every cycle.
     try:
-        check_drudge_writable()
+        check_drudge_writable(DrudgeClient())
     except DrudgeNotWritableError as exc:
         print(f"[codex-collect] write door closed: {exc}", file=sys.stderr, flush=True)
         event_log.try_append_event(

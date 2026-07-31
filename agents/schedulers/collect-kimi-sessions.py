@@ -104,7 +104,7 @@ def main():
     # Same reason as the other collectors: distillation is the expensive half, and a
     # degraded write door would only send the session back to retry.
     try:
-        check_drudge_writable()
+        check_drudge_writable(DrudgeClient())
     except DrudgeNotWritableError as exc:
         print(f"[collect-kimi] write door closed: {exc}", file=sys.stderr, flush=True)
         event_log.try_append_event(
