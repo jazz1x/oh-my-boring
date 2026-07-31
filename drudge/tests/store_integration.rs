@@ -113,23 +113,10 @@ async fn pool_recovers_after_backend_termination() {
     // `datname = current_database()` limits the blast radius to the isolated test
     // database. With `--test-threads=1` these are exactly the Store's pool
     // connections, but the filter is conservative enough for shared CI dbs too.
-    let terminated: i64 = admin
-        .query_one(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE datname = current_database()
-               AND pid <> pg_backend_pid()
-               AND backend_type = 'client backend';",
-            &[],
-        )
-        .await
-        .expect("count pool connections")
-        .get(0);
-    assert!(
-        terminated > 0,
-        "expected at least one Store pool connection to terminate"
-    );
-
-    admin
+    // Assert on what the kill actually did, not on a count taken beforehand: if the
+    // statement ever stops matching the pool's connections, this test must fail rather
+    // than pass on a write and read that were never interrupted.
+    let terminated = admin
         .execute(
             "SELECT pg_terminate_backend(pid)
              FROM pg_stat_activity
@@ -140,6 +127,10 @@ async fn pool_recovers_after_backend_termination() {
         )
         .await
         .expect("terminate pool connections");
+    assert!(
+        terminated > 0,
+        "expected to terminate at least one Store pool connection, terminated {terminated}"
+    );
 
     // The incident was a write-path failure (remember stopped), so exercise
     // both write and read after the kill.

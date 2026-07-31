@@ -25,6 +25,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: drudge
+          # Same key in every job that builds drudge, so the eval-gate DB suite
+          # reuses what rust-gate already compiled instead of starting cold.
+          shared-key: drudge
       # scripts/guard.sh = rustfmt --check + clippy -D warnings + test (스택-프리).
       - name: structural gate (guard.sh)
         run: ./scripts/guard.sh
@@ -39,6 +42,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: drudge
+          # Same key in every job that builds drudge, so the eval-gate DB suite
+          # reuses what rust-gate already compiled instead of starting cold.
+          shared-key: drudge
       - name: release quality gate
         run: make quality
 
@@ -114,6 +120,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: drudge
+          # Same key in every job that builds drudge, so the eval-gate DB suite
+          # reuses what rust-gate already compiled instead of starting cold.
+          shared-key: drudge
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
