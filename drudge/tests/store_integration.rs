@@ -494,7 +494,10 @@ async fn pool_recovers_after_connection_kill() {
     let store = Store::open(&dsn, 1024).await.expect("open store");
 
     // Baseline: pool is functional before the kill.
-    store.liveness_probe().await.expect("baseline liveness probe");
+    store
+        .liveness_probe()
+        .await
+        .expect("baseline liveness probe");
     let path = unique_path("pool-kill");
     let front = dummy_frontmatter(&path);
     store
@@ -560,7 +563,10 @@ async fn bare_client_does_not_recover_after_connection_kill() {
         )
         .await
         .expect("terminate target backend");
-    assert_eq!(killed, 1, "kill must terminate exactly the target connection");
+    assert_eq!(
+        killed, 1,
+        "kill must terminate exactly the target connection"
+    );
 
     let result = target.query_one("SELECT 1;", &[]).await;
     assert!(
