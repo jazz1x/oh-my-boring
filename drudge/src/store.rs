@@ -14,10 +14,27 @@
 //!
 //! ## Advantage over AGE
 //! Every value goes through `tokio-postgres` parameter binding ($1,$2…) → eliminates the cypher string-escaping footgun.
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use deadpool_postgres::{Manager, Object, Pool};
+use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime, Timeouts};
+
+/// Pool I/O-boundary timeouts. Finite values prevent infinite hangs on
+/// half-open sockets or a hung postgres process. The concrete seconds are a
+/// defensive bound, not a root-cause fix; the real fix is detecting and
+/// surfacing the failure rather than waiting forever. See CLAUDE.md
+/// "I/O-boundary timeout" and PHILOSOPHY.md Layer-1 honesty.
+const POOL_TIMEOUTS: Timeouts = Timeouts {
+    wait: Some(Duration::from_secs(5)),
+    create: Some(Duration::from_secs(5)),
+    recycle: Some(Duration::from_secs(5)),
+};
+
+/// Connection recycling method. `Verified` runs a lightweight test query on
+/// every reuse so that FIN-less cuts (idle reap, NAT timeout) cannot present a
+/// dead connection as alive. The cost is ~1 RTT per acquisition; that is
+/// preferred over the lie of a silently broken connection.
+const POOL_RECYCLING_METHOD: RecyclingMethod = RecyclingMethod::Verified;
 use pgvector::Vector;
 use serde_json::{Value, json};
 use tokio_postgres::types::Json as PgJson;
@@ -351,8 +368,17 @@ impl Store {
     #[allow(clippy::too_many_lines)] // schema DDL grows with features; splitting only obscures the one migration block.
     pub async fn open(dsn: &str, dim: usize) -> Result<Self> {
         let pg_config: tokio_postgres::Config = dsn.parse().context("parse postgres dsn")?;
-        let manager = Manager::new(pg_config, NoTls);
-        let pool = Pool::builder(manager).build()?;
+        let manager = Manager::from_config(
+            pg_config,
+            NoTls,
+            ManagerConfig {
+                recycling_method: POOL_RECYCLING_METHOD,
+            },
+        );
+        let pool = Pool::builder(manager)
+            .runtime(Runtime::Tokio1)
+            .timeouts(POOL_TIMEOUTS)
+            .build()?;
 
         // connect retry (IO boundary, graceful) — when postgres is started separately via profile
         // drudge waits up to ~10s even if it comes up first (depends_on removed → absorbs startup race).
@@ -2499,24 +2525,26 @@ impl Store {
     // ── stats / GC ──────────────────────────────────────────────────────────────
 
     pub async fn graph_stats(&self) -> Result<GraphStats> {
+        let db = self.db().await?;
         Ok(GraphStats {
-            documents: pg_count(&*self.db().await?, "SELECT count(*) FROM document;").await?,
-            chunks: pg_count(&*self.db().await?, "SELECT count(*) FROM chunk;").await?,
-            projects: count_node_kind(&*self.db().await?, "project").await?,
-            topics: count_node_kind(&*self.db().await?, "topic").await?,
-            claims: count_node_kind(&*self.db().await?, "claim").await?,
-            decisions: count_node_kind(&*self.db().await?, "decision").await?,
-            risks: count_node_kind(&*self.db().await?, "risk").await?,
-            edges: pg_count(&*self.db().await?, "SELECT count(*) FROM edge;").await?,
+            documents: pg_count(&db, "SELECT count(*) FROM document;").await?,
+            chunks: pg_count(&db, "SELECT count(*) FROM chunk;").await?,
+            projects: count_node_kind(&db, "project").await?,
+            topics: count_node_kind(&db, "topic").await?,
+            claims: count_node_kind(&db, "claim").await?,
+            decisions: count_node_kind(&db, "decision").await?,
+            risks: count_node_kind(&db, "risk").await?,
+            edges: pg_count(&db, "SELECT count(*) FROM edge;").await?,
         })
     }
 
     pub async fn semantic_stats(&self) -> Result<SemanticStats> {
+        let db = self.db().await?;
         Ok(SemanticStats {
-            tools: count_node_kind(&*self.db().await?, "tool").await?,
-            concepts: count_node_kind(&*self.db().await?, "concept").await?,
-            uses: count_edge_kind(&*self.db().await?, "uses").await?,
-            about: count_edge_kind(&*self.db().await?, "about").await?,
+            tools: count_node_kind(&db, "tool").await?,
+            concepts: count_node_kind(&db, "concept").await?,
+            uses: count_edge_kind(&db, "uses").await?,
+            about: count_edge_kind(&db, "about").await?,
         })
     }
 
