@@ -9,6 +9,7 @@
 //! - Error propagation: `AppError` → explicit HTTP status + JSON body.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio::sync::Mutex;
 
@@ -32,6 +33,33 @@ mod mcp;
 mod scheduler;
 
 // ── shared state ──────────────────────────────────────────────────────────────
+
+/// Last-observed DB health state for /health transition logging. Stored as an AtomicU8 so concurrent
+/// /health probes can detect a flip with a single atomic RMW — no load-then-store race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbHealthState {
+    Unknown,
+    Healthy,
+    Unhealthy,
+}
+
+impl DbHealthState {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Healthy => 1,
+            Self::Unhealthy => 2,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Healthy,
+            2 => Self::Unhealthy,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -59,6 +87,9 @@ pub struct AppState {
     pub(crate) wiki_index: Arc<std::sync::Mutex<wiki_recall::WikiIndex>>,
     /// Last successful compact time, shared with scheduler so manual `/compact` resets the window.
     pub(crate) last_compact: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Last observed DB health state for transition logging. `Unknown` until the first /health probe.
+    /// Wrapped in Arc so AppState remains Clone while the atomic is shared across cloned state handles.
+    pub(crate) db_healthy_last: Arc<AtomicU8>,
 }
 
 impl AppState {
@@ -86,6 +117,137 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         idx.refresh(&dir)?;
         Ok(idx.search(query, k, project, since_hours))
+    }
+
+    /// Probe all resident DB clients and return `(db_healthy, optional_error_text)`.
+    /// `db_healthy` is `None` when no DB client is configured (vector off + code_index off).
+    /// `Some(false)` means at least one configured client failed its liveness probe.
+    pub(crate) async fn probe_db_health(&self) -> (Option<bool>, Option<String>) {
+        let mut errors = Vec::new();
+
+        if let Some(store) = self.store.as_ref()
+            && let Err(error) = store.liveness_probe().await
+        {
+            errors.push(format!("store: {error:#}"));
+        }
+
+        if let Some(code_index) = self.code_index.as_ref()
+            && let Err(error) = code_index.liveness_probe().await
+        {
+            errors.push(format!("code_index: {error:#}"));
+        }
+
+        if self.store.is_none() && self.code_index.is_none() {
+            (None, None)
+        } else if errors.is_empty() {
+            (Some(true), None)
+        } else {
+            (Some(false), Some(errors.join("; ")))
+        }
+    }
+
+    /// Update the atomic last-observed state and emit a transition log line only on flip.
+    /// Returns the status string for the HTTP response ("ok" or "degraded").
+    pub(crate) async fn check_db_health(&self) -> (Option<bool>, &'static str) {
+        let (db_healthy, error_text) = self.probe_db_health().await;
+        let next_state = DbHealthState::from_option(db_healthy);
+        let prev_state = DbHealthState::from_u8(
+            self.db_healthy_last
+                .swap(next_state.to_u8(), Ordering::SeqCst),
+        );
+        if let Some(log) = transition_log(prev_state, next_state, error_text.as_deref()) {
+            eprintln!("{log}");
+        }
+        let status = if db_healthy == Some(false) {
+            "degraded"
+        } else {
+            "ok"
+        };
+        (db_healthy, status)
+    }
+}
+
+impl DbHealthState {
+    const fn from_option(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::Healthy,
+            Some(false) => Self::Unhealthy,
+            None => Self::Unknown,
+        }
+    }
+}
+
+/// Pure transition logger. Returns `None` when the state hasn't changed or when the change doesn't
+/// deserve a log line (e.g. initial Unknown → Healthy at startup).
+fn transition_log(prev: DbHealthState, next: DbHealthState, error: Option<&str>) -> Option<String> {
+    if prev == next {
+        return None;
+    }
+    match (prev, next) {
+        (_, DbHealthState::Unhealthy) => {
+            let err = error.unwrap_or("unknown error");
+            Some(format!("[health] db degraded: {err}"))
+        }
+        (DbHealthState::Unhealthy, DbHealthState::Healthy) => {
+            Some("[health] db recovered".to_owned())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{DbHealthState, transition_log};
+
+    #[test]
+    fn same_state_is_silent() {
+        assert!(transition_log(DbHealthState::Healthy, DbHealthState::Healthy, None).is_none());
+        assert!(
+            transition_log(
+                DbHealthState::Unhealthy,
+                DbHealthState::Unhealthy,
+                Some("x")
+            )
+            .is_none()
+        );
+        assert!(transition_log(DbHealthState::Unknown, DbHealthState::Unknown, None).is_none());
+    }
+
+    #[test]
+    fn failure_transition_includes_error_text() {
+        let log = transition_log(
+            DbHealthState::Healthy,
+            DbHealthState::Unhealthy,
+            Some("connection closed"),
+        )
+        .unwrap();
+        assert!(log.starts_with("[health] db degraded:"));
+        assert!(log.contains("connection closed"));
+    }
+
+    #[test]
+    fn recovery_transition_is_one_line() {
+        let log = transition_log(DbHealthState::Unhealthy, DbHealthState::Healthy, None).unwrap();
+        assert_eq!(log, "[health] db recovered");
+    }
+
+    #[test]
+    fn unknown_to_unhealthy_logs_failure() {
+        let log = transition_log(
+            DbHealthState::Unknown,
+            DbHealthState::Unhealthy,
+            Some("cannot connect"),
+        )
+        .unwrap();
+        assert!(log.starts_with("[health] db degraded:"));
+        assert!(log.contains("cannot connect"));
+    }
+
+    #[test]
+    fn unknown_to_healthy_is_silent_at_startup() {
+        assert!(transition_log(DbHealthState::Unknown, DbHealthState::Healthy, None).is_none());
     }
 }
 
@@ -398,6 +560,10 @@ pub(crate) struct HealthResp {
     /// unset/unreadable (kept best-effort so /health stays a liveness probe).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_count: Option<usize>,
+    /// `true` when all configured DB clients answer `SELECT 1`, `false` when any fail,
+    /// omitted when no DB client is configured (vector off + code_index off) to avoid false alarms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) db_healthy: Option<bool>,
 }
 
 /// Best-effort count of wiki notes (`vault/wiki/*.md`). `None` on any IO error — `/health` must stay a
@@ -469,6 +635,7 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
         sync_lock: Arc::new(Mutex::new(())),
         last_compact: Arc::clone(&last_compact),
         wiki_index: Arc::new(std::sync::Mutex::new(wiki_recall::WikiIndex::default())),
+        db_healthy_last: Arc::new(AtomicU8::new(DbHealthState::Unknown.to_u8())),
     };
 
     scheduler::spawn_scheduler(
