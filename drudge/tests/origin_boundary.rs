@@ -3,7 +3,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use drudge::frontmatter::FrontMatter;
+use drudge::frontmatter::{FrontMatter, claim_key};
 use drudge::store::Store;
 
 fn test_dsn() -> Option<String> {
@@ -101,7 +101,9 @@ async fn current_claims_respects_exclude_origins() {
         .await
         .expect("personal only");
     assert_eq!(personal_only.len(), 1, "company claim should be excluded");
-    assert_eq!(personal_only[0].subject, project);
+    // Claims are stored under a canonical claim_key (non-alphanumerics → spaces),
+    // so the read-back subject is the normalized form of the original project name.
+    assert_eq!(personal_only[0].subject, claim_key(&project));
 
     store.delete_document(&p_path).await.expect("cleanup p");
     store.delete_document(&c_path).await.expect("cleanup c");

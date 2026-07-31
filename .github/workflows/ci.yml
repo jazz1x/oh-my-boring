@@ -108,6 +108,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: drudge
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -122,13 +128,35 @@ jobs:
           # embed_dim=1024 matches the recording. provider/bootstrap are host-side only (unused here).
           cp boring.example.json boring.json
           mkdir -p vault/raw vault/wiki "$HOME/.claude/projects"
-      - name: start stack (vector mode)
+      - name: start postgres (vector mode)
+        env:
+          BORING_VECTOR: "on"
+        run: |
+          export BORING_UID="$(id -u)" BORING_GID="$(id -g)"
+          docker compose --profile vector up -d --build boring-postgres
+          for _ in $(seq 1 60); do docker compose exec -T boring-postgres pg_isready -U boring -d boring >/dev/null 2>&1 && break; sleep 1; done
+      - name: DB integration gate
+        env:
+          BORING_TEST_DATABASE_URL: postgresql://boring:boring@127.0.0.1:5432/boring
+        run: |
+          set +e
+          status=0
+          for suite in origin_boundary store_integration context_integration data_integrity redact_fuzz; do
+            echo "==> $suite"
+            cargo test --manifest-path drudge/Cargo.toml --test "$suite" -- --test-threads=1 || status=1
+          done
+          exit $status
+      - name: reset database for eval
+        run: |
+          docker compose exec -T boring-postgres psql -U boring -d postgres -c "DROP DATABASE IF EXISTS boring;"
+          docker compose exec -T boring-postgres psql -U boring -d postgres -c "CREATE DATABASE boring;"
+      - name: start drudge (vector mode)
         env:
           BORING_VECTOR: "on"
         run: |
           # Run the container as the runner user so it can write the bind-mounted vault (Linux EACCES guard).
           export BORING_UID="$(id -u)" BORING_GID="$(id -g)"
-          docker compose --profile vector up -d --build boring-drudge boring-postgres
+          docker compose --profile vector up -d --build boring-drudge
           for _ in $(seq 1 60); do curl -sf -m3 http://127.0.0.1:7700/health >/dev/null 2>&1 && break; sleep 3; done
           curl -sf -m3 http://127.0.0.1:7700/health
       - name: behavioral gate (eval-gate.sh)

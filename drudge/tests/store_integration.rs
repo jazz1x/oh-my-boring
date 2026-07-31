@@ -80,6 +80,117 @@ async fn compact_succeeds_in_autocommit_mode() {
     assert!(summary.total_ms > 0, "compact should report elapsed time");
 }
 
+/// Regression for the 2026-07-25 incident: if postgres kills the Store's
+/// connections, the pool must detect the broken objects and the next query
+/// must succeed automatically. A single shared Client would fail permanently
+/// here because it has no replacement path.
+#[tokio::test]
+async fn pool_recovers_after_backend_termination() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+    let admin = connect(&dsn).await;
+    let path = unique_path("pool-resilience");
+    let mut front = dummy_frontmatter(&path);
+    front.project = "omb".to_owned();
+
+    // Warm the pool and prove the baseline write/read path works.
+    store
+        .upsert_document(&front, "sha-pool-resilience", SystemTime::now())
+        .await
+        .expect("initial upsert");
+    let before = store
+        .doc_updated_at(&path)
+        .await
+        .expect("initial read before termination");
+    assert!(before.is_some(), "document should exist before termination");
+
+    // Kill every connection to this database except the admin connection we are
+    // using for the kill. `pid <> pg_backend_pid()` protects the admin session;
+    // `datname = current_database()` limits the blast radius to the isolated test
+    // database. With `--test-threads=1` these are exactly the Store's pool
+    // connections, but the filter is conservative enough for shared CI dbs too.
+    let terminated: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND pid <> pg_backend_pid()
+               AND backend_type = 'client backend';",
+            &[],
+        )
+        .await
+        .expect("count pool connections")
+        .get(0);
+    assert!(
+        terminated > 0,
+        "expected at least one Store pool connection to terminate"
+    );
+
+    admin
+        .execute(
+            "SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND pid <> pg_backend_pid()
+               AND backend_type = 'client backend';",
+            &[],
+        )
+        .await
+        .expect("terminate pool connections");
+
+    // The incident was a write-path failure (remember stopped), so exercise
+    // both write and read after the kill.
+    store
+        .upsert_document(&front, "sha-pool-resilience-2", SystemTime::now())
+        .await
+        .expect("upsert after backend termination");
+    let after = store
+        .doc_updated_at(&path)
+        .await
+        .expect("read after backend termination");
+    assert!(
+        after.is_some(),
+        "document should still be readable after recovery"
+    );
+
+    store.delete_document(&path).await.expect("cleanup");
+}
+
+/// Control for `pool_recovers_after_backend_termination`: a single raw connection
+/// stays dead after the backend is terminated. The pre-pool Store used exactly one
+/// `tokio_postgres::Client`, so this is why that implementation could not have passed
+/// the recovery test above.
+#[tokio::test]
+async fn single_raw_connection_stays_dead_after_termination() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+
+    let direct = connect(&dsn).await;
+    let admin = connect(&dsn).await;
+
+    let pid: i32 = direct
+        .query_one("SELECT pg_backend_pid();", &[])
+        .await
+        .expect("get direct backend pid")
+        .get(0);
+
+    admin
+        .execute("SELECT pg_terminate_backend($1);", &[&pid])
+        .await
+        .expect("terminate direct connection");
+
+    let result = direct.query_one("SELECT 1;", &[]).await;
+    assert!(
+        result.is_err(),
+        "a single terminated connection must not be usable again without reconnection"
+    );
+}
+
 #[tokio::test]
 async fn doc_updated_at_returns_none_for_missing_document() {
     let Some(dsn) = test_dsn() else {

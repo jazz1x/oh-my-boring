@@ -1,4 +1,4 @@
-.PHONY: help up down build logs agent-logs events recent-events codex-status-strict ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality self-verify-cycle self-verify-check deny eval bench-llm psql reset
+.PHONY: help up down build logs agent-logs events recent-events codex-status-strict ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality test-db self-verify-cycle self-verify-check deny eval bench-llm psql reset
 
 # Some Docker Desktop installs have a broken `docker compose` plugin while the
 # standalone `docker-compose` binary works. Fall back transparently.
@@ -143,6 +143,27 @@ guard: ## Full structural gate (Rust/Python/shell) + vault data hygiene dry-run
 
 quality: ## Release acceptance gate (MCP contract + docs drift + removed dangerous surface)
 	cd drudge && cargo test --quiet quality_gate
+
+test-db: ## Run DB integration suites (starts disposable pgvector, requires docker)
+	@command -v docker >/dev/null 2>&1 || { echo 'docker not found — install Docker to run test-db'; exit 1; }
+	@port=$${BORING_TEST_DB_PORT:-5433}; \
+	container="drudge-test-db-$$$$"; \
+	docker run --rm -d --name "$$container" -p "127.0.0.1:$$port:5432" \
+	  -e POSTGRES_USER=boring -e POSTGRES_PASSWORD=boring -e POSTGRES_DB=boring \
+	  pgvector/pgvector:pg16 >/dev/null; \
+	trap 'docker rm -f "$$container" >/dev/null 2>&1 || true' EXIT INT TERM; \
+	for _ in $$(seq 1 30); do \
+	  if docker exec "$$container" pg_isready -U boring -d boring >/dev/null 2>&1; then break; fi; \
+	  sleep 1; \
+	done; \
+	dsn="postgresql://boring:boring@127.0.0.1:$$port/boring"; \
+	echo "Running DB gate suites against $$dsn"; \
+	status=0; \
+	for suite in origin_boundary store_integration context_integration data_integrity redact_fuzz; do \
+	  echo "==> $$suite"; \
+	  BORING_TEST_DATABASE_URL="$$dsn" cargo test --manifest-path drudge/Cargo.toml --test "$$suite" -- --test-threads=1 || status=1; \
+	done; \
+	exit $$status
 
 self-verify-cycle: ## Run the next self-verification cycle: make self-verify-cycle [CYCLE=<expected-next>] [SUMMARY=/path/summary.tsv]
 	@if [ -n "$$CYCLE" ]; then \
