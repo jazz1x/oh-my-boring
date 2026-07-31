@@ -576,13 +576,16 @@ def test_collect_scan_reoffers_stale_pending_but_skips_fresh_pending():
 
 
 def test_collect_noop_run_logs_workflow_fields():
+    old_mark_dir = collect.markers.MARK_DIR
     old_min_kb = collect.MIN_KB
     try:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = root / "sessions"
             source.mkdir()
+            mark_dir = root / "markers"
             event_path = root / "events.ndjson"
+            collect.markers.set_mark_dir(str(mark_dir))
             collect.MIN_KB = 0
 
             stdout = io.StringIO()
@@ -604,6 +607,7 @@ def test_collect_noop_run_logs_workflow_fields():
             assert event["workflow_node"] == "readiness_projected"
             assert event["workflow_outcome"] == "pass"
     finally:
+        collect.markers.set_mark_dir(old_mark_dir)
         collect.MIN_KB = old_min_kb
 
 
@@ -858,13 +862,16 @@ def test_codex_note_session_id_rejects_non_string_yaml_value():
 
 
 def test_status_strict_fails_when_host_worker_missing():
+    old_mark_dir = collect.markers.MARK_DIR
     old_min_kb = collect.MIN_KB
     try:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = root / "sessions"
             source.mkdir()
+            mark_dir = root / "markers"
             event_path = root / "events.ndjson"
+            collect.markers.set_mark_dir(str(mark_dir))
             collect.MIN_KB = 0
             _write_codex_session(source / "todo.jsonl")
 
@@ -897,16 +904,20 @@ def test_status_strict_fails_when_host_worker_missing():
             assert event["workflow_node"] == "readiness_projected"
             assert event["workflow_outcome"] == "fail"
     finally:
+        collect.markers.set_mark_dir(old_mark_dir)
         collect.MIN_KB = old_min_kb
 
 
 def test_status_strict_reports_hermes_worker_failure_as_notice_when_host_worker_loaded():
+    old_mark_dir = collect.markers.MARK_DIR
     old_min_kb = collect.MIN_KB
     try:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = root / "sessions"
             source.mkdir()
+            mark_dir = root / "markers"
+            collect.markers.set_mark_dir(str(mark_dir))
             collect.MIN_KB = 0
             _write_codex_session(source / "todo.jsonl")
 
@@ -958,6 +969,7 @@ def test_status_strict_reports_hermes_worker_failure_as_notice_when_host_worker_
             assert event["workflow_node"] == "readiness_projected"
             assert event["workflow_outcome"] == "pass"
     finally:
+        collect.markers.set_mark_dir(old_mark_dir)
         collect.MIN_KB = old_min_kb
 
 

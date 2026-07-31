@@ -70,6 +70,7 @@ python3 agents/shared/test_transcript.py
 python3 agents/shared/test_recall_core.py
 python3 agents/shared/test_code_recall_core.py
 python3 agents/shared/test_briefing_format.py
+python3 agents/shared/test_drudge_client.py
 python3 agents/claude-code/test_hooks.py
 python3 agents/codex/test_codex.py
 python3 agents/kimi/test_kimi.py
@@ -88,8 +89,9 @@ python3 scripts/test_self_verify_contract.py
 echo "6) shell destructive-path guardrails (backup/restore DB)…"
 sh scripts/test_backup_db.sh
 sh scripts/test_restore_db.sh
-echo "7) shell readiness gate guardrails (doctor --strict)…"
+echo "7) shell readiness gate guardrails (doctor --strict + health helper)…"
 sh scripts/test_doctor.sh
+sh scripts/test_drudge_health_readiness.sh
 echo "8) shell LLM/provider guardrails (verify-llm)…"
 sh scripts/test_verify_llm.sh
 echo "9) vault lint --strict (schema/frontmatter/wikilink/sources)…"

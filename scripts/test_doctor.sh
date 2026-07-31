@@ -179,7 +179,7 @@ case "$(cat "$TMP/fail/events.calls")" in
 esac
 
 make_case "$TMP/provider-fail" yes
-if DOCTOR_VERIFY_LLM_FAIL=1 run_strict "$TMP/provider-fail" "$TMP/provider-fail.out"; then
+if ( DOCTOR_VERIFY_LLM_FAIL=1 run_strict "$TMP/provider-fail" "$TMP/provider-fail.out" ); then
     cat "$TMP/provider-fail.out"
     echo "FAIL: strict doctor should fail when verify-llm fails" >&2
     exit 1
@@ -192,10 +192,9 @@ case "$(cat "$TMP/provider-fail.out")" in
     exit 1
     ;;
 esac
-unset DOCTOR_VERIFY_LLM_FAIL
 
 make_case "$TMP/docker-ps-fail" yes
-if DOCTOR_DOCKER_PS_FAIL=1 run_strict "$TMP/docker-ps-fail" "$TMP/docker-ps-fail.out"; then
+if ( DOCTOR_DOCKER_PS_FAIL=1 run_strict "$TMP/docker-ps-fail" "$TMP/docker-ps-fail.out" ); then
     cat "$TMP/docker-ps-fail.out"
     echo "FAIL: strict doctor should fail when compose ps cannot inspect containers" >&2
     exit 1
@@ -208,13 +207,12 @@ case "$(cat "$TMP/docker-ps-fail.out")" in
     exit 1
     ;;
 esac
-unset DOCTOR_DOCKER_PS_FAIL
 
 make_case "$TMP/stale-note" yes
 old_note="$TMP/stale-note/boring/vault/wiki/wiki-0001.md"
 old_epoch=$(( $(date +%s) - 7200 ))
 python3 -c 'import os, sys; os.utime(sys.argv[1], (int(sys.argv[2]), int(sys.argv[2])))' "$old_note" "$old_epoch"
-if BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/stale-note" "$TMP/stale-note.out"; then
+if ( BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/stale-note" "$TMP/stale-note.out" ); then
     cat "$TMP/stale-note.out"
     echo "FAIL: strict doctor should fail when newest note is stale" >&2
     exit 1
@@ -240,7 +238,7 @@ tags:
 ---
 generated briefing output, not source memory
 MD
-if BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/generated-brief-fresh" "$TMP/generated-brief-fresh.out"; then
+if ( BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/generated-brief-fresh" "$TMP/generated-brief-fresh.out" ); then
     cat "$TMP/generated-brief-fresh.out"
     echo "FAIL: strict doctor should ignore generated brief freshness" >&2
     exit 1
@@ -266,7 +264,7 @@ tags:
 ---
 source memory that should still count for freshness
 MD
-if ! BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/similar-brief-tag-is-source" "$TMP/similar-brief-tag-is-source.out"; then
+if ! ( BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/similar-brief-tag-is-source" "$TMP/similar-brief-tag-is-source.out" ); then
     cat "$TMP/similar-brief-tag-is-source.out"
     echo "FAIL: strict doctor treated a similar tag as generated daily-brief output" >&2
     exit 1
@@ -284,7 +282,7 @@ make_case "$TMP/stale-marker" yes
 touch "$TMP/stale-marker/home/.cache/boring-distill/stale.pending"
 old_marker_epoch=$(( $(date +%s) - 7200 ))
 python3 -c 'import os, sys; os.utime(sys.argv[1], (int(sys.argv[2]), int(sys.argv[2])))' "$TMP/stale-marker/home/.cache/boring-distill/stale.pending" "$old_marker_epoch"
-if BORING_READINESS_PENDING_TTL=60 run_strict "$TMP/stale-marker" "$TMP/stale-marker.out"; then
+if ( BORING_READINESS_PENDING_TTL=60 run_strict "$TMP/stale-marker" "$TMP/stale-marker.out" ); then
     cat "$TMP/stale-marker.out"
     echo "FAIL: strict doctor should fail when pending marker is stale" >&2
     exit 1
@@ -299,7 +297,7 @@ case "$(cat "$TMP/stale-marker.out")" in
 esac
 
 make_case "$TMP/invalid-ttl" yes
-if BORING_READINESS_PENDING_TTL=abc run_strict "$TMP/invalid-ttl" "$TMP/invalid-ttl.out"; then
+if ( BORING_READINESS_PENDING_TTL=abc run_strict "$TMP/invalid-ttl" "$TMP/invalid-ttl.out" ); then
     cat "$TMP/invalid-ttl.out"
     echo "FAIL: strict doctor should fail on invalid marker TTL" >&2
     exit 1
@@ -314,7 +312,7 @@ case "$(cat "$TMP/invalid-ttl.out")" in
 esac
 
 make_case "$TMP/invalid-recent-hours" yes
-if BORING_EVENT_RECENT_HOURS=0 run_strict "$TMP/invalid-recent-hours" "$TMP/invalid-recent-hours.out"; then
+if ( BORING_EVENT_RECENT_HOURS=0 run_strict "$TMP/invalid-recent-hours" "$TMP/invalid-recent-hours.out" ); then
     cat "$TMP/invalid-recent-hours.out"
     echo "FAIL: strict doctor should fail on invalid recent event window" >&2
     exit 1
@@ -329,7 +327,7 @@ case "$(cat "$TMP/invalid-recent-hours.out")" in
 esac
 
 make_case "$TMP/db-degraded" yes
-if DOCTOR_HEALTH_DB_HEALTHY=false DOCTOR_HEALTH_STATUS=degraded run_strict "$TMP/db-degraded" "$TMP/db-degraded.out"; then
+if ( DOCTOR_HEALTH_DB_HEALTHY=false DOCTOR_HEALTH_STATUS=degraded run_strict "$TMP/db-degraded" "$TMP/db-degraded.out" ); then
     cat "$TMP/db-degraded.out"
     echo "FAIL: strict doctor should fail when db_healthy=false" >&2
     exit 1
@@ -342,10 +340,9 @@ case "$(cat "$TMP/db-degraded.out")" in
     exit 1
     ;;
 esac
-unset DOCTOR_HEALTH_DB_HEALTHY DOCTOR_HEALTH_STATUS
 
 make_case "$TMP/vector-off" yes
-if DOCTOR_HEALTH_DB_HEALTHY='' run_strict "$TMP/vector-off" "$TMP/vector-off.out"; then
+if ( DOCTOR_HEALTH_DB_HEALTHY='' run_strict "$TMP/vector-off" "$TMP/vector-off.out" ); then
     :
 else
     cat "$TMP/vector-off.out"
@@ -360,6 +357,5 @@ case "$(cat "$TMP/vector-off.out")" in
     exit 1
     ;;
 esac
-unset DOCTOR_HEALTH_DB_HEALTHY
 
 echo "doctor strict gate tests passed"
