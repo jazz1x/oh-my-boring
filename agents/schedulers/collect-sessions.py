@@ -29,7 +29,7 @@ import event_log
 import markers
 import omb_env
 import workflow_contract
-from drudge_client import DrudgeClient
+from drudge_client import DrudgeClient, DrudgeNotWritableError, check_drudge_writable
 
 BORING_URL = omb_env.drudge_url()  # BORING_URL canonical, BORING_URL deprecated alias
 WINDOW_H = float(os.environ.get("COLLECT_WINDOW_HOURS") or "720")
@@ -130,6 +130,30 @@ def main():
             **workflow_contract.collector_run_fields("ok", 0),
         )
         return 0
+
+    # Distilling costs a full LLM pass; remembering is what needs the DB. Check the write
+    # door first so a degraded engine leaves the session pending instead of burning the model
+    # on input that cannot be stored — that loop re-ran the same session every cycle.
+    try:
+        check_drudge_writable()
+    except DrudgeNotWritableError as exc:
+        print(f"[claude-collect] write door closed: {exc}", file=sys.stderr, flush=True)
+        event_log.try_append_event(
+            "claude-collector",
+            "collector_run",
+            "failed",
+            run_id=run_id,
+            agent="claude-code",
+            pending=len(todo),
+            batch=len(batch),
+            processed=0,
+            failed=0,
+            remaining=len(todo),
+            mode=label,
+            reason=str(exc),
+            **workflow_contract.collector_run_fields("failed", len(batch)),
+        )
+        return 1
 
     _warm_llm()  # pre-warm gemma so the first session isn't a ~70s cold start (→ agent timeout → SKIP)
 
