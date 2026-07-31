@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use tokio_postgres::{Client, NoTls, Transaction};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime, Timeouts};
+use tokio_postgres::{Config as PgConfig, NoTls, Transaction};
 
 use super::{
     CodeIndexError, CodeRelation, CodeSearchHit, CodeSymbolDetail, PreparedFile, RepositoryStatus,
@@ -12,24 +13,57 @@ use crate::config::CodeIndexSource;
 /// PostgreSQL adapter dedicated to the `code_index` schema. It never reads or writes the memory
 /// corpus (`document`, `chunk`, `node`, `edge`, `claim`).
 pub struct CodeIndexStore {
-    db: Client,
+    pool: Pool,
 }
+
+/// I/O-boundary timeout for pool wait/create/recycle. Prevents infinite hangs on DB loss;
+/// drudge/CLAUDE.md treats this as a graceful boundary, distinct from defensive `{timeout:200}` bounds.
+const POOL_TIMEOUT_SECONDS: u64 = 5;
+const POOL_TIMEOUTS: Timeouts = Timeouts {
+    wait: Some(Duration::from_secs(POOL_TIMEOUT_SECONDS)),
+    create: Some(Duration::from_secs(POOL_TIMEOUT_SECONDS)),
+    recycle: Some(Duration::from_secs(POOL_TIMEOUT_SECONDS)),
+};
 
 impl CodeIndexStore {
     /// Connect without creating or migrating schema. Read-only commands use this path.
+    #[allow(clippy::unused_async)] // kept async to match the existing caller contract.
     pub async fn connect(dsn: &str) -> Result<Self, CodeIndexError> {
-        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                eprintln!("code index postgres connection error: {error}");
-            }
-        });
-        Ok(Self { db: client })
+        let pg_config: PgConfig = dsn.parse()?;
+        let manager = Manager::from_config(
+            pg_config,
+            NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Verified,
+            },
+        );
+        let pool = Pool::builder(manager)
+            .runtime(Runtime::Tokio1)
+            .timeouts(POOL_TIMEOUTS)
+            .build()
+            .map_err(|e| CodeIndexError::Pool(e.to_string()))?;
+        Ok(Self { pool })
+    }
+    /// Acquire a connection from the pool.
+    async fn db(&self) -> Result<deadpool_postgres::Object, CodeIndexError> {
+        self.pool
+            .get()
+            .await
+            .map_err(|e| CodeIndexError::Pool(e.to_string()))
+    }
+
+    /// Probe that the database is reachable. Propagates the original error.
+    pub async fn liveness_probe(&self) -> Result<(), CodeIndexError> {
+        let db = self.db().await?;
+        db.query_one("SELECT 1", &[])
+            .await
+            .map_err(CodeIndexError::Database)?;
+        Ok(())
     }
 
     /// Initialize the isolated code-index schema immediately before a selected sync writes it.
     pub async fn initialize(&self) -> Result<(), CodeIndexError> {
-        self.db.batch_execute(SCHEMA).await?;
+        self.db().await?.batch_execute(SCHEMA).await?;
         Ok(())
     }
 
@@ -38,7 +72,8 @@ impl CodeIndexStore {
         repository_id: &str,
     ) -> Result<HashMap<String, String>, CodeIndexError> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT relative_path, sha256 FROM code_index.file WHERE repository_id = $1",
                 &[&repository_id],
@@ -60,7 +95,8 @@ impl CodeIndexStore {
             .root()
             .to_str()
             .ok_or_else(|| CodeIndexError::NonUtf8Path(source.root().to_path_buf()))?;
-        let transaction = self.db.transaction().await?;
+        let mut db = self.db().await?;
+        let transaction = db.transaction().await?;
         transaction
             .execute(
                 "INSERT INTO code_index.repository (id, name, root_path, language, last_synced_at)
@@ -116,9 +152,8 @@ impl CodeIndexStore {
         &self,
         repository_id: Option<&str>,
     ) -> Result<Vec<RepositoryStatus>, CodeIndexError> {
-        let rows = self
-            .db
-            .query(
+        let rows = self.db().await?
+                        .query(
                 "SELECT r.id, r.name, r.root_path, r.language, r.last_synced_at,
                         (SELECT count(*) FROM code_index.file f WHERE f.repository_id = r.id)::bigint,
                         (SELECT count(*) FROM code_index.symbol s WHERE s.repository_id = r.id)::bigint,
@@ -155,7 +190,8 @@ impl CodeIndexStore {
         repository_id: Option<&str>,
     ) -> Result<Vec<CodeSearchHit>, CodeIndexError> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT s.id, s.repository_id, f.relative_path, s.kind, s.name,
                         s.qualified_name, s.start_line, s.end_line
@@ -182,7 +218,8 @@ impl CodeIndexStore {
 
     pub async fn symbol(&self, id: &str) -> Result<Option<CodeSymbolDetail>, CodeIndexError> {
         let Some(row) = self
-            .db
+            .db()
+            .await?
             .query_opt(
                 "SELECT s.id, s.repository_id, f.relative_path, s.kind, s.name,
                         s.qualified_name, s.start_line, s.end_line
@@ -198,7 +235,8 @@ impl CodeIndexStore {
         };
         let symbol = search_hit_from_row(&row)?;
         let relations = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT kind, target_symbol_id, target_name, start_byte, end_byte
                  FROM code_index.relation

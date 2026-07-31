@@ -43,6 +43,8 @@ pub enum CodeIndexError {
     NumericOverflow,
     #[error("PostgreSQL code index operation failed: {0}")]
     Database(#[from] tokio_postgres::Error),
+    #[error("code index connection pool failed: {0}")]
+    Pool(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
