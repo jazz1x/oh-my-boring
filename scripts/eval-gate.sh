@@ -4,6 +4,8 @@
 # vector+graph recall regression).
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=lib/drudge_health_readiness.sh
+. "$ROOT/scripts/lib/drudge_health_readiness.sh"
 cd "$ROOT"
 
 URL="${BORING_URL:-http://localhost:7700}"
@@ -51,6 +53,12 @@ trap finish_eval_event EXIT
 
 if ! curl -s -m3 "$URL/health" >/dev/null 2>&1; then
   echo "engine not running ($URL). Run 'make up' first."
+  exit 1
+fi
+
+# Reachable is not writable — recall accuracy is meaningless against a degraded DB.
+if ! check_drudge_db_healthy "$URL"; then
+  echo "engine at $URL reports db_healthy=false — postgres is degraded."
   exit 1
 fi
 

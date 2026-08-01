@@ -8,6 +8,8 @@
 # Note: /bin/sh (dash) has no pipefail → check each step's result explicitly.
 set -eu
 URL="${BORING_URL:-http://localhost:7700}"
+# shellcheck source=lib/drudge_health_readiness.sh
+. "$(cd "$(dirname "$0")/lib" && pwd)/drudge_health_readiness.sh"
 fail() { echo "FAIL: $1"; exit 1; }
 
 # Resolve mode: honor an explicit BORING_VECTOR, else ask the live engine.
@@ -42,6 +44,8 @@ printf '%s\n' "$ps" | grep -E 'postgres|boring-drudge|agent' || true
 
 echo "2) engine /health…"
 [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$URL/health")" = "200" ] || fail "/health != 200"
+# 200 only proves the engine answers — db_healthy proves it can still write.
+check_drudge_db_healthy "$URL" || fail "/health reports db_healthy=false — postgres is degraded"
 
 echo "3) engine /sync (deterministic baseline; waits for startup sync to finish)…"
 sync=$(curl -sf -m600 -X POST "$URL/sync" 2>/dev/null) || fail "/sync failed"

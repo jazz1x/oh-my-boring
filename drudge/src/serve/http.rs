@@ -31,11 +31,13 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResp> {
     } else {
         SyncState::Running
     };
+    let (db_healthy, status) = state.check_db_health().await;
     Json(HealthResp {
-        status: "ok",
+        status,
         vector: state.store.is_some(),
         sync,
         corpus_count: state.wiki_dir().as_deref().and_then(count_wiki_notes),
+        db_healthy,
     })
 }
 

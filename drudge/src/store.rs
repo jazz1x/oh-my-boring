@@ -13,13 +13,14 @@
 //!
 //! ## Advantage over AGE
 //! Every value goes through `tokio-postgres` parameter binding ($1,$2…) → eliminates the cypher string-escaping footgun.
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime, Timeouts};
 use pgvector::Vector;
 use serde_json::{Value, json};
 use tokio_postgres::types::Json as PgJson;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, Config as PgConfig, NoTls};
 
 use crate::frontmatter::{Claim, FrontMatter};
 
@@ -162,7 +163,7 @@ pub struct SemanticStats {
 }
 
 pub struct Store {
-    db: Client,
+    pool: Pool,
     /// Embedding dimension (= `boring.json` `embed_dim`; bge-m3 = 1024). Enforced at every embedding
     /// upsert via `checked_vector` and mirrored by the `vector(dim)` DDL columns created in `open`.
     dim: usize,
@@ -175,6 +176,14 @@ const SEMANTIC_EDGE_KINDS: [&str; 3] = ["uses", "about", "claims"];
 /// Internal eval fixtures must remain searchable while `make eval` is running, but they are not
 /// user memory. Recency and claim surfaces feed briefings/status, so exclude that fixture namespace.
 const INTERNAL_EVAL_FIXTURE_RE: &str = r"(^|/)eval-[^/]*\.md$";
+/// I/O-boundary timeout for pool wait/create/recycle. Prevents infinite hangs on DB loss;
+/// drudge/CLAUDE.md treats this as a graceful boundary, distinct from defensive `{timeout:200}` bounds.
+const POOL_TIMEOUT_SECONDS: u64 = 5;
+const POOL_TIMEOUTS: Timeouts = Timeouts {
+    wait: Some(Duration::from_secs(POOL_TIMEOUT_SECONDS)),
+    create: Some(Duration::from_secs(POOL_TIMEOUT_SECONDS)),
+    recycle: Some(Duration::from_secs(POOL_TIMEOUT_SECONDS)),
+};
 
 /// chunk id ("path#idx") → graph document node id ("doc:path").
 fn doc_node_id(chunk_or_path: &str) -> String {
@@ -213,17 +222,45 @@ impl Store {
     /// `dim` = the embedding dimension (`boring.json` `embed_dim`) → the `vector(dim)` columns.
     #[allow(clippy::too_many_lines)] // schema DDL grows with features; splitting only obscures the one migration block.
     pub async fn open(dsn: &str, dim: usize) -> Result<Self> {
+        let pg_config: PgConfig = dsn.parse().context("parse postgres connection string")?;
+        let manager = Manager::from_config(
+            pg_config,
+            NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Verified,
+            },
+        );
+        let pool = Pool::builder(manager)
+            .runtime(Runtime::Tokio1)
+            .timeouts(POOL_TIMEOUTS)
+            .build()
+            .context("build postgres connection pool")?;
+
         // connect retry (IO boundary, graceful) — when postgres is started separately via profile
         // drudge waits up to ~10s even if it comes up first (depends_on removed → absorbs startup race).
-        let (client, conn) = {
+        {
             let mut tries = 0_u32;
             loop {
-                match tokio_postgres::connect(dsn, NoTls).await {
-                    Ok(pair) => break pair,
+                match pool.get().await {
+                    Ok(obj) => match obj.query_one("SELECT 1", &[]).await {
+                        Ok(_) => break,
+                        Err(e) if tries < 9 => {
+                            tries += 1;
+                            eprintln!("[store] postgres connect retry {tries}/10 … ({e})");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(
+                                "postgres connect (retries exhausted) — is Postgres up? \
+                                 vector mode needs `BORING_VECTOR=on make up` (starts pgvector); \
+                                 or run wiki-first with BORING_VECTOR unset",
+                            ));
+                        }
+                    },
                     Err(e) if tries < 9 => {
                         tries += 1;
                         eprintln!("[store] postgres connect retry {tries}/10 … ({e})");
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     Err(e) => {
                         return Err(anyhow::Error::new(e).context(
@@ -234,17 +271,16 @@ impl Store {
                     }
                 }
             }
-        };
-        // spawn the background connection driver.
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                eprintln!("postgres connection error: {e}");
-            }
-        });
+        }
+
+        let obj = pool
+            .get()
+            .await
+            .context("get connection for schema initialization")?;
 
         // DDL parameterized by the embedding dim (`embed_dim`). `vector({dim})` is the only interpolation;
         // dim is a parsed integer (no injection surface). `'{{}}'` escapes the literal empty-array default.
-        client
+        obj
             .batch_execute(&format!(
                 "CREATE EXTENSION IF NOT EXISTS vector;
                  CREATE TABLE IF NOT EXISTS document (
@@ -351,7 +387,26 @@ impl Store {
             .await
             .context("pgvector + graph schema")?;
 
-        Ok(Self { db: client, dim })
+        Ok(Self { pool, dim })
+    }
+    /// Acquire a connection from the pool. Kept as a method (not direct field access) so every
+    /// call site is a single point to instrument and so callers can reuse one object across a
+    /// multi-statement logical unit (e.g. stats/compact) rather than holding several connections.
+    async fn db(&self) -> Result<deadpool_postgres::Object> {
+        self.pool
+            .get()
+            .await
+            .context("get postgres connection from pool")
+    }
+
+    /// Probe that the database is reachable. Propagates the original error — callers decide whether
+    /// to treat failure as degraded health or a hard error.
+    pub async fn liveness_probe(&self) -> Result<()> {
+        let db = self.db().await?;
+        db.query_one("SELECT 1", &[])
+            .await
+            .context("store liveness probe (SELECT 1)")?;
+        Ok(())
     }
 
     /// Build a pgvector `Vector` after checking the dimension matches the `vector(dim)` columns.
@@ -375,7 +430,8 @@ impl Store {
 
     pub async fn get_doc_sha(&self, path: &str) -> Result<Option<String>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query("SELECT sha FROM document WHERE source_path = $1;", &[&path])
             .await?;
         Ok(rows.first().map(|r| r.get::<_, String>(0)))
@@ -383,7 +439,8 @@ impl Store {
 
     pub async fn all_doc_paths(&self) -> Result<Vec<String>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query("SELECT source_path FROM document;", &[])
             .await?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
@@ -392,7 +449,8 @@ impl Store {
     /// Document mtime — the `valid_from` of a claim (temporal sort key). Falls back to now() if absent (graceful).
     pub async fn doc_updated_at(&self, path: &str) -> Result<SystemTime> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT updated_at FROM document WHERE source_path = $1;",
                 &[&path],
@@ -406,7 +464,8 @@ impl Store {
     /// Update only the recency of documents whose content is unchanged (same sha) — mtime backfill without re-embedding.
     /// Ensures the recency-first sort key (`updated_at`) is also populated for existing documents.
     pub async fn set_updated_at(&self, path: &str, updated_at: SystemTime) -> Result<()> {
-        self.db
+        self.db()
+            .await?
             .execute(
                 "UPDATE document SET updated_at = $2
                  WHERE source_path = $1 AND updated_at IS DISTINCT FROM $2;",
@@ -429,7 +488,8 @@ impl Store {
     ) -> Result<Vec<RecentDoc>> {
         let rows = match since_hours {
             Some(hours) => self
-                .db
+                .db()
+                .await?
                 .query(
                     "SELECT d.source_path, d.project, d.tags,
                                 string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content
@@ -453,7 +513,8 @@ impl Store {
                 .await
                 .context("recent docs with time window")?,
             None => self
-                .db
+                .db()
+                .await?
                 .query(
                     "SELECT d.source_path, d.project, d.tags,
                                 string_agg(c.content, E'\n' ORDER BY c.chunk_idx) AS content
@@ -494,7 +555,8 @@ impl Store {
     pub async fn related_docs(&self, source_path: &str, limit: i64) -> Result<Vec<String>> {
         let doc_id = doc_node_id(source_path);
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "WITH self_nodes AS (
                      SELECT dst FROM edge WHERE src = $1
@@ -533,7 +595,8 @@ impl Store {
         max_dist: f64,
     ) -> Result<Vec<String>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "WITH src AS (
                      SELECT embedding FROM chunk WHERE source_path = $1 AND embedding IS NOT NULL
@@ -561,7 +624,8 @@ impl Store {
     ) -> Result<Vec<RecentDoc>> {
         let doc_id = doc_node_id(source_path);
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "WITH self_nodes AS (
                      SELECT dst FROM edge WHERE src = $1
@@ -599,7 +663,8 @@ impl Store {
     /// Supplements only when there are no concept-based links to prevent orphans, but only a few so it doesn't become a mesh.
     pub async fn recent_project_docs(&self, source_path: &str, limit: i64) -> Result<Vec<String>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT d2.source_path FROM document d1
                  JOIN document d2 ON d2.project = d1.project
@@ -630,7 +695,7 @@ impl Store {
         confidence: &str,
     ) -> Result<()> {
         let vec = self.checked_vector(embedding)?; // dim guard (shared with upsert_chunk)
-        self.db
+        self.db().await?
             .execute(
                 "INSERT INTO claim (subject, predicate, value, source_path, valid_from, embedding, kind, confidence)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -651,7 +716,8 @@ impl Store {
             .await
             .context("insert claim")?;
         // seal everything below the latest valid_from, leaving only the single latest row as current.
-        self.db
+        self.db()
+            .await?
             .execute(
                 "UPDATE claim c SET superseded_at = m.mx
                  FROM (SELECT subject, predicate, max(valid_from) AS mx FROM claim
@@ -662,7 +728,8 @@ impl Store {
             )
             .await
             .context("seal old claims")?;
-        self.db
+        self.db()
+            .await?
             .execute(
                 "UPDATE claim SET superseded_at = NULL
                  WHERE subject = $1 AND predicate = $2 AND superseded_at IS NOT NULL
@@ -724,7 +791,8 @@ impl Store {
         exclude_origins: &[String],
     ) -> Result<Vec<Claim>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence FROM claim c
                  JOIN document d ON d.source_path = c.source_path
@@ -768,7 +836,8 @@ impl Store {
         older_than_days: i64,
     ) -> Result<Vec<Claim>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence FROM claim c
                  JOIN document d ON d.source_path = c.source_path
@@ -819,7 +888,8 @@ impl Store {
         // chunks in the same answer respect (Layer 1: one answer, one consistent origin boundary).
         // `origin = ANY('{}')` is false, so an empty exclusion passes every claim (no behavior change).
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence FROM claim c
                  JOIN document d ON d.source_path = c.source_path
@@ -863,7 +933,7 @@ impl Store {
     ) -> Result<()> {
         let path = &front.source_path;
         let title_ref: Option<&str> = front.title.as_deref();
-        self.db
+        self.db().await?
             .execute(
                 "INSERT INTO document (source_path, origin, project, kind, title, tags, sha, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -896,7 +966,8 @@ impl Store {
         }
 
         // tagged: remove existing then regenerate (idempotent)
-        self.db
+        self.db()
+            .await?
             .execute(
                 "DELETE FROM edge WHERE src = $1 AND kind = 'tagged';",
                 &[&doc_id],
@@ -915,7 +986,8 @@ impl Store {
     /// sees an empty/half-deleted chunk set (no delete-first window). `from_idx == new chunk count`.
     pub async fn prune_chunks_from(&self, path: &str, from_idx: usize) -> Result<()> {
         let from = i32::try_from(from_idx).unwrap_or(i32::MAX);
-        self.db
+        self.db()
+            .await?
             .execute(
                 "DELETE FROM chunk WHERE source_path = $1 AND chunk_idx >= $2;",
                 &[&path, &from],
@@ -926,11 +998,13 @@ impl Store {
 
     /// Remove (prune) document + chunks (CASCADE) + graph edges + claims (explicit; claim has no FK).
     pub async fn delete_document(&self, path: &str) -> Result<()> {
-        self.db
+        self.db()
+            .await?
             .execute("DELETE FROM document WHERE source_path = $1;", &[&path])
             .await?;
         let doc_id = doc_node_id(path);
-        self.db
+        self.db()
+            .await?
             .execute("DELETE FROM edge WHERE src = $1 OR dst = $1;", &[&doc_id])
             .await?;
         // claim has NO FK to document (unlike chunk's ON DELETE CASCADE) so the document delete does not
@@ -940,7 +1014,8 @@ impl Store {
         // Caveat: if this doc owned the latest value of a (subject,predicate) while an OLDER row from
         // another doc stays sealed, that pair loses its current pointer (a MISSING claim, never an
         // orphaned/WRONG one) — inherent to single-valued provenance; the remedy is a re-seal pass.
-        self.db
+        self.db()
+            .await?
             .execute("DELETE FROM claim WHERE source_path = $1;", &[&path])
             .await?;
         Ok(())
@@ -951,7 +1026,7 @@ impl Store {
     pub async fn upsert_chunk(&self, d: &Doc) -> Result<()> {
         let vec = self.checked_vector(&d.embedding)?; // dim guard (shared with upsert_claim)
         let idx = i32::try_from(d.chunk_idx).unwrap_or(i32::MAX);
-        self.db
+        self.db().await?
             .execute(
                 "INSERT INTO chunk (id, source_path, content, embedding, origin, project, kind, chunk_idx)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -973,9 +1048,8 @@ impl Store {
     pub async fn vector_search(&self, vec: &[f32], k: usize) -> Result<Vec<Hit>> {
         let qvec = Vector::from(vec.to_vec());
         let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
-        let rows = self
-            .db
-            .query(
+        let rows = self.db().await?
+                        .query(
                 "SELECT id, content, origin, project, source_path, (embedding <=> $1)::float4 AS dist
                  FROM chunk ORDER BY embedding <=> $1 LIMIT $2;",
                 &[&qvec, &k_i64],
@@ -987,7 +1061,8 @@ impl Store {
     pub async fn text_search(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
         let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT id, content, origin, project, source_path,
                         ts_rank(tsv, plainto_tsquery('simple', $1))::float4 AS dist
@@ -1011,7 +1086,8 @@ impl Store {
         let qvec = Vector::from(vec.to_vec());
         let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT c.id, c.content, c.origin, c.project, c.source_path,
                         (c.embedding <=> $1)::float4 AS dist
@@ -1036,7 +1112,8 @@ impl Store {
     ) -> Result<Option<(String, f64)>> {
         let qvec = Vector::from(vec.to_vec());
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT d.source_path, MIN(c.embedding <=> $1)::float8 AS dist
                  FROM document d
@@ -1063,7 +1140,8 @@ impl Store {
     ) -> Result<Vec<Hit>> {
         let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT c.id, c.content, c.origin, c.project, c.source_path,
                         ts_rank(c.tsv, plainto_tsquery('simple', $1))::float4 AS dist
@@ -1081,12 +1159,13 @@ impl Store {
     }
 
     pub async fn count(&self) -> Result<usize> {
-        pg_count(&self.db, "SELECT count(*) FROM chunk;").await
+        pg_count(&*self.db().await?, "SELECT count(*) FROM chunk;").await
     }
 
     pub async fn all_meta(&self) -> Result<Vec<Meta>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query("SELECT origin, project, kind, source_path FROM chunk;", &[])
             .await?;
         Ok(rows
@@ -1122,7 +1201,7 @@ impl Store {
             ),
             Err(_) => (query.to_owned(), answer_snippet.to_owned()),
         };
-        self.db
+        self.db().await?
             .execute(
                 "INSERT INTO query_log (endpoint, query, hit_paths, sources, answer_snippet, latency_ms)
                  VALUES ($1, $2, $3, $4, $5, $6);",
@@ -1141,9 +1220,8 @@ impl Store {
     }
 
     pub async fn recent_queries(&self, limit: i64) -> Result<Vec<QueryLogRow>> {
-        let rows = self
-            .db
-            .query(
+        let rows = self.db().await?
+                        .query(
                 "SELECT id, created_at, endpoint, query, hit_paths, sources, answer_snippet, latency_ms
                  FROM query_log ORDER BY created_at DESC LIMIT $1;",
                 &[&limit],
@@ -1229,7 +1307,7 @@ impl Store {
         let workflow_node = text_field(&event, "workflow_node");
         let workflow_outcome = text_field(&event, "workflow_outcome");
 
-        self.db
+        self.db().await?
             .execute(
                 "INSERT INTO event_log (
                      time_unix_nano, severity_text, severity_number, service_name,
@@ -1264,7 +1342,8 @@ impl Store {
 
     pub async fn recent_events(&self, filter: EventLogFilter<'_>) -> Result<Vec<EventLogRow>> {
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT id, observed_at, time_unix_nano, severity_text, severity_number,
                         service_name, component, event_name, status, trace_id, span_id,
@@ -1326,6 +1405,7 @@ impl Store {
     pub async fn compact(&self) -> Result<CompactSummary> {
         let mut report = CompactReport::default();
         let started = std::time::Instant::now();
+        let db = self.db().await?;
 
         let t0 = std::time::Instant::now();
         for table in [
@@ -1337,8 +1417,7 @@ impl Store {
             "query_log",
             "event_log",
         ] {
-            self.db
-                .batch_execute(&format!("VACUUM ANALYZE {table};"))
+            db.batch_execute(&format!("VACUUM ANALYZE {table};"))
                 .await
                 .with_context(|| format!("vacuum analyze {table}"))?;
         }
@@ -1354,15 +1433,13 @@ impl Store {
             "query_log",
             "event_log",
         ] {
-            self.db
-                .batch_execute(&format!("REINDEX TABLE CONCURRENTLY {table};"))
+            db.batch_execute(&format!("REINDEX TABLE CONCURRENTLY {table};"))
                 .await
                 .with_context(|| format!("reindex table {table}"))?;
         }
         report.reindex_ms = t0.elapsed().as_millis();
 
-        let pruned = self
-            .db
+        let pruned = db
             .execute(
                 "DELETE FROM query_log WHERE created_at < now() - interval '90 days';",
                 &[],
@@ -1390,7 +1467,7 @@ impl Store {
         label: &str,
         outcome: Option<&str>,
     ) -> Result<()> {
-        self.db
+        self.db().await?
             .execute(
                 "INSERT INTO node (id, kind, label, outcome) VALUES ($1, $2, $3, $4)
                  ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label, outcome = EXCLUDED.outcome;",
@@ -1402,7 +1479,8 @@ impl Store {
     }
 
     async fn upsert_edge(&self, src: &str, dst: &str, kind: &str) -> Result<()> {
-        self.db
+        self.db()
+            .await?
             .execute(
                 "INSERT INTO edge (src, dst, kind) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;",
                 &[&src, &dst, &kind],
@@ -1427,7 +1505,8 @@ impl Store {
     pub async fn clear_semantic_edges(&self, doc_path: &str) -> Result<()> {
         let doc_id = doc_node_id(doc_path);
         let kinds: Vec<&str> = SEMANTIC_EDGE_KINDS.to_vec();
-        self.db
+        self.db()
+            .await?
             .execute(
                 "DELETE FROM edge WHERE src = $1 AND kind = ANY($2);",
                 &[&doc_id, &kinds],
@@ -1453,7 +1532,8 @@ impl Store {
     pub async fn graph_neighbors(&self, chunk_id: &str) -> Result<Vec<String>> {
         let doc_id = doc_node_id(chunk_id);
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT n.label FROM edge e JOIN node n ON n.id = e.dst
                  WHERE e.src = $1 AND e.kind IN ('in_project', 'tagged', 'claims');",
@@ -1467,7 +1547,8 @@ impl Store {
     pub async fn semantic_neighbors(&self, chunk_id: &str) -> Result<Vec<String>> {
         let doc_id = doc_node_id(chunk_id);
         let rows = self
-            .db
+            .db()
+            .await?
             .query(
                 "SELECT n.label FROM edge e JOIN node n ON n.id = e.dst
                  WHERE e.src = $1 AND e.kind = ANY($2);",
@@ -1480,24 +1561,26 @@ impl Store {
     // ── stats / GC ──────────────────────────────────────────────────────────────
 
     pub async fn graph_stats(&self) -> Result<GraphStats> {
+        let db = self.db().await?;
         Ok(GraphStats {
-            documents: pg_count(&self.db, "SELECT count(*) FROM document;").await?,
-            chunks: pg_count(&self.db, "SELECT count(*) FROM chunk;").await?,
-            projects: count_node_kind(&self.db, "project").await?,
-            topics: count_node_kind(&self.db, "topic").await?,
-            claims: count_node_kind(&self.db, "claim").await?,
-            decisions: count_node_kind(&self.db, "decision").await?,
-            risks: count_node_kind(&self.db, "risk").await?,
-            edges: pg_count(&self.db, "SELECT count(*) FROM edge;").await?,
+            documents: pg_count(&db, "SELECT count(*) FROM document;").await?,
+            chunks: pg_count(&db, "SELECT count(*) FROM chunk;").await?,
+            projects: count_node_kind(&db, "project").await?,
+            topics: count_node_kind(&db, "topic").await?,
+            claims: count_node_kind(&db, "claim").await?,
+            decisions: count_node_kind(&db, "decision").await?,
+            risks: count_node_kind(&db, "risk").await?,
+            edges: pg_count(&db, "SELECT count(*) FROM edge;").await?,
         })
     }
 
     pub async fn semantic_stats(&self) -> Result<SemanticStats> {
+        let db = self.db().await?;
         Ok(SemanticStats {
-            tools: count_node_kind(&self.db, "tool").await?,
-            concepts: count_node_kind(&self.db, "concept").await?,
-            uses: count_edge_kind(&self.db, "uses").await?,
-            about: count_edge_kind(&self.db, "about").await?,
+            tools: count_node_kind(&db, "tool").await?,
+            concepts: count_node_kind(&db, "concept").await?,
+            uses: count_edge_kind(&db, "uses").await?,
+            about: count_edge_kind(&db, "about").await?,
         })
     }
 
@@ -1506,7 +1589,8 @@ impl Store {
         let mut gc = GcStats::default();
         for kind in ["tool", "concept"] {
             let n = self
-                .db
+                .db()
+                .await?
                 .execute(
                     "DELETE FROM node WHERE kind = $1
                        AND id NOT IN (SELECT src FROM edge UNION SELECT dst FROM edge);",

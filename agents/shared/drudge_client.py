@@ -17,6 +17,10 @@ from typing import Any, Optional
 import omb_env
 
 
+class DrudgeNotWritableError(Exception):
+    """drudge cannot accept writes right now — distillation must not run."""
+
+
 class DrudgeClient:
     """Minimal drudge HTTP client. Silent failures are left to callers."""
 
@@ -106,3 +110,31 @@ class DrudgeClient:
         if project:
             payload["project"] = project
         return self._retry("POST", "/context", payload)
+
+
+def check_drudge_writable(client: Optional["DrudgeClient"] = None) -> None:
+    """Raise DrudgeNotWritableError unless drudge can accept a write right now.
+
+    Collectors distill first and remember second, so a dead write door used to burn a
+    full LLM pass per session and per cycle: the marker went back to retry and the next
+    run re-distilled the same input. This is the cheap check that stops that loop.
+
+    Reads GET /health. Blocks on an explicit ``db_healthy`` of false, or a ``degraded``
+    status. A response without ``db_healthy`` is an engine running wiki-first (or an
+    older build) and is allowed through — absence of the field is not evidence of
+    failure. An unreachable engine blocks, since nothing can be written to it either.
+    """
+    client = client or DrudgeClient()
+    try:
+        health = client.health()
+    except Exception as exc:  # noqa: BLE001 — any transport failure means "cannot write"
+        raise DrudgeNotWritableError(f"drudge /health unreachable: {exc}") from exc
+
+    if health.get("db_healthy") is False:
+        raise DrudgeNotWritableError(
+            "drudge reports db_healthy=false — postgres is degraded, writes would fail"
+        )
+    if "db_healthy" in health and health.get("status") == "degraded":
+        raise DrudgeNotWritableError(
+            f"drudge reports status={health.get('status')!r} — writes would fail"
+        )

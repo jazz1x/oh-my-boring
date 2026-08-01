@@ -64,6 +64,7 @@ python3 agents/shared/test_markers.py
 python3 agents/shared/test_resolution_quality.py
 python3 agents/shared/test_transcript.py
 python3 agents/shared/test_recall_core.py
+python3 agents/shared/test_drudge_client.py
 python3 agents/claude-code/test_hooks.py
 python3 agents/kimi/test_kimi.py
 python3 agents/schedulers/test_collectors.py
@@ -77,6 +78,7 @@ echo "6) shell destructive-path guardrails (restore-db)…"
 sh scripts/test_restore_db.sh
 echo "7) shell readiness gate guardrails (doctor --strict)…"
 sh scripts/test_doctor.sh
+sh scripts/test_drudge_health_readiness.sh
 echo "8) shell LLM/provider guardrails (verify-llm)…"
 sh scripts/test_verify_llm.sh
 echo "✅ 구조 게이트 통과 — 컴파일러/clippy/test + Python adapters 무위반."

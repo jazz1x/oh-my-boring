@@ -17,6 +17,8 @@
 # engine.
 set -eu
 URL="${BORING_URL:-http://localhost:7700}"
+# shellcheck source=lib/drudge_health_readiness.sh
+. "$(cd "$(dirname "$0")/lib" && pwd)/drudge_health_readiness.sh"
 
 fail() { echo "FAIL: $1"; exit 1; }
 skip() { echo "SKIP: $1"; exit 0; }
@@ -29,6 +31,8 @@ echo "0) stack up? (engine /health)…"
 if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$URL/health" 2>/dev/null)" != "200" ]; then
   skip "engine not up at $URL (run: make up) — e2e needs a live stack"
 fi
+# A reachable engine whose DB is down would fail every write below with a confusing error.
+check_drudge_db_healthy "$URL" || skip "engine at $URL reports db_healthy=false — postgres is degraded"
 
 # --- mode check ----------------------------------------------------------------
 # Resolve mode: honor explicit BORING_VECTOR, else ask /audit

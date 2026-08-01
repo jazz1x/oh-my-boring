@@ -25,6 +25,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: drudge
+          shared-key: drudge # same key across every job that builds drudge, so the cache isn't split per job name
       # scripts/guard.sh = rustfmt --check + clippy -D warnings + test (스택-프리).
       - name: structural gate (guard.sh)
         run: ./scripts/guard.sh
@@ -39,6 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: drudge
+          shared-key: drudge # same key across every job that builds drudge, so the cache isn't split per job name
       - name: release quality gate
         run: make quality
 
@@ -111,6 +113,43 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: drudge
+          shared-key: drudge # same key across every job that builds drudge, so the cache isn't split per job name
+      - name: start postgres (for the DB gate suites, ahead of the drudge container)
+        run: |
+          export BORING_UID="$(id -u)" BORING_GID="$(id -g)"
+          docker compose --profile vector up -d --wait boring-postgres
+      # These 6 suites need a live Postgres (BORING_TEST_DATABASE_URL) and, until now, ran nowhere —
+      # not in CI, not in pre-commit, not in the Makefile. That left the pool-vs-single-Client
+      # regression (2026-07-25 outage) with no safety net. Reuses the eval-gate postgres — no new
+      # service container. Each suite is invoked separately and failures are accumulated (not
+      # short-circuited) because `cargo test` refuses to start a later test binary once an earlier
+      # one has failed — running them as one invocation would silently hide every suite after the
+      # first failure.
+      - name: DB gate suites (origin_boundary, store_integration, context_integration, data_integrity, redact_fuzz, code_index_integration)
+        env:
+          BORING_TEST_DATABASE_URL: postgresql://boring:boring@127.0.0.1:5432/boring
+        run: |
+          cd drudge
+          fail=0
+          for suite in origin_boundary store_integration context_integration data_integrity redact_fuzz code_index_integration; do
+            echo "::group::cargo test --test $suite"
+            if ! cargo test -p drudge --test "$suite" -- --test-threads=1; then
+              echo "FAILED: $suite"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$fail"
+      - name: reset DB (DB gate suites leave rows behind; drudge/eval-gate need a clean corpus)
+        run: |
+          docker compose --profile vector exec -T boring-postgres \
+            psql -v ON_ERROR_STOP=1 -U boring -d postgres \
+            -c "DROP DATABASE IF EXISTS boring;" \
+            -c "CREATE DATABASE boring OWNER boring;"
       - name: start offline stub embedder (recorded bge-m3 replay)
         run: |
           python3 data/eval/stub_embedder.py &

@@ -35,6 +35,11 @@ for arg in "$@"; do
         --strict) STRICT=1 ;;
     esac
 done
+# Shared /health readiness judge (db_healthy), so every gate asks the same question.
+DOCTOR_LIB_DIR="$(cd "$(dirname "$0")/lib" && pwd)"
+# shellcheck source=lib/drudge_health_readiness.sh
+. "$DOCTOR_LIB_DIR/drudge_health_readiness.sh"
+
 EVENT_LOG="$BORING_HOME/agents/shared/event_log.py"
 doctor_run_id="doctor-$(date +%Y%m%dT%H%M%S)-$$"
 doctor_started_at="$(date +%s)"
@@ -202,8 +207,15 @@ else
 fi
 
 # (a2) engine /health — the deterministic write gate the hook POSTs `remember` to.
+# 200 only proves the engine answers; db_healthy proves it can still write. During the
+# 2026-07-25 outage every write failed for days while /health kept returning 200.
 if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$BORING_URL/health" 2>/dev/null)" = "200" ]; then
-    ok "engine /health 200 ($BORING_URL) — write door reachable"
+    if check_drudge_db_healthy "$BORING_URL"; then
+        ok "engine /health 200 ($BORING_URL) — write door reachable"
+    else
+        bad "engine /health 200 but postgres is degraded ($BORING_URL) — distilled sessions are being DROPPED"; failed_engine=1
+        drudge_down=1
+    fi
 else
     bad "engine /health unreachable ($BORING_URL) — distilled sessions are being DROPPED"; failed_engine=1
     drudge_down=1
