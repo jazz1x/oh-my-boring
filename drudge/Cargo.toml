@@ -34,7 +34,7 @@ hex = "0.4"
 chrono = "0.4"
 thiserror = "2"
 regex = "1"
-fancy-regex = "0.18"
+fancy-regex = "0.19"
 tree-sitter = "=0.26.11"
 tree-sitter-rust = "=0.24.2"
 
