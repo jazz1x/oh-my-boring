@@ -334,6 +334,37 @@ def test_collect_scan_classifies_queue_marked_rollout_and_subagent():
         collect.STABLE_AGE_S = old_stable_age
 
 
+def test_collect_scan_excludes_dead_lettered_sessions_from_queue():
+    old_mark_dir = collect.markers.MARK_DIR
+    old_min_kb = collect.MIN_KB
+    old_stable_age = collect.STABLE_AGE_S
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = root / "sessions"
+            source.mkdir()
+            mark_dir = root / "markers"
+            collect.markers.set_mark_dir(str(mark_dir))
+            collect.MIN_KB = 0
+            collect.STABLE_AGE_S = 0
+
+            _write_codex_session(source / "todo.jsonl")
+            _write_codex_session(source / "exhausted.jsonl")
+            collect.markers.mark_pending("codex-exhausted")  # queued before it started failing
+            with mock.patch.dict(os.environ, {"MARKER_RETRY_MAX_ATTEMPTS": "1"}):
+                collect.markers.mark_retry("codex-exhausted", reason="resolution gate failed")
+
+            scan = collect._scan_sessions(str(source), cutoff=0)
+
+            assert collect.markers.is_dead("codex-exhausted")
+            assert [Path(p).name for p in scan["todo"]] == ["todo.jsonl"]
+            assert scan["already_marked"] == 1
+    finally:
+        collect.markers.set_mark_dir(old_mark_dir)
+        collect.MIN_KB = old_min_kb
+        collect.STABLE_AGE_S = old_stable_age
+
+
 def test_collect_scan_can_include_rollouts_without_subagents():
     old_mark_dir = collect.markers.MARK_DIR
     old_min_kb = collect.MIN_KB
@@ -823,6 +854,7 @@ if __name__ == "__main__":
     test_codex_distill_clamps_with_ingest_budget()
     test_codex_distill_respects_zero_payload_clamp_override()
     test_collect_scan_classifies_queue_marked_rollout_and_subagent()
+    test_collect_scan_excludes_dead_lettered_sessions_from_queue()
     test_collect_scan_can_include_rollouts_without_subagents()
     test_collect_scan_skips_unstable_recent_sessions()
     test_collect_scan_reoffers_stale_pending_but_skips_fresh_pending()

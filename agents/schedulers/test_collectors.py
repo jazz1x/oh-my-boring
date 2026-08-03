@@ -123,7 +123,37 @@ def test_kimi_collector_fails_when_distill_fails():
         kimi_collect.LIMIT = old_limit
 
 
+def test_claude_marked_excludes_dead_lettered_session():
+    old_mark_dir = claude_collect.markers.MARK_DIR
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            claude_collect.markers.set_mark_dir(d)
+            with mock.patch.dict(os.environ, {"MARKER_RETRY_MAX_ATTEMPTS": "1"}):
+                claude_collect.markers.mark_retry("s1", reason="resolution gate failed")
+
+            assert claude_collect.markers.is_dead("s1")
+            assert claude_collect._marked("s1") is True
+    finally:
+        claude_collect.markers.set_mark_dir(old_mark_dir)
+
+
+def test_kimi_marked_excludes_dead_lettered_session():
+    old_mark_dir = kimi_collect.markers.MARK_DIR
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            kimi_collect.markers.set_mark_dir(d)
+            with mock.patch.dict(os.environ, {"MARKER_RETRY_MAX_ATTEMPTS": "1"}):
+                kimi_collect.markers.mark_retry("k1", reason="resolution gate failed")
+
+            assert kimi_collect.markers.is_dead("k1")
+            assert kimi_collect._marked("k1") is True
+    finally:
+        kimi_collect.markers.set_mark_dir(old_mark_dir)
+
+
 if __name__ == "__main__":
     test_claude_collector_fails_when_sync_fails()
     test_kimi_collector_fails_when_distill_fails()
+    test_claude_marked_excludes_dead_lettered_session()
+    test_kimi_marked_excludes_dead_lettered_session()
     print("ok - scheduler collectors")

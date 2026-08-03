@@ -30,7 +30,11 @@ PENDING_TTL = float(os.environ.get("COLLECT_PENDING_TTL") or os.environ.get("ING
 
 
 def _marked(session_id: str) -> bool:
-    return markers.is_done(session_id) or markers.is_pending(session_id, ttl=PENDING_TTL)
+    return (
+        markers.is_done(session_id)
+        or markers.is_pending(session_id, ttl=PENDING_TTL)
+        or markers.is_dead(session_id)
+    )
 
 
 def _session_age_hours(session_dir: str) -> float:
