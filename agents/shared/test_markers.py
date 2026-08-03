@@ -100,6 +100,59 @@ class MarkerReliabilityTests(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, "remove failed"):
                     markers.remove_pending("s1")
 
+    def test_mark_retry_counts_attempts_and_is_backward_compatible_with_legacy_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            # Legacy on-disk format: timestamp only, no attempt count (pre-dates this change).
+            (Path(d) / "s1.retry").write_text(str(time.time()))
+
+            # The legacy marker's mere existence already counts as attempt 1, so the next
+            # mark_retry call must not crash on it and must resume counting from 2.
+            attempts = markers.mark_retry("s1")
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(markers.retry_count("s1"), 2)
+            self.assertFalse(markers.is_dead("s1"))
+
+    def test_mark_retry_dead_letters_after_threshold_and_stops_re_queueing(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            with mock.patch.dict(os.environ, {"MARKER_RETRY_MAX_ATTEMPTS": "3"}):
+                self.assertEqual(markers.mark_retry("s1"), 1)
+                self.assertFalse(markers.is_dead("s1"))
+                self.assertEqual(markers.mark_retry("s1"), 2)
+                self.assertFalse(markers.is_dead("s1"))
+                self.assertEqual(markers.mark_retry("s1"), 3)
+            self.assertTrue(markers.is_dead("s1"))
+            self.assertFalse((Path(d) / "s1.retry").exists())
+
+    def test_mark_retry_dead_letter_records_reason_and_attempts(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            with mock.patch.dict(os.environ, {"MARKER_RETRY_MAX_ATTEMPTS": "1"}):
+                markers.mark_retry("s1", reason="engine down")
+
+            content = (Path(d) / "s1.dead").read_text()
+            lines = content.splitlines()
+            self.assertEqual(lines[1], "1")
+            self.assertEqual(lines[2], "engine down")
+
+    def test_mark_done_and_mark_pending_clear_dead_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            (Path(d) / "s1.dead").write_text("dead")
+            markers.mark_done("s1")
+            self.assertFalse((Path(d) / "s1.dead").exists())
+
+            (Path(d) / "s2.dead").write_text("dead")
+            markers.mark_pending("s2")
+            self.assertFalse((Path(d) / "s2.dead").exists())
+
+    def test_is_dead_false_when_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            markers.set_mark_dir(d)
+            self.assertFalse(markers.is_dead("absent"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -5,17 +5,39 @@ All adapters share ``~/.cache/boring-distill`` so engine-direct SessionEnd hooks
 hermes-agent cron, and host-side backfill schedulers see the same queue state.
 
 Markers:
-- ``<sid>.ts``     — done (the session has been distilled/ingested successfully).
+- ``<sid>.ts``      — done (the session has been distilled/ingested successfully).
 - ``<sid>.pending`` — currently queued/processing.
 - ``<sid>.retry``   — transient failure; backfill schedulers should retry later.
+                       Content is ``"<mtime>\\n<attempts>"``; markers written before
+                       attempt-counting existed are timestamp-only and read as attempt 1.
+- ``<sid>.dead``    — permanent failure; ``mark_retry`` transitions here once attempts
+                       reach ``MARKER_RETRY_MAX_ATTEMPTS``. Collectors must exclude
+                       ``.dead`` from their queues so a repeatedly-failing session stops
+                       occupying the head of the line (head-of-line blocking).
 """
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 MARK_DIR = os.path.expanduser("~/.cache/boring-distill")
+
+# SSOT for how many times `mark_retry` will re-queue a session before giving up and
+# writing a `.dead` marker instead. Override via env for ops tuning without a code change.
+RETRY_MAX_ATTEMPTS_ENV = "MARKER_RETRY_MAX_ATTEMPTS"
+DEFAULT_RETRY_MAX_ATTEMPTS = 5
+
+
+def _retry_max_attempts() -> int:
+    raw = os.environ.get(RETRY_MAX_ATTEMPTS_ENV)
+    if not raw:
+        return DEFAULT_RETRY_MAX_ATTEMPTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_RETRY_MAX_ATTEMPTS
 
 
 def set_mark_dir(path: str) -> None:
@@ -29,9 +51,9 @@ def safe_id(session_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "", session_id) or "nosession"
 
 
-def _paths(session_id: str) -> tuple[str, str, str]:
+def _paths(session_id: str) -> tuple[str, str, str, str]:
     base = os.path.join(MARK_DIR, safe_id(session_id))
-    return f"{base}.ts", f"{base}.pending", f"{base}.retry"
+    return f"{base}.ts", f"{base}.pending", f"{base}.retry", f"{base}.dead"
 
 
 def _ensure_dir() -> None:
@@ -54,24 +76,69 @@ def _transition_marker(target: str, cleanup: tuple[str, ...], text: str) -> None
 
 
 def mark_done(session_id: str) -> None:
-    """Write a done marker and clean up any pending/retry markers."""
-    ts, pending, retry = _paths(session_id)
+    """Write a done marker and clean up any pending/retry/dead markers."""
+    ts, pending, retry, dead = _paths(session_id)
     _ensure_dir()
-    _transition_marker(ts, (pending, retry), str(time.time()))
+    _transition_marker(ts, (pending, retry, dead), str(time.time()))
 
 
-def mark_retry(session_id: str) -> None:
-    """Write a retry marker and remove the done/pending markers if present."""
-    ts, pending, retry = _paths(session_id)
+def _read_retry_count(retry_path: str) -> int:
+    """Parse the attempt count out of a `.retry` marker; 0 if absent.
+
+    Current format is ``"<mtime>\\n<attempts>"``. Markers written before attempt
+    counting existed are timestamp-only (no newline) — their mere existence already
+    means one attempt failed, so they read as attempt 1, not 0. Reading them as 0
+    would silently reset the failure history for every session already on disk.
+    """
+    try:
+        with open(retry_path, encoding="utf-8") as f:
+            content = f.read().strip()
+    except OSError:
+        return 0
+    if not content:
+        return 0
+    parts = content.split("\n")
+    if len(parts) >= 2:
+        try:
+            return int(parts[1].strip())
+        except ValueError:
+            return 1
+    return 1
+
+
+def retry_count(session_id: str) -> int:
+    """Return the recorded attempt count for `session_id`'s `.retry` marker (0 if none)."""
+    return _read_retry_count(_paths(session_id)[2])
+
+
+def mark_retry(session_id: str, reason: str = "") -> int:
+    """Write/increment a retry marker; return the attempt count just recorded.
+
+    Once attempts reach ``MARKER_RETRY_MAX_ATTEMPTS`` (env override, default
+    ``DEFAULT_RETRY_MAX_ATTEMPTS``), transitions to a `.dead` marker instead so the
+    session stops occupying the head of the retry queue. `.retry` stays eligible for
+    retry below that threshold — transient failures (engine down, etc.) still recover.
+    """
+    ts, pending, retry, dead = _paths(session_id)
     _ensure_dir()
-    _transition_marker(retry, (ts, pending), str(time.time()))
+    attempts = _read_retry_count(retry) + 1
+    if attempts >= _retry_max_attempts():
+        _transition_marker(dead, (ts, pending, retry), f"{time.time()}\n{attempts}\n{reason}")
+        print(
+            f"[markers] {session_id} dead-lettered after {attempts} attempts"
+            f"{f' ({reason})' if reason else ''}",
+            file=sys.stderr,
+        )
+        return attempts
+    _transition_marker(retry, (ts, pending), f"{time.time()}\n{attempts}")
+    return attempts
 
 
 def mark_pending(session_id: str) -> None:
-    """Write a plain pending marker and remove done/retry markers."""
-    ts, pending, retry = _paths(session_id)
+    """Write a plain pending marker and remove done/retry/dead markers."""
+    ts, pending, retry, dead = _paths(session_id)
     _ensure_dir()
-    _transition_marker(pending, (ts, retry), str(time.time()))
+    _transition_marker(pending, (ts, retry, dead), str(time.time()))
 
 
 def is_done(session_id: str) -> bool:
@@ -79,9 +146,14 @@ def is_done(session_id: str) -> bool:
     return os.path.exists(_paths(session_id)[0])
 
 
+def is_dead(session_id: str) -> bool:
+    """Return True if a dead-letter marker exists (permanently failed; do not re-queue)."""
+    return os.path.exists(_paths(session_id)[3])
+
+
 def is_pending(session_id: str, ttl: Optional[float] = None) -> bool:
     """Return True if a pending marker exists and (when ttl is given) is not expired."""
-    _, path, _ = _paths(session_id)
+    _, path, _, _ = _paths(session_id)
     if not os.path.exists(path):
         return False
     if ttl is None:
@@ -107,7 +179,7 @@ def is_retry(session_id: str, ttl: Optional[float] = None) -> bool:
 
 def done_time(session_id: str) -> Optional[float]:
     """Return the mtime of the done marker, or None if absent."""
-    ts, _, _ = _paths(session_id)
+    ts, _, _, _ = _paths(session_id)
     try:
         return os.path.getmtime(ts)
     except OSError:
@@ -125,14 +197,14 @@ def ingest_pending_path(session_id: str) -> str:
 
 def write_ingest_pending(session_id: str, before: int, attempts: int) -> None:
     """Write the ingest-worker's pending marker with ``(sid, before, attempts)``."""
-    ts, path, retry = _paths(session_id)
+    ts, path, retry, _dead = _paths(session_id)
     _ensure_dir()
     _transition_marker(path, (ts, retry), f"{session_id}\n{before}\n{attempts}")
 
 
 def read_ingest_pending(session_id: str) -> Optional[tuple[str, int, int]]:
     """Parse the ingest-worker's pending marker. Return None if absent/corrupt."""
-    _, path, _ = _paths(session_id)
+    _, path, _, _ = _paths(session_id)
     try:
         with open(path, encoding="utf-8") as f:
             parts = f.read().strip().split("\n")
@@ -146,5 +218,5 @@ def read_ingest_pending(session_id: str) -> Optional[tuple[str, int, int]]:
 
 def remove_pending(session_id: str) -> None:
     """Remove any pending marker for ``session_id``."""
-    _, path, _ = _paths(session_id)
+    _, path, _, _ = _paths(session_id)
     _remove_marker(path)

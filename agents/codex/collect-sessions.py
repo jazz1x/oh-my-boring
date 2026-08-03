@@ -73,7 +73,11 @@ def _codex_session_id(path: str) -> str:
 
 def _marked(session_id: str) -> bool:
     prefixed = f"codex-{session_id}"
-    return markers.is_done(prefixed) or markers.is_pending(prefixed, ttl=PENDING_TTL)
+    return (
+        markers.is_done(prefixed)
+        or markers.is_pending(prefixed, ttl=PENDING_TTL)
+        or markers.is_dead(prefixed)
+    )
 
 
 def _scan_sessions(source_dir: str, cutoff: float) -> dict:

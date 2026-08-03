@@ -44,8 +44,13 @@ HOOK = os.path.join(BORING_HOME, "agents/claude-code/distill-session.py")
 
 def _marked(session_id):
     # Done marker means fully handled; hermes pending markers mean "already queued" — don't backfill.
-    # Retry markers are intentionally eligible for backfill (that's what backfill is for).
-    return markers.is_done(session_id) or markers.is_pending(session_id, ttl=PENDING_TTL)
+    # Retry markers are intentionally eligible for backfill (that's what backfill is for), but a
+    # dead-lettered session has exhausted its retries and must not re-occupy the queue head.
+    return (
+        markers.is_done(session_id)
+        or markers.is_pending(session_id, ttl=PENDING_TTL)
+        or markers.is_dead(session_id)
+    )
 
 
 def transcript_cwd(tp):
