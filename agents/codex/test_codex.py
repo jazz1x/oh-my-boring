@@ -53,6 +53,7 @@ def _run_main(payload: dict, extracted: str):
 
 
 def test_large_raw_parse_short_marks_retry():
+    """Parser produced little from a large file that does carry real assistant output."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         f.write(
             json.dumps(
@@ -60,7 +61,7 @@ def test_large_raw_parse_short_marks_retry():
                     "type": "event_msg",
                     "payload": {
                         "type": "agent_message",
-                        "last_agent_message": "short assistant result",
+                        "last_agent_message": "substantive assistant result. " * 12,
                     },
                 }
             )
@@ -846,6 +847,58 @@ def test_status_strict_fails_on_stale_codex_markers():
         collect.RETRY_TTL = old_retry_ttl
 
 
+
+def test_recommended_plugins_block_is_noise():
+    """The plugin advert Codex injects is not session content.
+
+    A transcript whose only user turn is that block distills into a note about plugins
+    nobody asked for, so it must never reach the LLM.
+    """
+    import transcript as t
+
+    raw = (
+        json.dumps({"type": "response_item", "payload": {"role": "user", "content": [
+            {"type": "input_text", "text": "<recommended_plugins>\nBox (box@openai-curated-remote)\n</recommended_plugins>"}]}})
+        + "\n"
+        + json.dumps({"type": "response_item", "payload": {"role": "user", "content": [
+            {"type": "input_text", "text": "reply with just: ok"}]}})
+        + "\n"
+        + json.dumps({"type": "response_item", "payload": {"role": "assistant", "content": [
+            {"type": "output_text", "text": "ok"}]}})
+        + "\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "s.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raw)
+        text = t.extract(path, "codex-jsonl")
+    assert "recommended_plugins" not in text, text
+    assert "box@openai-curated-remote" not in text, text
+    assert "reply with just: ok" in text
+
+
+def test_acknowledgement_only_session_is_not_substantive():
+    """A big raw file whose entire assistant output is 'ok' has nothing to review.
+
+    should_retry_short_extract exists to flag a parser that failed on real content. The
+    extractor is a pure function of the file, so retrying a genuinely trivial session
+    repeats forever — that is how one session held the queue head for three weeks.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "s.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "response_item", "payload": {"role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]}}) + "\n")
+        assert distill._has_substantive_assistant_turn(path) is False
+
+        long_path = os.path.join(d, "long.jsonl")
+        body = "x" * (distill.MIN_SUBSTANTIVE_ASSISTANT_CHARS + 1)
+        with open(long_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "response_item", "payload": {"role": "assistant",
+                "content": [{"type": "output_text", "text": body}]}}) + "\n")
+        assert distill._has_substantive_assistant_turn(long_path) is True
+
+
 if __name__ == "__main__":
     test_large_raw_parse_short_marks_retry()
     test_large_raw_import_only_parse_short_marks_done()
@@ -864,4 +917,6 @@ if __name__ == "__main__":
     test_status_strict_fails_when_host_worker_missing()
     test_status_strict_fails_when_hermes_worker_failed()
     test_status_strict_fails_on_stale_codex_markers()
+    test_recommended_plugins_block_is_noise()
+    test_acknowledgement_only_session_is_not_substantive()
     print("ok - codex adapter")

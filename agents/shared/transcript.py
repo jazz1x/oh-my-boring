@@ -116,6 +116,7 @@ _CODEX_USER_NOISE_MARKERS = (
     "Filesystem sandboxing",
     "<filesystem>",
     "<current_date>",
+    "<recommended_plugins>",
     "<shell>",
     "<cwd>",
 )
