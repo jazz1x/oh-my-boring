@@ -39,7 +39,15 @@ def extract(path):
     return transcript.extract(path, TRANSCRIPT_FORMAT)
 
 
+# An acknowledgement is not a session. Retrying a short extract only helps while the
+# transcript is still being written — the extractor is a pure function of the file, so once
+# it is stable a short result stays short forever. Requiring real assistant output keeps the
+# review flag for genuine parse failures and lets trivial sessions finish as done.
+MIN_SUBSTANTIVE_ASSISTANT_CHARS = 200
+
+
 def _has_substantive_assistant_turn(transcript_path: str) -> bool:
+    total = 0
     with open(transcript_path, encoding="utf-8") as f:
         for line in f:
             try:
@@ -62,7 +70,9 @@ def _has_substantive_assistant_turn(transcript_path: str) -> bool:
                 text = payload.get("last_agent_message") or payload.get("message") or ""
             text = text.strip()
             if text and text != EXTERNAL_IMPORT_MESSAGE:
-                return True
+                total += len(text)
+                if total >= MIN_SUBSTANTIVE_ASSISTANT_CHARS:
+                    return True
     return False
 
 
