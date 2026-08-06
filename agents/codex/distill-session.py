@@ -30,7 +30,7 @@ from distill_core import (  # noqa: F401
 )
 
 TRANSCRIPT_FORMAT = "codex-jsonl"
-CLAMP = int(os.environ.get("CODEX_DISTILL_CLAMP") or os.environ.get("INGEST_CLAMP") or "4000")
+CLAMP = transcript.codex_distill_clamp()
 EXTERNAL_IMPORT_MESSAGE = "<EXTERNAL SESSION IMPORTED>"
 
 

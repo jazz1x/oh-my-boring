@@ -6,15 +6,56 @@ boring.json selects the parser; unknown formats are rejected loudly so a
 misconfigured agent does not silently produce empty notes.
 """
 import json
+import os
 import sys
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int constant from env, falling back to `default` when unset/blank."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+# Head/tail split for clamp_text: keep the start of the transcript (the ask)
+# and bias the remainder toward the tail (decision/result land last).
+_CLAMP_HEAD_NUMERATOR = 2
+_CLAMP_HEAD_DENOMINATOR = 5
+
+# codex-jsonl clamp ceiling. Raised 4000 -> 12000 (2026-08-04): measured against
+# real ~/.codex/sessions data, the median codex-jsonl extract() is ~8.4k chars —
+# above the old 4000 ceiling — and a 12k-char prompt still lands well inside the
+# 120s LLM call timeout (agents/shared/distill_core.py:_call_llm) against the
+# local qwen3:14b endpoint (benchmarked 26-81s for 4k-24k char prompts, no
+# monotonic blowup). Override with CODEX_DISTILL_CLAMP or the shared INGEST_CLAMP.
+CODEX_CLAMP_DEFAULT = 12000
+
+
+def codex_distill_clamp() -> int:
+    """Resolve the codex-jsonl clamp limit, honouring the existing env knobs."""
+    raw = os.environ.get("CODEX_DISTILL_CLAMP") or os.environ.get("INGEST_CLAMP")
+    return int(raw) if raw else CODEX_CLAMP_DEFAULT
+
+
 def clamp_text(text, limit):
-    """Return a head/tail-clamped transcript and whether it was shortened."""
+    """Return a head/tail-clamped transcript and whether it was shortened.
+
+    Cut points snap to the nearest newline so a kept `[role] ...` turn is never
+    sliced mid-line.
+    """
     if limit <= 0 or len(text) <= limit:
         return text, False
-    head = limit * 2 // 5
-    return text[:head] + "\n…(truncated)…\n" + text[-(limit - head) :], True
+    head = limit * _CLAMP_HEAD_NUMERATOR // _CLAMP_HEAD_DENOMINATOR
+    tail = limit - head
+    head_cut = text.rfind("\n", 0, head + 1)
+    if head_cut <= 0:
+        head_cut = head
+    tail_start = len(text) - tail
+    tail_nl = text.find("\n", tail_start)
+    if tail_nl != -1:
+        tail_start = tail_nl + 1
+    return text[:head_cut] + "\n…(truncated)…\n" + text[tail_start:], True
 
 
 def _extract_claude_jsonl(path: str) -> str:
@@ -122,6 +163,43 @@ _CODEX_USER_NOISE_MARKERS = (
 )
 
 
+# raw codex-jsonl bytes are dominated by function_call_output (huge shell/file
+# dumps) and reasoning (hidden CoT) — both stay dropped, they are why extraction
+# was ~2% of raw bytes in the first place and re-including them would just move
+# the ceiling from clamp back onto extraction. function_call signatures are
+# small (~11% of raw bytes for ~35 calls/session median) and, for exec_command /
+# update_plan specifically, carry real "what was tried" narrative that the
+# [user]/[assistant] turns alone can miss (measured: sessions with 30+ tool
+# calls and <5k chars of message narrative). Every other tool name is dropped
+# rather than guessed at — send_message payloads observed in the wild are
+# opaque/encrypted blobs, not narrative.
+_CODEX_TOOL_ALLOWLIST = {
+    "exec_command": lambda args: args.get("cmd"),
+    "update_plan": lambda args: "; ".join(
+        f"{s.get('status', '?')}:{s.get('step', '')}"
+        for s in (args.get("plan") or [])
+        if isinstance(s, dict)
+    ),
+}
+
+CODEX_TOOL_ARG_CHARS = _env_int("CODEX_TOOL_ARG_CHARS", 200)
+
+
+def _codex_tool_call_text(name: str, arguments) -> str:
+    """Return a short, allowlisted signature for a Codex function_call, or ''."""
+    extractor = _CODEX_TOOL_ALLOWLIST.get(name)
+    if extractor is None:
+        return ""
+    try:
+        args = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(args, dict):
+        return ""
+    text = (extractor(args) or "").strip()
+    return text[:CODEX_TOOL_ARG_CHARS]
+
+
 def _codex_content_text(role: str, content) -> str:
     """Extract speakable text from a Codex response_item content payload."""
     parts = []
@@ -155,6 +233,12 @@ def _extract_codex_jsonl(path: str) -> str:
             t = obj.get("type")
             payload = obj.get("payload") or {}
             if t == "response_item":
+                if payload.get("type") == "function_call":
+                    name = payload.get("name") or ""
+                    sig = _codex_tool_call_text(name, payload.get("arguments"))
+                    if sig:
+                        out.append(f"[tool] {name} {sig}")
+                    continue
                 role = payload.get("role") or ""
                 if role not in ("user", "assistant"):
                     continue
