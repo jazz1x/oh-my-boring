@@ -11,6 +11,20 @@ oh-my-boring ingestion pipeline via `~/.cache/boring-distill`.
 - WINDOW (default 720h=30d, COLLECT_WINDOW_HOURS): ignore anything too old.
 - Subagent/rollout sessions (guardian, etc.) are skipped by default; set
   CODEX_INCLUDE_SUBAGENTS=1 to ingest them too.
+
+Canonical scheduler decision (2026-08-06): this script is invoked by TWO independent
+schedulers — the host launchd job `com.ohmyboring.codex-ingest` (20 min interval, runs
+directly against ~/.codex/sessions, no extra runtime dependency) and the hermes cron job
+`codex-memory-ingest-worker` (4h interval, runs inside the boring-agent container via a
+bind mount, env supplied only through the wrapper's `setdefault` — not visible in
+jobs.json). launchd is canonical: it has one fewer moving part (no container needs to be
+up), its config is self-documenting (env is inline in the plist), and its tighter
+interval keeps the ingestion queue drained instead of backlogged for hours. hermes should
+stay disabled permanently, not run as a redundant hot-standby — both point at the same
+host filesystem on the same machine, so there is no independent-uptime benefit to
+running both, only duplicate-run risk. `--status` reports it as an issue if both are ever
+active at once, or if neither is; `acquire_collector_lock` below is the runtime backstop
+for the same failure mode.
 """
 from __future__ import annotations
 
@@ -45,6 +59,18 @@ BORING_HOME = os.environ.get("BORING_HOME") or omb_env.omb_home()
 HOOK = os.path.join(BORING_HOME, "agents/codex/distill-session.py")
 HOST_WORKER_LABEL = "com.ohmyboring.codex-ingest"
 
+# Two schedulers (launchd on the host, hermes cron inside boring-agent) can both point at
+# this script (see module docstring decision note below). A run-lock is the runtime
+# backstop for whenever ownership drifts back to "both enabled": it does not replace
+# picking one owner, it just stops a second concurrent run from burning an LLM pass on a
+# session the first run is already mid-distill on. TTL-based, not pid-liveness-based,
+# because launchd (host pid namespace) and hermes cron (container pid namespace) do not
+# share a pid space — a raw `kill(pid, 0)` across that boundary would be meaningless.
+# Sized comfortably above a normal single-session run (LLM call + sync, observed well
+# under 2 minutes) and comfortably below the tightest scheduler interval (launchd's 20
+# minutes), so a crashed holder is reclaimed before the next legitimate run would starve.
+COLLECTOR_LOCK_TTL_S = float(os.environ.get("CODEX_COLLECTOR_LOCK_TTL") or "900")
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -65,6 +91,104 @@ def _source_dir():
     if omb_env._in_container():
         return "/host/.codex/sessions"
     return os.path.expanduser("~/.codex/sessions")
+
+
+def _lock_path() -> str:
+    # Computed lazily (not a module-level constant) so the container override of
+    # markers.MARK_DIR above is always reflected.
+    return os.path.join(markers.MARK_DIR, "codex-collector.lock")
+
+
+def _lock_owner_label() -> str:
+    return "container" if omb_env._in_container() else "host"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort same-pid-namespace liveness check.
+
+    A False here does NOT prove the remote holder is dead when the checking process and
+    the lock holder are in different pid namespaces (host vs. container) — it is a
+    fast-path only; COLLECTOR_LOCK_TTL_S above is the authoritative reclaim signal.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock() -> dict | None:
+    try:
+        with open(_lock_path(), encoding="utf-8") as f:
+            parts = f.read().strip().split("\n")
+    except OSError:
+        return None
+    try:
+        return {
+            "pid": int(parts[0]),
+            "host": parts[1] if len(parts) > 1 else "",
+            "started": float(parts[2]) if len(parts) > 2 else os.path.getmtime(_lock_path()),
+            "owner": parts[3] if len(parts) > 3 else "",
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def acquire_collector_lock() -> tuple[bool, str]:
+    """Best-effort single-run lock for the batch-processing section of a collector run.
+
+    Returns (acquired, reason). `reason` explains a False result (never silent — the
+    whole point is that a duplicate run leaves evidence instead of just doing nothing).
+    A held lock is reclaimed once it is older than COLLECTOR_LOCK_TTL_S, or immediately
+    if its pid is confirmed dead in our own pid namespace.
+    """
+    os.makedirs(markers.MARK_DIR, exist_ok=True)
+    path = _lock_path()
+    now = time.time()
+    existing = _read_lock()
+    if existing is not None:
+        age = now - existing["started"]
+        stale = age > COLLECTOR_LOCK_TTL_S
+        if not stale and existing["owner"] == _lock_owner_label() and not _pid_alive(existing["pid"]):
+            stale = True
+        if not stale:
+            return False, (
+                f"locked by pid={existing['pid']} host={existing['host']} "
+                f"owner={existing['owner']} age={age:.0f}s (ttl={COLLECTOR_LOCK_TTL_S:g}s)"
+            )
+        print(
+            f"[codex-collect] reclaiming stale collector lock "
+            f"(age={age:.0f}s pid={existing['pid']} owner={existing['owner']})",
+            file=sys.stderr,
+        )
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        # Lost a race against another instance's acquire between our staleness check and
+        # our create — the other instance legitimately holds it now.
+        return False, "lost race acquiring lock (another instance just took it)"
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid()}\n{platform.node()}\n{now}\n{_lock_owner_label()}\n")
+    return True, ""
+
+
+def release_collector_lock() -> None:
+    """Release the lock, but only if it is still ours (it may have been reclaimed as
+    stale by another instance while we were still running — don't delete their lock)."""
+    existing = _read_lock()
+    if existing and existing["pid"] == os.getpid() and existing["owner"] == _lock_owner_label():
+        try:
+            os.unlink(_lock_path())
+        except OSError:
+            pass
 
 
 def _codex_session_id(path: str) -> str:
@@ -291,11 +415,17 @@ def _parse_worker_time(raw: str) -> dt.datetime | None:
 
 
 def _worker_readiness_issues(worker: dict) -> list[str]:
-    issues = []
-    if not worker.get("found"):
-        return ["hermes codex worker missing"]
+    """Hermes-specific health checks (schedule staleness, last run outcome).
+
+    Only meaningful while hermes is actually the active scheduler: see the canonical-owner
+    decision above collect-sessions.py's docstring — launchd is the intended owner, so
+    hermes staying disabled (or entirely absent from jobs.json) is the correct steady
+    state, not an issue. `_scheduler_ownership_issues` is what flags an actual ownership
+    problem (both active, or neither active).
+    """
     if not worker.get("enabled"):
-        issues.append("hermes codex worker disabled")
+        return []
+    issues = []
     last_status = str(worker.get("last_status") or "").lower()
     if last_status not in ("ok", "success"):
         issues.append(f"hermes codex worker last_status={last_status or 'missing'}")
@@ -309,6 +439,33 @@ def _worker_readiness_issues(worker: dict) -> list[str]:
         if next_run < now:
             issues.append("hermes codex worker schedule stale")
     return issues
+
+
+def _scheduler_ownership_issues(host_worker: dict, hermes_worker: dict) -> list[str]:
+    """Exactly one of {launchd host worker, hermes cron worker} may own codex ingestion.
+
+    Both active is the actual incident this guards against (a scheduler got toggled
+    without noticing the other was still running, so the LLM kept firing every 4h from
+    hermes while someone believed it was off). Neither active means ingestion has
+    silently stopped. launchd is the canonical owner (see the module-level decision
+    note); hermes being disabled or even absent from jobs.json is therefore healthy,
+    not a problem — `_worker_readiness_issues` no longer flags it as one.
+    """
+    host_active = bool(host_worker.get("found") and host_worker.get("loaded"))
+    hermes_active = bool(hermes_worker.get("found") and hermes_worker.get("enabled"))
+    if host_active and hermes_active:
+        return [
+            "dual codex scheduler active: launchd host worker AND hermes cron worker "
+            "are both enabled — pick one owner (launchd is canonical; disable the hermes job)"
+        ]
+    if not host_active and hermes_active:
+        return [
+            "non-canonical codex scheduler owns ingestion: hermes cron is active but "
+            "launchd (the canonical owner) is not loaded"
+        ]
+    if not host_active and not hermes_active:
+        return ["no codex ingestion scheduler active: neither launchd nor hermes cron is enabled"]
+    return []
 
 
 def _marker_readiness_issues(marker: dict) -> list[str]:
@@ -418,8 +575,7 @@ def _print_status(source_dir: str, scan: dict) -> bool:
         f"kind={host_worker.get('kind', '')} path={host_worker.get('path', '')}"
     )
     issues = []
-    if not (host_worker.get("found") and host_worker.get("loaded")):
-        issues.append("host worker is not installed/loaded")
+    issues.extend(_scheduler_ownership_issues(host_worker, worker))
     issues.extend(_worker_readiness_issues(worker))
     issues.extend(_marker_readiness_issues(marker))
     for issue in issues:
@@ -586,17 +742,16 @@ def main(argv: list[str] | None = None):
         )
         return 0
 
-    # Distilling costs a full LLM pass; remembering is what needs the DB. Check the write
-    # door first so a degraded engine leaves the session pending instead of burning the model
-    # on input that cannot be stored — that loop re-ran the same session every cycle.
-    try:
-        check_drudge_writable(DrudgeClient())
-    except DrudgeNotWritableError as exc:
-        print(f"[codex-collect] write door closed: {exc}", file=sys.stderr, flush=True)
+    # Batch processing (LLM distill + DB write) is the section a second concurrent
+    # scheduler instance must not duplicate. Acquire before the write-door check so a
+    # locked-out instance never even touches Drudge.
+    acquired, lock_reason = acquire_collector_lock()
+    if not acquired:
+        print(f"[{label}] skipped: {lock_reason}", file=sys.stderr, flush=True)
         event_log.try_append_event(
             "codex-collector",
             "collector_run",
-            "failed",
+            "ok",
             run_id=run_id,
             agent="codex",
             pending=len(todo),
@@ -605,65 +760,93 @@ def main(argv: list[str] | None = None):
             failed=0,
             remaining=len(todo),
             mode=label,
-            reason=str(exc),
-            **workflow_contract.collector_run_fields("failed", len(batch)),
+            reason=lock_reason,
+            locked_out=True,
+            **workflow_contract.collector_run_fields("ok", 0),
         )
-        return 1
+        return 0
 
-    env = dict(os.environ)
-    if args.now:
-        env["BORING_DISTILL_NO_MARK"] = "1"
-    done = 0
-    failed = 0
-    for tp in batch:
-        sid = _codex_session_id(tp)
-        cwd = _transcript_cwd(tp)
-        payload = json.dumps(
-            {
-                "transcript_path": tp,
-                "cwd": cwd,
-                "session_id": sid,
-                "hook_event_name": "SessionEnd",
-                "raw_bytes": os.path.getsize(tp),
-                "min_raw_bytes_for_retry": int(MIN_KB * 1024),
-                "distill_clamp": DISTILL_CLAMP,
-            }
-        )
-        r = subprocess.run([sys.executable, HOOK], input=payload, text=True, env=env)
-        done += 1 if r.returncode == 0 else 0
-        failed += 1 if r.returncode != 0 else 0
-        print(f"[{label}] {'ok' if r.returncode == 0 else 'fail'}  {sid}", flush=True)
-
-    sync_status = "ok"
     try:
-        DrudgeClient().sync()
-        print(f"[{label}] sync ok", flush=True)
-    except Exception as e:
-        sync_status = "failed"
-        print(f"[{label}] sync failed: {e}", file=sys.stderr, flush=True)
+        # Distilling costs a full LLM pass; remembering is what needs the DB. Check the write
+        # door first so a degraded engine leaves the session pending instead of burning the model
+        # on input that cannot be stored — that loop re-ran the same session every cycle.
+        try:
+            check_drudge_writable(DrudgeClient())
+        except DrudgeNotWritableError as exc:
+            print(f"[codex-collect] write door closed: {exc}", file=sys.stderr, flush=True)
+            event_log.try_append_event(
+                "codex-collector",
+                "collector_run",
+                "failed",
+                run_id=run_id,
+                agent="codex",
+                pending=len(todo),
+                batch=len(batch),
+                processed=0,
+                failed=0,
+                remaining=len(todo),
+                mode=label,
+                reason=str(exc),
+                **workflow_contract.collector_run_fields("failed", len(batch)),
+            )
+            return 1
 
-    print(
-        f"[{label}] done={done}/{len(batch)}  remaining={len(todo) - done} sync={sync_status}",
-        flush=True,
-    )
-    status = "ok" if done == len(batch) else "failed"
-    event_log.try_append_event(
-        "codex-collector",
-        "collector_run",
-        status,
-        run_id=run_id,
-        agent="codex",
-        pending=len(todo),
-        batch=len(batch),
-        processed=done,
-        failed=failed,
-        remaining=len(todo) - done,
-        sync_status=sync_status,
-        sync_degraded=(sync_status == "failed" and status == "ok"),
-        mode=label,
-        **workflow_contract.collector_run_fields(status, len(batch)),
-    )
-    return 0 if status == "ok" else 1
+        env = dict(os.environ)
+        if args.now:
+            env["BORING_DISTILL_NO_MARK"] = "1"
+        done = 0
+        failed = 0
+        for tp in batch:
+            sid = _codex_session_id(tp)
+            cwd = _transcript_cwd(tp)
+            payload = json.dumps(
+                {
+                    "transcript_path": tp,
+                    "cwd": cwd,
+                    "session_id": sid,
+                    "hook_event_name": "SessionEnd",
+                    "raw_bytes": os.path.getsize(tp),
+                    "min_raw_bytes_for_retry": int(MIN_KB * 1024),
+                    "distill_clamp": DISTILL_CLAMP,
+                }
+            )
+            r = subprocess.run([sys.executable, HOOK], input=payload, text=True, env=env)
+            done += 1 if r.returncode == 0 else 0
+            failed += 1 if r.returncode != 0 else 0
+            print(f"[{label}] {'ok' if r.returncode == 0 else 'fail'}  {sid}", flush=True)
+
+        sync_status = "ok"
+        try:
+            DrudgeClient().sync()
+            print(f"[{label}] sync ok", flush=True)
+        except Exception as e:
+            sync_status = "failed"
+            print(f"[{label}] sync failed: {e}", file=sys.stderr, flush=True)
+
+        print(
+            f"[{label}] done={done}/{len(batch)}  remaining={len(todo) - done} sync={sync_status}",
+            flush=True,
+        )
+        status = "ok" if done == len(batch) else "failed"
+        event_log.try_append_event(
+            "codex-collector",
+            "collector_run",
+            status,
+            run_id=run_id,
+            agent="codex",
+            pending=len(todo),
+            batch=len(batch),
+            processed=done,
+            failed=failed,
+            remaining=len(todo) - done,
+            sync_status=sync_status,
+            sync_degraded=(sync_status == "failed" and status == "ok"),
+            mode=label,
+            **workflow_contract.collector_run_fields(status, len(batch)),
+        )
+        return 0 if status == "ok" else 1
+    finally:
+        release_collector_lock()
 
 
 if __name__ == "__main__":

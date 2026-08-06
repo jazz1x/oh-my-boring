@@ -582,7 +582,9 @@ def test_status_mode_reports_queue_worker_and_note_without_mutation():
                         "jobs": [
                             {
                                 "name": "codex-memory-ingest-worker",
-                                "enabled": True,
+                                # launchd is the canonical owner; hermes staying disabled is the
+                                # healthy single-owner steady state, not a readiness issue.
+                                "enabled": False,
                                 "state": "scheduled",
                                 "last_status": "success",
                                 "last_run_at": "2026-06-29T09:00:00+09:00",
@@ -636,8 +638,9 @@ def test_status_mode_reports_queue_worker_and_note_without_mutation():
             assert "skipped_new=0 skipped_small=0 skipped_rollout=0 skipped_marked=0 skipped_subagent=0" in out
             assert "markers done=1 pending=0 retry=0 dead_letter=0 stale_pending=0 stale_retry=0" in out
             assert "codex-rollout-" not in out
-            assert "worker found=true enabled=true state=scheduled last_status=success" in out
+            assert "worker found=true enabled=false state=scheduled last_status=success" in out
             assert "host_worker found=true loaded=true kind=launchd" in out
+            assert "readiness_issue" not in out
             assert "newest_note session_id=codex-note" in out
             event = _read_last_event(event_path)
             assert event["event"] == "collector_status"
@@ -877,6 +880,134 @@ def test_recommended_plugins_block_is_noise():
     assert "reply with just: ok" in text
 
 
+def test_scheduler_ownership_issues_matrix():
+    """Exactly one of {launchd, hermes} active is healthy; both or neither is an issue."""
+    host_on = {"found": True, "loaded": True}
+    host_off = {"found": False, "loaded": False}
+    hermes_on = {"found": True, "enabled": True}
+    hermes_off = {"found": True, "enabled": False}
+
+    assert collect._scheduler_ownership_issues(host_on, hermes_off) == []
+    dual = collect._scheduler_ownership_issues(host_on, hermes_on)
+    assert len(dual) == 1 and "dual codex scheduler active" in dual[0]
+    non_canonical = collect._scheduler_ownership_issues(host_off, hermes_on)
+    assert len(non_canonical) == 1 and "non-canonical codex scheduler" in non_canonical[0]
+    none_active = collect._scheduler_ownership_issues(host_off, hermes_off)
+    assert len(none_active) == 1 and "no codex ingestion scheduler active" in none_active[0]
+
+
+def test_worker_readiness_issues_ignores_disabled_hermes():
+    """A disabled/absent hermes job is the correct steady state, not a health problem —
+    even when its stale fields (old next_run_at, failed last_status) would otherwise
+    trip the hermes-specific checks."""
+    disabled_but_stale = {
+        "found": True,
+        "enabled": False,
+        "last_status": "failed",
+        "last_error": "boom",
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+    }
+    assert collect._worker_readiness_issues(disabled_but_stale) == []
+    assert collect._worker_readiness_issues({"found": False}) == []
+
+
+def test_collector_lock_blocks_concurrent_acquire_with_reason():
+    old_mark_dir = collect.markers.MARK_DIR
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            collect.markers.set_mark_dir(d)
+            ok1, reason1 = collect.acquire_collector_lock()
+            assert ok1 is True
+            assert reason1 == ""
+
+            ok2, reason2 = collect.acquire_collector_lock()
+            assert ok2 is False
+            assert f"pid={os.getpid()}" in reason2
+            assert "ttl=" in reason2
+
+            collect.release_collector_lock()
+            ok3, _ = collect.acquire_collector_lock()
+            assert ok3 is True
+            collect.release_collector_lock()
+    finally:
+        collect.markers.set_mark_dir(old_mark_dir)
+
+
+def test_collector_lock_reclaims_stale_lock():
+    old_mark_dir = collect.markers.MARK_DIR
+    old_ttl = collect.COLLECTOR_LOCK_TTL_S
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            collect.markers.set_mark_dir(d)
+            collect.COLLECTOR_LOCK_TTL_S = 60
+            stale_pid = 999999  # unlikely to be a live pid; irrelevant here anyway since age > ttl
+            stale_started = time.time() - 3600
+            with open(collect._lock_path(), "w", encoding="utf-8") as f:
+                f.write(f"{stale_pid}\nold-host\n{stale_started}\nhost\n")
+
+            ok, reason = collect.acquire_collector_lock()
+
+            assert ok is True
+            assert reason == ""
+            held = collect._read_lock()
+            assert held["pid"] == os.getpid()
+            collect.release_collector_lock()
+    finally:
+        collect.markers.set_mark_dir(old_mark_dir)
+        collect.COLLECTOR_LOCK_TTL_S = old_ttl
+
+
+def test_collect_run_skips_when_locked_by_another_instance():
+    """A second scheduler instance racing the collector must not silently no-op — it
+    must leave a reason in both stderr and the event log, and must never touch the
+    LLM/DB path (subprocess.run, DrudgeClient)."""
+    old_mark_dir = collect.markers.MARK_DIR
+    old_min_kb = collect.MIN_KB
+    old_stable_age = collect.STABLE_AGE_S
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = root / "sessions"
+            source.mkdir()
+            mark_dir = root / "markers"
+            event_path = root / "events.ndjson"
+            collect.markers.set_mark_dir(str(mark_dir))
+            mark_dir.mkdir(parents=True, exist_ok=True)
+            collect.MIN_KB = 0
+            collect.STABLE_AGE_S = 0
+            _write_codex_session(source / "todo.jsonl")
+
+            # Simulate "another instance is already running": a fresh, live-pid lock.
+            other_pid = os.getpid()
+            with open(collect._lock_path(), "w", encoding="utf-8") as f:
+                f.write(f"{other_pid}\nother-host\n{time.time()}\n{collect._lock_owner_label()}\n")
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(collect, "_source_dir", return_value=str(source)),
+                mock.patch.dict(os.environ, {"BORING_EVENT_LOG": str(event_path), "BORING_EVENT_SINK": "spool"}),
+                mock.patch.object(collect.sys, "stderr", stderr),
+                mock.patch.object(collect.subprocess, "run") as run,
+                mock.patch.object(collect, "DrudgeClient") as client,
+            ):
+                rc = collect.main([])
+
+            assert rc == 0
+            run.assert_not_called()
+            client.assert_not_called()
+            assert "skipped: locked by pid=" in stderr.getvalue()
+            event = _read_last_event(event_path)
+            assert event["reason"].startswith("locked by pid=")
+            assert event["locked_out"] is True
+            # The other instance's lock must survive untouched — we never held it.
+            held = collect._read_lock()
+            assert held is not None and held["pid"] == other_pid
+    finally:
+        collect.markers.set_mark_dir(old_mark_dir)
+        collect.MIN_KB = old_min_kb
+        collect.STABLE_AGE_S = old_stable_age
+
+
 def test_acknowledgement_only_session_is_not_substantive():
     """A big raw file whose entire assistant output is 'ok' has nothing to review.
 
@@ -917,6 +1048,11 @@ if __name__ == "__main__":
     test_status_strict_fails_when_host_worker_missing()
     test_status_strict_fails_when_hermes_worker_failed()
     test_status_strict_fails_on_stale_codex_markers()
+    test_scheduler_ownership_issues_matrix()
+    test_worker_readiness_issues_ignores_disabled_hermes()
+    test_collector_lock_blocks_concurrent_acquire_with_reason()
+    test_collector_lock_reclaims_stale_lock()
+    test_collect_run_skips_when_locked_by_another_instance()
     test_recommended_plugins_block_is_noise()
     test_acknowledgement_only_session_is_not_substantive()
     print("ok - codex adapter")
