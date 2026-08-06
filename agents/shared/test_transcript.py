@@ -136,6 +136,55 @@ def test_extract_codex_jsonl_user_and_assistant():
         os.unlink(path)
 
 
+def test_extract_codex_jsonl_includes_allowlisted_tool_calls():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        _write(
+            f.name,
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": "rg -n TODO src/", "max_output_tokens": 4000}),
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "update_plan",
+                        "arguments": json.dumps(
+                            {"plan": [{"step": "inventory files", "status": "in_progress"}]}
+                        ),
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "send_message",
+                        "arguments": json.dumps({"target": "/root/x", "message": "gAAAAA_opaque_blob"}),
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {"type": "function_call_output", "output": "huge raw dump" * 100},
+                },
+            ],
+        )
+        path = f.name
+    try:
+        out = transcript.extract(path, "codex-jsonl")
+        assert "[tool] exec_command rg -n TODO src/" in out
+        assert "[tool] update_plan in_progress:inventory files" in out
+        assert "send_message" not in out
+        assert "opaque_blob" not in out
+        assert "huge raw dump" not in out
+    finally:
+        os.unlink(path)
+
+
 def test_extract_unknown_format_raises():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         f.write("x")
@@ -171,12 +220,44 @@ def test_clamp_text_keeps_short_input():
     assert clamped == text
 
 
+def test_clamp_text_snaps_to_newline_not_mid_line():
+    lines = [f"[user] turn {i} filler text here" for i in range(20)]
+    text = "\n".join(lines)
+
+    clamped, changed = transcript.clamp_text(text, 200)
+
+    assert changed is True
+    head, _, tail = clamped.partition("\n…(truncated)…\n")
+    # Every kept line on both sides must be a whole line from the source, never
+    # a ragged mid-line fragment.
+    for line in head.split("\n") + tail.split("\n"):
+        assert line == "" or line in lines
+
+
+def test_codex_distill_clamp_default_and_env_override():
+    saved = {k: os.environ.pop(k, None) for k in ("CODEX_DISTILL_CLAMP", "INGEST_CLAMP")}
+    try:
+        assert transcript.codex_distill_clamp() == transcript.CODEX_CLAMP_DEFAULT
+
+        os.environ["CODEX_DISTILL_CLAMP"] = "9999"
+        assert transcript.codex_distill_clamp() == 9999
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+
 if __name__ == "__main__":
     test_extract_claude_jsonl_text_and_list_content()
     test_extract_claude_jsonl_ignores_malformed_lines()
     test_extract_kimi_wire_user_and_assistant()
     test_extract_codex_jsonl_user_and_assistant()
+    test_extract_codex_jsonl_includes_allowlisted_tool_calls()
     test_extract_unknown_format_raises()
     test_clamp_text_preserves_head_and_tail()
     test_clamp_text_keeps_short_input()
+    test_clamp_text_snaps_to_newline_not_mid_line()
+    test_codex_distill_clamp_default_and_env_override()
     print("ok - transcript parser")
