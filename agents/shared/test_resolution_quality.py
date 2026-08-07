@@ -6,7 +6,12 @@ Run: python3 agents/shared/test_resolution_quality.py
 import unittest
 from typing import Optional, get_type_hints
 
-from resolution_quality import normalize_resolution, resolution_prompt_contract, verify_note_resolution
+from resolution_quality import (
+    body_survives_storage_normalize,
+    normalize_resolution,
+    resolution_prompt_contract,
+    verify_note_resolution,
+)
 import resolution_quality
 
 
@@ -296,6 +301,90 @@ class ResolutionQualityTests(unittest.TestCase):
 
         self.assertFalse(report.ok)
         self.assertIn("claim-kind-invalid:verdict", report.missing)
+
+    def test_headings_with_no_content_are_caught_not_passed(self):
+        # TASK C1 repro: every required heading present, none has any prose beneath it. This
+        # used to report ok=True (section substring-matched the bare heading text) and then died
+        # at drudge's write gate ("missing argument: body") once normalize_body collapsed it.
+        transcript = "PR #159 CI checks: 8 passed. eval-gate took 2m10s."
+        note = {
+            "title": "빈 섹션 회귀 재현",
+            "body": "\n\n".join(
+                [
+                    "## 배경 / 문제",
+                    "## 현재 상태",
+                    "## 목표 상태",
+                    "## 결정",
+                    "## 근거 / 검증",
+                    "## 결과",
+                    "## 남은 일",
+                ]
+            ),
+            "claims": [
+                claim("ingest", "completion-state", "retry-visible", "decision"),
+                claim("ci", "passed-checks", "8", "fact"),
+                claim("eval-gate", "duration", "2m10s", "fact"),
+                claim("resolution-gate", "next-step", "add verifier", "next"),
+            ],
+        }
+
+        report = verify_note_resolution(note, transcript, "evidence")
+
+        self.assertFalse(report.ok)
+        self.assertIn("section:problem", report.missing)
+        self.assertIn("section:decision", report.missing)
+        self.assertIn("section:result", report.missing)
+        self.assertIn("body:storage-normalize-empty", report.missing)
+        self.assertFalse(body_survives_storage_normalize(note["body"]))
+
+    def test_normal_headed_note_still_passes(self):
+        # Same shape as the repro above, but every heading actually has content underneath —
+        # must still pass. This is the regression guard for the section-signal tightening.
+        transcript = "PR #159 CI checks: 8 passed. eval-gate took 2m10s."
+        note = {
+            "title": "정상 노트 회귀 방지",
+            "body": "\n".join(
+                [
+                    "## 배경 / 문제",
+                    "Hermes 취합이 witness 없이 성공 처리될 수 있었다.",
+                    "## 현재 상태",
+                    "이전에는 일정 횟수 후 done 처리했다.",
+                    "## 목표 상태",
+                    "retry 상태를 witness 있을 때까지 유지한다.",
+                    "## 결정",
+                    "false done 대신 retry backoff를 쓴다.",
+                    "## 근거 / 검증",
+                    "PR #159 CI 8건 통과, eval-gate 2m10s 확인.",
+                    "## 결과",
+                    "CLEAN 상태에 도달했다.",
+                    "## 남은 일",
+                    "readiness에 resolution verifier를 노출한다.",
+                ]
+            ),
+            "claims": [
+                claim("ingest", "completion-state", "retry-visible", "decision"),
+                claim("ci", "passed-checks", "8", "fact"),
+                claim("eval-gate", "duration", "2m10s", "fact"),
+                claim("resolution-gate", "next-step", "add verifier", "next"),
+            ],
+        }
+
+        report = verify_note_resolution(note, transcript, "evidence")
+
+        self.assertTrue(report.ok, report.missing)
+        self.assertTrue(body_survives_storage_normalize(note["body"]))
+
+    def test_body_survives_storage_normalize_matches_drudge_trailing_strip(self):
+        # A non-trailing empty heading is NOT stripped by drudge's normalize_body (it only peels
+        # from the end), so storage still accepts the body — this predicts that exact shape.
+        body = "## Problem\n\n## Decision\nUse retry backoff.\n\n## Result\n"
+
+        self.assertTrue(body_survives_storage_normalize(body))
+
+    def test_body_survives_storage_normalize_rejects_all_empty_headings(self):
+        body = "## Problem\n\n## Decision\n\n## Result\n\n"
+
+        self.assertFalse(body_survives_storage_normalize(body))
 
     def test_prompt_contract_spells_out_required_claim_kinds(self):
         contract = resolution_prompt_contract("evidence")

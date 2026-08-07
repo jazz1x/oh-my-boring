@@ -32,6 +32,7 @@ from resolution_quality import (  # noqa: E402
     ALLOWED_CLAIM_KINDS,
     ALLOWED_RESOLUTIONS,
     RESOLUTION_RULES,
+    body_survives_storage_normalize,
     normalize_resolution,
     resolution_prompt_contract,
     verify_note_resolution,
@@ -541,6 +542,19 @@ def _prepare_note(parsed):
     if not title or not body:
         print("[distill-session] missing title/body in LLM output", file=sys.stderr)
         return None
+    # Precondition, not normalization: predicts whether drudge's normalize_body (SSOT —
+    # drudge/src/vault/remember.rs) will collapse this body to "" at the write gate, e.g. every
+    # heading present but none with content beneath it. Flagged here, early, so the resolution
+    # gate that runs right after _prepare_note (in distill_and_remember) sees the same failure
+    # and the existing repair pass gets a chance to fix it — instead of the note passing the
+    # gate and dying silently inside the remember() HTTP call. This does NOT rewrite body; only
+    # drudge normalizes for storage.
+    if not body_survives_storage_normalize(body):
+        print(
+            "[distill-session] body would collapse to empty at storage normalize "
+            "(headings with no content) — resolution gate will flag this for repair",
+            file=sys.stderr,
+        )
 
     tags = [t.strip() for t in parsed.get("tags", []) if isinstance(t, str) and t.strip()][:6]
     tools = [t.strip() for t in parsed.get("tools", []) if isinstance(t, str) and t.strip()][:8]

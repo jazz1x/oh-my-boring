@@ -7,6 +7,7 @@ specific enough for the requested resolution level?
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -14,6 +15,15 @@ from typing import Any, Optional
 
 ALLOWED_RESOLUTIONS = {"compact", "standard", "evidence", "forensic"}
 ALLOWED_CLAIM_KINDS = {"fact", "decision", "assumption", "risk", "blocked", "goal", "term", "next"}
+
+# A section "signal" (heading word) only counts once real prose sits under it — a bare
+# "## Decision" with nothing beneath is not a decision section. SSOT for that content-length
+# floor, env-overridable. Kept at 1 (any non-whitespace char) so this only catches the
+# genuinely-empty case and does not tighten grading beyond that (see TASK C1: over-tightening
+# risked flipping already-passing notes to red).
+SECTION_MIN_CONTENT_CHARS = int(os.environ.get("BORING_SECTION_MIN_CONTENT_CHARS", "1"))
+
+_ATX_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 
 SECTION_SIGNALS = {
     "problem": ("background", "problem", "context", "배경", "문제", "背景", "問題"),
@@ -125,6 +135,8 @@ def verify_note_resolution(
         missing.append("title")
     if not body.strip():
         missing.append("body")
+    elif not body_survives_storage_normalize(body):
+        missing.append("body:storage-normalize-empty")
 
     for section in rule["sections"]:
         if not _has_section_signal(body, section):
@@ -189,8 +201,94 @@ def _claims(note: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _has_section_signal(body: str, section: str) -> bool:
-    lower = body.lower()
+    lower = _prose_only(body).lower()
     return any(signal.lower() in lower for signal in SECTION_SIGNALS[section])
+
+
+def _prose_only(body: str) -> str:
+    """`body` with content-free ATX headings dropped.
+
+    A heading with nothing beneath it (before the next heading, or EOF) only NAMES a
+    section — it does not make the section exist. Without this, "## Decision" alone would
+    satisfy the decision-section signal even though nothing was ever decided. Headings that
+    DO have content, and any prose that sits outside heading structure, are left untouched —
+    including a signal word that happens to appear inside real prose elsewhere in the body.
+    That leniency is deliberate: tightening it further risks flipping already-passing notes to
+    red, which is a worse regression than the coincidental match it would prevent.
+    """
+    lines = body.split("\n")
+    keep = [True] * len(lines)
+    for i, line in enumerate(lines):
+        if not _ATX_HEADING_RE.match(line):
+            continue
+        content_len = 0
+        for other in lines[i + 1 :]:
+            if _ATX_HEADING_RE.match(other):
+                break
+            content_len += len(other.strip())
+        if content_len < SECTION_MIN_CONTENT_CHARS:
+            keep[i] = False
+    return "\n".join(line for line, k in zip(lines, keep) if k)
+
+
+# --- storage-precondition check -------------------------------------------------------------
+# drudge/src/vault/remember.rs::normalize_body is the SSOT for what gets written to the vault:
+# it decodes a small set of JSON-escaped characters, then repeatedly strips a *trailing* ATX
+# heading that has no content beneath it (drudge::vault::remember::strip_trailing_empty_heading).
+# A body that is nothing but empty headings collapses to "" there and the write gate rejects it
+# with "missing argument: body" — after the resolution gate already said the note was fine.
+#
+# The functions below PREDICT that outcome; they do not replace it and must never be used to
+# rewrite the body actually sent to `remember` (only drudge normalizes for storage — see
+# remember.rs:74-79). Duplicating the transform as a second writer would reintroduce exactly the
+# drift this file exists to close. This is a precondition check only: "would storage reject this",
+# answered before the HTTP round-trip, not "here is the normalized body to send".
+_BODY_ESCAPE_RE = re.compile(r"\\(.)", re.DOTALL)
+_BODY_ESCAPE_DECODE = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "`": "`",
+    "#": "#",
+    '"': '"',
+    "*": "*",
+    "_": "_",
+    "[": "[",
+    "]": "]",
+    "(": "(",
+    ")": ")",
+    "\\": "\\",
+}
+
+
+def _decode_body_escapes(body: str) -> str:
+    """Mirror drudge's normalize_body escape decoding (remember.rs ~80-103), predict-only."""
+    return _BODY_ESCAPE_RE.sub(lambda m: _BODY_ESCAPE_DECODE.get(m.group(1), "\\" + m.group(1)), body)
+
+
+def _strip_trailing_empty_headings(body: str) -> str:
+    """Mirror drudge's strip_trailing_empty_heading (remember.rs:55-70), predict-only."""
+    lines = body.split("\n")
+    while lines:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines and _ATX_HEADING_RE.match(lines[-1].lstrip()):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines)
+
+
+def body_survives_storage_normalize(body: str) -> bool:
+    """True if drudge's normalize_body would keep non-empty content for this body.
+
+    Predicts (does not perform) the write-gate normalization owned by
+    drudge/src/vault/remember.rs::normalize_body, so a note doomed to collapse into "" at
+    storage can be caught before `remember` is ever called, instead of dying inside the MCP
+    call with "missing argument: body".
+    """
+    decoded = _decode_body_escapes(body).strip()
+    return bool(_strip_trailing_empty_headings(decoded).strip())
 
 
 def _search_text(title: str, body: str, claims: list[dict[str, Any]]) -> str:
