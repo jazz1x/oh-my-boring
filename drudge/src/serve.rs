@@ -367,6 +367,14 @@ pub(crate) struct SearchHit {
     pub(crate) project: String,
     pub(crate) source_path: String,
     pub(crate) snippet: String,
+    /// Relevance signal for this hit — see `dist_kind` for what it means. `None` when the serving
+    /// path (wiki-recall fallback, `BORING_VECTOR=off`) has no comparable number to offer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dist: Option<f32>,
+    /// What `dist` measures. Cosine distance and full-text rank are not the same scale — a
+    /// consumer must branch on this before comparing `dist` against a threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dist_kind: Option<crate::store::DistKind>,
 }
 
 #[derive(Serialize)]

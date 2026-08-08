@@ -326,9 +326,15 @@ pub(crate) async fn handle_search(
             project: h.project,
             source_path: h.source_path,
             snippet: h.content,
+            dist: Some(h.dist),
+            dist_kind: Some(h.dist_kind),
         })
         .collect()
     } else {
+        // wiki-recall's WikiHit.score is a term-overlap heuristic (higher-is-better, unbounded) —
+        // a third, incomparable scale on top of vector cosine distance and text ts_rank. Rather than
+        // pretend it fits the same dist/dist_kind contract, this path honestly reports "no comparable
+        // relevance signal" and leaves filtering to the caller's own judgment.
         s.wiki_recall(&req.query, max_results, project, since_hours)?
             .into_iter()
             .map(|h| SearchHit {
@@ -337,6 +343,8 @@ pub(crate) async fn handle_search(
                 project: String::new(),
                 source_path: h.source_path,
                 snippet: h.snippet,
+                dist: None,
+                dist_kind: None,
             })
             .collect()
     };
