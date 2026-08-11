@@ -50,6 +50,131 @@ def test_extract_claude_jsonl_ignores_malformed_lines():
         os.unlink(path)
 
 
+def test_extract_claude_jsonl_includes_allowlisted_tool_calls():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        _write(
+            f.name,
+            [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "checking the tests"},
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "rg -n TODO src/", "description": "find TODOs"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "name": "Edit",
+                                "input": {
+                                    "file_path": "agents/shared/transcript.py",
+                                    "old_string": "SECRET_OLD_BODY",
+                                    "new_string": "SECRET_NEW_BODY",
+                                },
+                            },
+                            {
+                                "type": "tool_use",
+                                "name": "Write",
+                                "input": {
+                                    "file_path": "agents/shared/new_file.py",
+                                    "content": "SECRET_FILE_BODY",
+                                },
+                            },
+                            {
+                                "type": "tool_use",
+                                "name": "TodoWrite",
+                                "input": {
+                                    "todos": [
+                                        {"content": "inventory files", "status": "in_progress"}
+                                    ]
+                                },
+                            },
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": "agents/shared/transcript.py"},
+                            },
+                        ],
+                    }
+                },
+                {
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "content": "SECRET_TOOL_RESULT_BODY",
+                            }
+                        ],
+                    }
+                },
+            ],
+        )
+        path = f.name
+    try:
+        out = transcript.extract(path, "claude-json")
+        assert "[tool] Bash rg -n TODO src/  # find TODOs" in out
+        assert "[tool] Edit agents/shared/transcript.py" in out
+        assert "[tool] Write agents/shared/new_file.py" in out
+        assert "[tool] TodoWrite in_progress:inventory files" in out
+        assert "SECRET_OLD_BODY" not in out
+        assert "SECRET_NEW_BODY" not in out
+        assert "SECRET_FILE_BODY" not in out
+        assert "SECRET_TOOL_RESULT_BODY" not in out
+        assert "[tool] Read" not in out
+    finally:
+        os.unlink(path)
+
+
+def test_extract_claude_jsonl_drops_unknown_tool_calls():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        _write(
+            f.name,
+            [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Grep",
+                                "input": {"pattern": "TODO", "path": "src/"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "name": "WebFetch",
+                                "input": {"url": "https://example.com"},
+                            },
+                        ],
+                    }
+                },
+            ],
+        )
+        path = f.name
+    try:
+        out = transcript.extract(path, "claude-json")
+        assert out == ""
+    finally:
+        os.unlink(path)
+
+
+def test_claude_distill_clamp_default_and_env_override():
+    saved = {k: os.environ.pop(k, None) for k in ("DISTILL_CLAMP", "INGEST_CLAMP")}
+    try:
+        assert transcript.claude_distill_clamp() == transcript.CLAUDE_CLAMP_DEFAULT
+
+        os.environ["DISTILL_CLAMP"] = "9999"
+        assert transcript.claude_distill_clamp() == 9999
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+
 def test_extract_kimi_wire_user_and_assistant():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         _write(
@@ -252,6 +377,9 @@ def test_codex_distill_clamp_default_and_env_override():
 if __name__ == "__main__":
     test_extract_claude_jsonl_text_and_list_content()
     test_extract_claude_jsonl_ignores_malformed_lines()
+    test_extract_claude_jsonl_includes_allowlisted_tool_calls()
+    test_extract_claude_jsonl_drops_unknown_tool_calls()
+    test_claude_distill_clamp_default_and_env_override()
     test_extract_kimi_wire_user_and_assistant()
     test_extract_codex_jsonl_user_and_assistant()
     test_extract_codex_jsonl_includes_allowlisted_tool_calls()
