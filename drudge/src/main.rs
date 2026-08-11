@@ -285,7 +285,14 @@ async fn main() -> Result<()> {
             println!("'{query}' → {} hits", hits.len());
             for h in &hits {
                 let snip: String = h.content.chars().take(50).collect();
-                println!("  [{}/{}] {} — {snip}", h.origin, h.project, h.id);
+                let kind_label = match h.dist_kind {
+                    store::DistKind::VectorCosine => "vector_cosine",
+                    store::DistKind::TextRank => "text_rank",
+                };
+                println!(
+                    "  [dist={:.4} {kind_label}] [{}/{}] {} — {snip}",
+                    h.dist, h.origin, h.project, h.id
+                );
             }
         }
         Cmd::Ask { question } => {

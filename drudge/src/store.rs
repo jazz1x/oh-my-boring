@@ -33,6 +33,18 @@ pub struct Doc {
     pub chunk_idx: usize,
 }
 
+/// What `Hit::dist` actually measures. Vector cosine distance and full-text rank live on
+/// different, non-comparable scales (direction of "better" even flips) — this stops a caller
+/// from doing arithmetic (e.g. a relevance threshold) across the two without knowing which it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistKind {
+    /// pgvector cosine distance to the query embedding (0 = identical, 2 = opposite). Lower is better.
+    VectorCosine,
+    /// Postgres `ts_rank` full-text score. Higher is better; unbounded, not comparable across queries.
+    TextRank,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // some fields are for retrieve / display only
 pub struct Hit {
@@ -42,6 +54,7 @@ pub struct Hit {
     pub project: String,
     pub source_path: String,
     pub dist: f32,
+    pub dist_kind: DistKind,
 }
 
 #[derive(Debug)]
@@ -1055,7 +1068,10 @@ impl Store {
                 &[&qvec, &k_i64],
             )
             .await?;
-        Ok(rows.iter().map(row_to_hit).collect())
+        Ok(rows
+            .iter()
+            .map(|r| row_to_hit(r, DistKind::VectorCosine))
+            .collect())
     }
 
     pub async fn text_search(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
@@ -1071,7 +1087,10 @@ impl Store {
                 &[&query, &k_i64],
             )
             .await?;
-        Ok(rows.iter().map(row_to_hit).collect())
+        Ok(rows
+            .iter()
+            .map(|r| row_to_hit(r, DistKind::TextRank))
+            .collect())
     }
 
     /// Vector search with optional project and recency filters.
@@ -1100,7 +1119,10 @@ impl Store {
                 &[&qvec, &k_i64, &project, &since_hours],
             )
             .await?;
-        Ok(rows.iter().map(row_to_hit).collect())
+        Ok(rows
+            .iter()
+            .map(|r| row_to_hit(r, DistKind::VectorCosine))
+            .collect())
     }
 
     /// Find the single nearest document by mean chunk distance. Used at the remember write gate
@@ -1155,7 +1177,10 @@ impl Store {
                 &[&query, &k_i64, &project, &since_hours],
             )
             .await?;
-        Ok(rows.iter().map(row_to_hit).collect())
+        Ok(rows
+            .iter()
+            .map(|r| row_to_hit(r, DistKind::TextRank))
+            .collect())
     }
 
     pub async fn count(&self) -> Result<usize> {
@@ -1653,7 +1678,7 @@ fn redact_json_value(value: &Value) -> Value {
     }
 }
 
-fn row_to_hit(r: &tokio_postgres::Row) -> Hit {
+fn row_to_hit(r: &tokio_postgres::Row, dist_kind: DistKind) -> Hit {
     Hit {
         id: r.get(0),
         content: r.get(1),
@@ -1661,5 +1686,28 @@ fn row_to_hit(r: &tokio_postgres::Row) -> Hit {
         project: r.get(3),
         source_path: r.get(4),
         dist: r.get(5),
+        dist_kind,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::DistKind;
+
+    /// `agents/shared/recall_core.py` string-matches this exact JSON contract to decide whether a
+    /// `dist` is a comparable cosine distance — a silent rename here would break that filter without
+    /// any Rust-side signal that something changed.
+    #[test]
+    fn dist_kind_serializes_to_the_strings_recall_core_matches_on() {
+        assert_eq!(
+            serde_json::to_string(&DistKind::VectorCosine).unwrap(),
+            "\"vector_cosine\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DistKind::TextRank).unwrap(),
+            "\"text_rank\""
+        );
     }
 }

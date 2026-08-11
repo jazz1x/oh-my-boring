@@ -394,6 +394,50 @@ class RecallFormattingTests(unittest.TestCase):
         self.assertIn("- [wiki-0007.md] fixed the cache", ctx)  # basename + whitespace collapsed
         self.assertIn("self-augmenting RAG recall", ctx)        # the injection fence is present
 
+    def test_vector_hit_beyond_relevance_floor_is_dropped(self):
+        # dist above RELEVANCE_MAX_DIST → excluded, the other hit still injects. The fixtures sit
+        # far either side of the constant so retuning it does not silently make this test vacuous.
+        out, _err = self._run_main(
+            "a sufficiently long prompt",
+            [
+                {"source_path": "x/near.md", "snippet": "close", "dist": 0.3, "dist_kind": "vector_cosine"},
+                {"source_path": "x/far.md", "snippet": "irrelevant", "dist": 0.9, "dist_kind": "vector_cosine"},
+            ],
+        )
+        payload = json.loads(out)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("- [near.md] close", ctx)
+        self.assertNotIn("far.md", ctx)
+
+    def test_all_hits_beyond_relevance_floor_is_quiet_noop(self):
+        # every hit fails the floor → no injection at all, but still a clean no-op (no error).
+        out, err = self._run_main(
+            "a sufficiently long prompt",
+            [{"source_path": "x/far.md", "snippet": "irrelevant", "dist": 0.9, "dist_kind": "vector_cosine"}],
+        )
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+
+    def test_text_rank_hit_is_never_relevance_filtered(self):
+        # text_rank is ts_rank (higher=better, unbounded) — not comparable to a cosine ceiling.
+        out, _err = self._run_main(
+            "a sufficiently long prompt",
+            [{"source_path": "x/kw.md", "snippet": "keyword hit", "dist": 999.0, "dist_kind": "text_rank"}],
+        )
+        payload = json.loads(out)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("- [kw.md] keyword hit", ctx)
+
+    def test_hit_without_dist_is_never_relevance_filtered(self):
+        # wiki-recall fallback (BORING_VECTOR=off) has no comparable score — always passes through.
+        out, _err = self._run_main(
+            "a sufficiently long prompt",
+            [{"source_path": "x/wiki.md", "snippet": "no score field"}],
+        )
+        payload = json.loads(out)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("- [wiki.md] no score field", ctx)
+
     def test_empty_hits_noop(self):
         out, _err = self._run_main("a sufficiently long prompt", [])
         self.assertEqual(out, "")
