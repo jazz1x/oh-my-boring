@@ -58,8 +58,62 @@ def clamp_text(text, limit):
     return text[:head_cut] + "\n…(truncated)…\n" + text[tail_start:], True
 
 
+# Claude Code tool_use blocks dominate raw bytes (measured: dropped tool content is
+# 10.5x what plain text extraction keeps) but most of that bulk is what the session
+# READ (Read file bodies, tool_result output), not what it DID. Bash/Edit/Write are
+# the mutating actions — the same "did, not read" split #194 drew for codex
+# (exec_command/update_plan in, function_call_output/reasoning out). TodoWrite mirrors
+# codex's update_plan (plan/status narrative); Read and Grep are excluded on purpose —
+# on a 2936-session sample they are pure investigation (Read 18912, Grep 8 tool calls)
+# and Edit/Write already capture the file path once real changes are made. Bodies
+# (old_string/new_string/content) are never taken — file_path only, per the
+# must_not: no tool_result bodies.
+_CLAUDE_TOOL_ALLOWLIST = {
+    "Bash": lambda args: args.get("command", "")
+    + (f"  # {args['description']}" if args.get("description") else ""),
+    "Edit": lambda args: args.get("file_path", ""),
+    "Write": lambda args: args.get("file_path", ""),
+    "TodoWrite": lambda args: "; ".join(
+        f"{t.get('status', '?')}:{t.get('content', '')}"
+        for t in (args.get("todos") or [])
+        if isinstance(t, dict)
+    ),
+}
+
+CLAUDE_TOOL_ARG_CHARS = _env_int("CLAUDE_TOOL_ARG_CHARS", 200)
+
+
+def _claude_tool_call_text(name: str, arguments) -> str:
+    """Return a short, allowlisted signature for a Claude tool_use block, or ''."""
+    extractor = _CLAUDE_TOOL_ALLOWLIST.get(name)
+    if extractor is None or not isinstance(arguments, dict):
+        return ""
+    text = (extractor(arguments) or "").strip()
+    return text[:CLAUDE_TOOL_ARG_CHARS]
+
+
+# Claude-jsonl clamp ceiling. Widening extraction to include tool_use signatures
+# roughly doubles the median extract() size (measured on 40 real sessions, seed 11:
+# median 12420 -> 24243 chars; p90 179763; max 1525152 before clamping) — the
+# pre-widening default (2000, hardcoded in agents/claude-code/distill-session.py,
+# set when this path only saw text blocks) is now too tight to keep a useful slice
+# of the new tool-action lines. Benchmarked against the live qwen3:14b endpoint on
+# the largest post-change extraction in that sample, clamped to 4000/6000/8000/12000
+# chars: 45.5s/45.7s/33.7s/51.4s — no monotonic blowup, same shape codex saw when it
+# set its own ceiling to 12000. Matching that ceiling here keeps ~69s of margin
+# under the 120s call timeout. Override with DISTILL_CLAMP or the shared
+# INGEST_CLAMP — same env knobs already read by agents/claude-code/distill-session.py.
+CLAUDE_CLAMP_DEFAULT = 12000
+
+
+def claude_distill_clamp() -> int:
+    """Resolve the claude-jsonl clamp limit, honouring the existing env knobs."""
+    raw = os.environ.get("DISTILL_CLAMP") or os.environ.get("INGEST_CLAMP")
+    return int(raw) if raw else CLAUDE_CLAMP_DEFAULT
+
+
 def _extract_claude_jsonl(path: str) -> str:
-    """Extract user/assistant text from a Claude Code JSONL transcript."""
+    """Extract user/assistant text and allowlisted tool actions from a Claude Code JSONL transcript."""
     out = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -73,18 +127,26 @@ def _extract_claude_jsonl(path: str) -> str:
                 continue
             c = msg.get("content")
             if isinstance(c, str):
-                t = c
-            elif isinstance(c, list):
-                t = " ".join(
-                    b.get("text", "")
-                    for b in c
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            else:
-                t = ""
-            t = t.strip()
+                t = c.strip()
+                if t:
+                    out.append(f"[{role}] {t}")
+                continue
+            if not isinstance(c, list):
+                continue
+            t = " ".join(
+                b.get("text", "")
+                for b in c
+                if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
             if t:
                 out.append(f"[{role}] {t}")
+            for b in c:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                name = b.get("name") or ""
+                sig = _claude_tool_call_text(name, b.get("input"))
+                if sig:
+                    out.append(f"[tool] {name} {sig}")
     return "\n".join(out)
 
 

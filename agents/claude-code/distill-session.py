@@ -38,9 +38,14 @@ __all__ = [
 # fmt: on
 
 TRANSCRIPT_FORMAT = boring_config.agent_config("claude-code").get("format") or "claude-json"
-# Direct SessionEnd distill calls the local LLM synchronously; keep the default tighter than
-# the Hermes offer path, and let operators raise it explicitly when the local model can handle it.
-CLAMP = int(os.environ.get("DISTILL_CLAMP") or "2000")
+# Direct SessionEnd distill calls the local LLM synchronously. The ceiling lives in transcript.py
+# beside the extractor that produces the text, because the two are one decision: widening what is
+# extracted is worthless if this cuts it back down. That is not hypothetical — this line read
+# `or "2000"` while extraction was producing a median of 12,420 chars, so the model saw 0.16% of a
+# median session and every extraction improvement upstream was silently discarded here.
+# `claude_distill_clamp()` reads the same DISTILL_CLAMP knob this line already honoured, so an
+# operator override behaves exactly as before. Mirrors agents/codex/distill-session.py.
+CLAMP = transcript.claude_distill_clamp()
 
 
 def extract(path):

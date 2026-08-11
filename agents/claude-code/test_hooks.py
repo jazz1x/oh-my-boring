@@ -479,6 +479,28 @@ class DistillMainLoggingTests(unittest.TestCase):
         self.assertIn("[omb-distill] transcript not found", err)
 
 
+class ClampWiringTest(unittest.TestCase):
+    """The distill clamp must come from transcript.py, not a literal in the hook.
+
+    This guards a defect that shipped: the hook read `or "2000"` while the extractor
+    produced a median of 12,420 chars, so the model saw 0.16% of a median session and
+    every upstream extraction improvement was discarded at this line. A literal here is
+    the regression, so the assertion is against the shared constant rather than a number
+    repeated in the test.
+    """
+
+    def test_clamp_comes_from_the_shared_constant(self):
+        import transcript
+
+        self.assertEqual(distill.CLAMP, transcript.CLAUDE_CLAMP_DEFAULT)
+
+    def test_clamp_admits_a_median_extraction(self):
+        # Measured over 40 real sessions (seed 11): extraction median 24,243 chars after
+        # the tool-action allowlist, 12,420 before. A clamp under the pre-allowlist median
+        # would mean the extractor's output never reaches the model intact.
+        self.assertGreaterEqual(distill.CLAMP, 12000)
+
+
 def _read_last_event(path):
     with open(path, encoding="utf-8") as f:
         return json.loads(f.readlines()[-1])
