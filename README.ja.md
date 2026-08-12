@@ -113,7 +113,7 @@ flowchart LR
 
 ### ワークフローグラフ契約
 
-取り込みループには `drudge/src/workflow.rs` に Rust 側のワークフローグラフ契約があり、`drudge/WORKFLOW.md` に文書化されています。セッション検出、蒸留、解像度検証、補強、`remember`、マーカー更新、イベント記録、readiness 投影を、閉じた型の 랭그래프状態グラフとして表します。これは 2 つ目のランタイムオーケストレーターではありません。Python のフック/ワーカーは引き続きホスト I/O を担当し、Rust はノード/エッジ語彙とグラフ形状テストを所有します。
+取り込みループには `drudge/src/workflow.rs` に Rust 側のワークフローグラフ契約があり、`drudge/WORKFLOW.md` に文書化されています。セッション検出、蒸留、解像度検証、補強、`remember`、マーカー更新、イベント記録、readiness 投影を、閉じた型の状態グラフとして表します。これは 2 つ目のランタイムオーケストレーターではありません。Python のフック/ワーカーは引き続きホスト I/O を担当し、Rust はノード/エッジ語彙とグラフ形状テストを所有します。
 
 ---
 
@@ -215,8 +215,12 @@ make readiness
 | `BORING_LLM_API_KEY` | `llm.api_key_env` がここを指す場合の API キー（認証 provider） |
 | `DOCKER_BIN` | GUI/launchd 環境の `PATH` に Docker がない場合に使う任意の Docker CLI パス |
 | `BORING_DISTILL_RESOLUTION` | 取り込み解像度の契約: `compact`, `standard`, `evidence`（デフォルト）, `forensic`; 検証失敗時は 1 回だけ補強し、それでも失敗したら `remember` をブロック |
-| `DISTILL_CLAMP` | 直接 SessionEnd hook がローカル LLM に送る最大文字数。ローカルモデルの timeout を避けるためデフォルトは `2000`。Hermes worker offer は引き続き `INGEST_CLAMP`（`4000`）を使用 |
-| `CODEX_DISTILL_CLAMP` | Codex セッションから抽出して distill LLM に送る最大文字数。デフォルトは `INGEST_CLAMP`、次に `4000`。大きい rollout transcript も Hermes worker の予算内で処理しつつ、前後の根拠を残します |
+| `DISTILL_CLAMP` | Claude Code hook が distill LLM に送る最大文字数。`INGEST_CLAMP`、次に `12000` の順で決まります |
+| `CODEX_DISTILL_CLAMP` | Codex セッション向けの同じ値。`INGEST_CLAMP`、次に `12000` |
+| `KIMI_DISTILL_CLAMP` | Kimi Code セッション向けの同じ値。`INGEST_CLAMP`、次に `12000` |
+| `DISTILL_BACKSTOP_CLAMP` | 呼び出し側が clamp せずに渡した場合だけ効く最終上限（`48000`）。上の 3 つのデフォルトより意図的に高く置き、そのいずれかを上げたときに黙って切り戻されないようにしています。ここに掛かった場合はどのノブを上げるべきかをログに出します |
+| `RECALL_RELEVANCE_MAX_DIST` | 取得した hit を主題外と判定する cosine 距離の上限（`0.514`）。`vector_cosine` のみを比較し、`text_rank` の hit や距離を持たない hit はこの値で判定しません |
+| `RECALL_RELEVANCE_ENFORCE` | `1` で上限が実際に hit を破棄します。**既定はオフ** — 出荷値が正解を捨てるためです（コーパスが実際に扱う内容の言い換えが `0.5278`、扱っていない話題が `0.4642`）。`data/eval` が代替メカニズムを採点できるようになるまではオフのままにします |
 | `BORING_EVENT_LOG` | ローカル NDJSON fallback スプール。デフォルトは `~/.cache/oh-my-boring/events.ndjson` |
 | `BORING_EVENT_SINK` | イベント sink モード: `db`(デフォルト)、`spool`、`both`。`db` はエンジン DB に先に書き、失敗時だけスプールします |
 | `BORING_EVENT_SPOOL` | fallback スプールポリシー: `on_failure`(DB 利用時のデフォルト)、`always`、`off` |
@@ -394,6 +398,11 @@ curl -s -X POST http://localhost:7700/mcp \
 - MCP `recall` は `max_tokens`、`max_results` を受け取ります。
 - HTTP `/search` は `max_tokens`、`max_results` を受け取ります。
 - `recall.py` は `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS` で注入 context を制限します。
+- `recall.py` は各 hit を `RECALL_RELEVANCE_MAX_DIST` で採点し、**捨てるはずだったもの**を stderr に
+  記録します。`RECALL_RELEVANCE_ENFORCE=1` でない限り実際には何も捨てません（理由は変数表を参照）。
+- `/search` の各 hit は、比較可能な値がある場合に `dist` と `dist_kind`（`vector_cosine` または
+  `text_rank`）を返します。wiki-recall フォールバック経路は、比較できない 3 つ目の尺度をスコアとして
+  出す代わりに、両フィールドを省略します。
 - `ask`/`brief` 合成は取得した context を固定文字数上限以下に保ちます。
 
 ### その他のエージェント

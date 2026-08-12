@@ -113,7 +113,7 @@ flowchart LR
 
 ### Workflow graph contract
 
-The ingest loop also has a Rust-side workflow graph contract in `drudge/src/workflow.rs`, documented in `drudge/WORKFLOW.md`. It is a 랭그래프 typed state graph for session discovery, distillation, resolution verification, repair, `remember`, marker update, event logging, and readiness projection. It is not a second runtime orchestrator: Python hooks/workers still perform host I/O, while Rust owns the closed node/edge vocabulary and graph-shape tests.
+The ingest loop also has a Rust-side workflow graph contract in `drudge/src/workflow.rs`, documented in `drudge/WORKFLOW.md`. It is a typed state graph for session discovery, distillation, resolution verification, repair, `remember`, marker update, event logging, and readiness projection. It is not a second runtime orchestrator: Python hooks/workers still perform host I/O, while Rust owns the closed node/edge vocabulary and graph-shape tests.
 
 ---
 
@@ -215,8 +215,12 @@ The model ids must match what LM Studio reports. `make verify-llm` also calls `/
 | `BORING_LLM_API_KEY` | API key when `llm.api_key_env` points here (auth providers) |
 | `DOCKER_BIN` | optional Docker CLI path when GUI/launchd environments do not include Docker in `PATH` |
 | `BORING_DISTILL_RESOLUTION` | distillation detail contract: `compact`, `standard`, `evidence` (default), or `forensic`; verifier failures repair once, then block `remember` |
-| `DISTILL_CLAMP` | max characters sent by the direct SessionEnd hook to the local LLM; defaults to `2000` to avoid local-model timeouts. Hermes worker offers still use `INGEST_CLAMP` (`4000`) |
-| `CODEX_DISTILL_CLAMP` | max extracted Codex session characters sent to the distill LLM; defaults to `INGEST_CLAMP`, then `4000`. This keeps large rollout transcripts inside the Hermes worker budget while preserving head/tail evidence |
+| `DISTILL_CLAMP` | max characters the Claude Code hook sends to the distill LLM; falls back to `INGEST_CLAMP`, then `12000` |
+| `CODEX_DISTILL_CLAMP` | same, for Codex sessions; falls back to `INGEST_CLAMP`, then `12000` |
+| `KIMI_DISTILL_CLAMP` | same, for Kimi Code sessions; falls back to `INGEST_CLAMP`, then `12000` |
+| `DISTILL_BACKSTOP_CLAMP` | last-resort ceiling (`48000`) applied only when a caller passes unclamped text. It sits well above the three defaults on purpose, so raising one of them is not silently undone; hitting it logs which knob to raise instead |
+| `RECALL_RELEVANCE_MAX_DIST` | cosine-distance ceiling above which a recalled hit is considered off-topic (`0.514`). Only compares `vector_cosine` distances; a `text_rank` hit or one with no distance is never judged by it |
+| `RECALL_RELEVANCE_ENFORCE` | `1` makes the ceiling actually drop hits. **Off by default** — the ceiling is measured and logged but discards nothing, because the shipped value drops correct answers (a paraphrase of covered work scores `0.5278` while an uncovered topic scores `0.4642`). Leave it off until `data/eval` can score a replacement |
 | `BORING_EVENT_LOG` | local NDJSON fallback spool; defaults to `~/.cache/oh-my-boring/events.ndjson` |
 | `BORING_EVENT_SINK` | event sink mode: `db` (default), `spool`, or `both`. `db` writes the engine DB first and spools only on failure |
 | `BORING_EVENT_SPOOL` | fallback spool policy: `on_failure` (default when DB is enabled), `always`, or `off` |
@@ -432,7 +436,7 @@ Memory can be reached through HTTP endpoints or the MCP server (`http://localhos
 | `POST /decisions` / `decisions` | Decision claims for a project | required |
 | `POST /risks` / `risks` | Risk/assumption/blocked claims for a project | required |
 | `POST /ask` / `ask` | Direct question answered from memory | not required |
-| `POST /search` / `recall` | Raw memory excerpts | not required; semantic search uses vector when enabled |
+| `POST /search` / `recall` | Raw memory excerpts. Each hit carries `dist` and `dist_kind` (`vector_cosine` or `text_rank`) when the serving path has a comparable number; both are absent on the wiki-recall fallback rather than reporting a score from a third, incomparable scale | not required; semantic search uses vector when enabled |
 | `/remember` / `remember` | Store a curated note | — |
 
 ### Token budget
@@ -443,6 +447,9 @@ Automatic retrieval can explode an agent's context window, so the retrieval surf
 - MCP `ask` and HTTP `/ask` accept `project` and `since_hours` to narrow retrieval.
 - `/context` caps each section at `max_items` (default 5) and needs no vector search.
 - `recall.py` caps its prompt-injection context via `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS`.
+- `recall.py` also scores each hit against `RECALL_RELEVANCE_MAX_DIST` and reports what it *would*
+  drop on stderr. It discards nothing unless `RECALL_RELEVANCE_ENFORCE=1`; see the variable table
+  for why that is off.
 - `ask`/`brief` synthesis keeps retrieved context under a fixed character ceiling.
 
 ### Other agents
