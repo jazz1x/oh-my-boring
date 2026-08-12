@@ -21,6 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "shared"))
 import boring_config
+import transcript
 from distill_core import (  # noqa: F401
     _mark,
     _distill_resolution,
@@ -32,6 +33,7 @@ from distill_core import (  # noqa: F401
 )
 
 KIMI_HOME = os.environ.get("KIMI_CODE_HOME") or os.path.expanduser("~/.kimi-code")
+CLAMP = transcript.kimi_distill_clamp()
 
 
 def _work_dir_key(cwd: str) -> str:
@@ -173,6 +175,12 @@ def main() -> int:
         return 2
 
     text = extract_session(session_dir)
+    # This path used to hand unbounded text to distill_and_remember and rely on a hardcoded
+    # truncation inside it. Clamping here, with this path's own accessor, puts the decision
+    # where the other two agents already make it — and makes KIMI_DISTILL_CLAMP mean something.
+    text, was_clamped = transcript.clamp_text(text, CLAMP)
+    if was_clamped:
+        print(f"[omb-distill] transcript clamped to {len(text)} chars", file=sys.stderr)
     remote_url = git_remote_url(cwd)
     origin, _rule = boring_config.classify(cwd, remote_url or None)
     repo = repo_slug(cwd)

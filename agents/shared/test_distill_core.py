@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import distill_core
+import transcript
 
 
 SHALLOW_NOTE = {
@@ -412,6 +413,56 @@ def _restore_env(name, value):
         os.environ.pop(name, None)
     else:
         os.environ[name] = value
+
+
+class BackstopClampTests(unittest.TestCase):
+    """The backstop is the last-resort bound for a caller that forgot to clamp.
+
+    It used to truncate silently with its own head/tail split, so raising a caller's clamp
+    above it looked like it worked while the extra text was cut back here under a different
+    rule. Both properties are pinned: it must announce itself, and it must use the shared
+    truncation algorithm rather than a second one that disagrees.
+    """
+
+    def _run(self, text):
+        stderr = io.StringIO()
+        seen = {}
+
+        def fake_llm(prompt):
+            seen["prompt"] = prompt
+            return None  # stop right after the clamp; nothing downstream is under test
+
+        with mock.patch.object(distill_core, "_call_llm", fake_llm), \
+             mock.patch.object(distill_core.sys, "stderr", stderr):
+            distill_core.distill_and_remember(text, "personal", "repo")
+        return seen.get("prompt", ""), stderr.getvalue()
+
+    def test_backstop_sits_above_every_caller_default(self):
+        # The previous backstop equalled the caller defaults, so raising a caller's clamp was
+        # silently undone here. A guard at the same value as the knob it guards is a hidden knob.
+        for accessor in (transcript.claude_distill_clamp, transcript.codex_distill_clamp,
+                         transcript.kimi_distill_clamp):
+            self.assertGreater(distill_core.BACKSTOP_CLAMP, accessor())
+
+    def test_over_backstop_is_cut_and_announced(self):
+        text = "\n".join(f"line {i} " + "x" * 60 for i in range(4000))
+        self.assertGreater(len(text), distill_core.BACKSTOP_CLAMP)
+        _prompt, err = self._run(text)
+        self.assertIn("backstop", err)
+        self.assertIn("unclamped", err)
+
+    def test_under_backstop_is_untouched_and_silent(self):
+        text = "short enough\n" * 10
+        _prompt, err = self._run(text)
+        self.assertNotIn("backstop", err)
+
+    def test_backstop_uses_the_shared_truncator(self):
+        # clamp_text snaps to newline boundaries; the old inline split did not. If the backstop
+        # ever goes back to slicing by index this lands mid-line and the assertion fails.
+        text = "\n".join("y" * 200 for _ in range(1200))
+        prompt, _err = self._run(text)
+        body = prompt[prompt.find("y" * 200):]
+        self.assertNotIn("y" * 201, body)
 
 
 def _read_last_event():

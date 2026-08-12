@@ -112,6 +112,34 @@ def claude_distill_clamp() -> int:
     return int(raw) if raw else CLAUDE_CLAMP_DEFAULT
 
 
+# The kimi path had no clamp accessor and no clamp call at all: `agents/kimi/distill-session.py`
+# handed extract_session() straight to distill_and_remember(), whose own hardcoded truncation was
+# the only bound in the chain. That made the inner bound load-bearing for one path and dead for
+# the other two, which is why it could not simply be deleted. Same ceiling as the other two so
+# the three paths share one number rather than three.
+KIMI_CLAMP_DEFAULT = 12000
+
+
+def kimi_distill_clamp() -> int:
+    """Resolve the kimi-wire clamp limit, honouring the same env knobs as the other paths."""
+    raw = os.environ.get("KIMI_DISTILL_CLAMP") or os.environ.get("INGEST_CLAMP")
+    return int(raw) if raw else KIMI_CLAMP_DEFAULT
+
+
+# Guard against *unbounded* input reaching the model when a caller forgot to clamp — deliberately
+# well above the three per-path defaults so a raised clamp passes through untouched. A guard set at
+# the same value as the knob it guards is a second, hidden knob: the previous one sat at 12000 and
+# silently cut a clamp raised to 20000 straight back down. Genuinely unclamped input is an order of
+# magnitude larger again (measured p90 raw extraction 179,763 chars, max 1,525,152), so the net
+# still catches what it is for. Lives here because this module is where every clamp number lives.
+BACKSTOP_CLAMP_DEFAULT = 48000
+
+
+def distill_backstop_clamp() -> int:
+    """Resolve the last-resort backstop used when a caller passes unclamped text."""
+    return _env_int("DISTILL_BACKSTOP_CLAMP", BACKSTOP_CLAMP_DEFAULT)
+
+
 def _extract_claude_jsonl(path: str) -> str:
     """Extract user/assistant text and allowlisted tool actions from a Claude Code JSONL transcript."""
     out = []
