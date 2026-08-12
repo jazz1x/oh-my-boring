@@ -57,6 +57,27 @@ RELEVANCE_ENFORCE = (os.environ.get("RECALL_RELEVANCE_ENFORCE") or "").strip().l
 )
 
 
+def exceeds_relevance_ceiling(hit: dict) -> bool:
+    """True if `hit` is a cosine distance beyond RELEVANCE_MAX_DIST.
+
+    Only `vector_cosine` is a distance comparable to the ceiling — `text_rank` is a ts_rank
+    (higher is better, unbounded) and a hit with no `dist` carries no signal, so neither is
+    ever judged by it. This is deliberately the single definition: `data/eval/run_eval.py`
+    scores the filter with it, so a copy there would let the instrument and the shipped
+    behaviour drift apart while the gate kept reporting green.
+
+    Note this answers "is it over the ceiling", not "will it be discarded" — discarding is
+    gated separately on RELEVANCE_ENFORCE, which is off. The eval gate wants the former: it
+    measures what enforcement *would* cost.
+    """
+    dist = hit.get("dist")
+    return (
+        hit.get("dist_kind") == "vector_cosine"
+        and dist is not None
+        and dist > RELEVANCE_MAX_DIST
+    )
+
+
 def _throttle_path() -> str:
     cache = os.path.join(os.path.expanduser("~"), ".cache", "oh-my-boring")
     os.makedirs(cache, exist_ok=True)
@@ -135,11 +156,7 @@ def run_recall(
         dist = h.get("dist")
         # Only "vector_cosine" is a distance (lower = closer) — "text_rank" and "missing" are not
         # comparable to RELEVANCE_MAX_DIST, so they are never judged by it (see the constant above).
-        over = (
-            h.get("dist_kind") == "vector_cosine"
-            and dist is not None
-            and dist > RELEVANCE_MAX_DIST
-        )
+        over = exceeds_relevance_ceiling(h)
         src = (h.get("source_path") or "").rsplit("/", 1)[-1]
         if over:
             shadow_drops.append((src, dist))
