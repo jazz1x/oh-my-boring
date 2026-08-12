@@ -113,7 +113,7 @@ flowchart LR
 
 ### 작업 흐름 그래프 계약
 
-적재 루프에는 `drudge/src/workflow.rs`에 Rust 쪽 작업 흐름 그래프 계약이 있고, `drudge/WORKFLOW.md`에 문서화되어 있습니다. 세션 발견, 증류, 해상도 검증, 보강, `remember`, 마커 갱신, 이벤트 기록, readiness 투영을 닫힌 타입의 랭그래프 상태 그래프로 표현합니다. 두 번째 런타임 오케스트레이터는 아닙니다. Python 훅/워커는 계속 호스트 I/O를 맡고, Rust는 노드/엣지 어휘와 그래프 형태 테스트를 소유합니다.
+적재 루프에는 `drudge/src/workflow.rs`에 Rust 쪽 작업 흐름 그래프 계약이 있고, `drudge/WORKFLOW.md`에 문서화되어 있습니다. 세션 발견, 증류, 해상도 검증, 보강, `remember`, 마커 갱신, 이벤트 기록, readiness 투영을 닫힌 타입의 상태 그래프로 표현합니다. 두 번째 런타임 오케스트레이터는 아닙니다. Python 훅/워커는 계속 호스트 I/O를 맡고, Rust는 노드/엣지 어휘와 그래프 형태 테스트를 소유합니다.
 
 ---
 
@@ -215,8 +215,12 @@ make readiness
 | `BORING_LLM_API_KEY` | `llm.api_key_env`가 여기를 가리킬 때의 API 키(인증 provider) |
 | `DOCKER_BIN` | GUI/launchd 환경의 `PATH`에 Docker가 없을 때 사용할 선택적 Docker CLI 경로 |
 | `BORING_DISTILL_RESOLUTION` | 적재 해상도 계약: `compact`, `standard`, `evidence`(기본), `forensic`; 검증 실패 시 한 번 보강하고 그래도 실패하면 `remember` 차단 |
-| `DISTILL_CLAMP` | 직접 SessionEnd hook이 로컬 LLM에 보내는 최대 문자 수; 로컬 모델 timeout을 피하기 위해 기본값은 `2000`. Hermes worker offer는 계속 `INGEST_CLAMP`(`4000`)를 사용 |
-| `CODEX_DISTILL_CLAMP` | Codex 세션에서 추출해 distill LLM에 보내는 최대 문자 수; 기본값은 `INGEST_CLAMP`, 그다음 `4000`. 큰 rollout transcript도 Hermes worker 예산 안에서 처리하되 앞/뒤 근거는 보존합니다 |
+| `DISTILL_CLAMP` | Claude Code hook이 distill LLM에 보내는 최대 문자 수; `INGEST_CLAMP`, 그다음 `12000` 순으로 결정됩니다 |
+| `CODEX_DISTILL_CLAMP` | Codex 세션에 대한 동일한 값; `INGEST_CLAMP`, 그다음 `12000` |
+| `KIMI_DISTILL_CLAMP` | Kimi Code 세션에 대한 동일한 값; `INGEST_CLAMP`, 그다음 `12000` |
+| `DISTILL_BACKSTOP_CLAMP` | 호출자가 clamp 하지 않고 넘긴 경우에만 걸리는 최후 상한(`48000`). 위 세 기본값보다 의도적으로 높게 두어, 그중 하나를 올렸을 때 조용히 되잘리지 않게 합니다. 여기 걸리면 어느 노브를 올려야 하는지 로그로 알려줍니다 |
+| `RECALL_RELEVANCE_MAX_DIST` | 회수된 hit을 주제 밖으로 판정하는 cosine 거리 상한(`0.514`). `vector_cosine`만 비교하며, `text_rank` hit이나 거리가 없는 hit은 이 값으로 판정하지 않습니다 |
+| `RECALL_RELEVANCE_ENFORCE` | `1`이면 상한이 실제로 hit을 버립니다. **기본은 꺼짐** — 배포된 값이 정답을 버리기 때문입니다(코퍼스가 실제로 다루는 내용의 패러프레이즈가 `0.5278`, 다루지 않는 주제가 `0.4642`). `data/eval`이 대체 메커니즘을 채점할 수 있을 때까지 꺼둡니다 |
 | `BORING_EVENT_LOG` | 로컬 NDJSON fallback 스풀; 기본값 `~/.cache/oh-my-boring/events.ndjson` |
 | `BORING_EVENT_SINK` | 이벤트 sink 모드: `db`(기본), `spool`, `both`. `db`는 엔진 DB에 먼저 쓰고 실패 시에만 스풀 |
 | `BORING_EVENT_SPOOL` | fallback 스풀 정책: `on_failure`(DB 사용 시 기본), `always`, `off` |
@@ -424,6 +428,11 @@ curl -s -X POST http://localhost:7700/mcp \
 - MCP `recall`은 `max_tokens`, `max_results`를 받습니다.
 - HTTP `/search`는 `max_tokens`, `max_results`를 받습니다.
 - `recall.py`는 `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS`로 주입 context를 제한합니다.
+- `recall.py`는 각 hit을 `RECALL_RELEVANCE_MAX_DIST`로 채점해 **버릴 뻔한 것**을 stderr에 남깁니다.
+  `RECALL_RELEVANCE_ENFORCE=1`이 아니면 실제로는 아무것도 버리지 않습니다(이유는 변수 표 참조).
+- `/search` 응답의 각 hit은 비교 가능한 값이 있을 때 `dist`와 `dist_kind`(`vector_cosine` 또는
+  `text_rank`)를 함께 반환합니다. wiki-recall fallback 경로는 세 번째 비교 불가 척도를 점수처럼
+  내놓는 대신 두 필드를 생략합니다.
 - `ask`/`brief` 합성은 검색된 context를 고정 문자 한도 아래로 유지합니다.
 
 ### 다른 에이전트
