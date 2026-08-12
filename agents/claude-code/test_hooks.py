@@ -38,7 +38,8 @@ sys.path.insert(0, str(SHARED_DIR))
 # Neutralize ambient policy/endpoint env so module-load + assertions are deterministic.
 for _var in ("BORING_CONFIG", "BORING_HOME", "BORING_URL", "BORING_EVENT_SINK",
              "BORING_EVENT_SPOOL", "BORING_EVENT_DB_MIRROR", "RECALL_MAX_RESULTS",
-             "RECALL_MAX_TOKENS", "RECALL_TIMEOUT", "RECALL_RETRIES"):
+             "RECALL_MAX_TOKENS", "RECALL_TIMEOUT", "RECALL_RETRIES",
+             "RECALL_RELEVANCE_MAX_DIST", "RECALL_RELEVANCE_ENFORCE"):
     os.environ.pop(_var, None)
 
 
@@ -363,17 +364,21 @@ class DistillExitCodeTests(unittest.TestCase):
 class RecallFormattingTests(unittest.TestCase):
     """recall.main reads stdin + posts to /search; we mock urlopen so NO network happens."""
 
-    def _run_main(self, prompt, hits, search_side_effect=None):
+    def _run_main(self, prompt, hits, search_side_effect=None, enforce=False):
         captured = io.StringIO()
         stderr = io.StringIO()
         if search_side_effect is None:
             search_mock = mock.MagicMock(return_value=hits)
         else:
             search_mock = mock.MagicMock(side_effect=search_side_effect)
+        # recall_core writes its own diagnostics through its own `sys`, so both modules' stderr
+        # must be captured or the shadow-drop report escapes the assertion.
         with mock.patch.object(recall.sys, "stdin", io.StringIO(json.dumps({"prompt": prompt}))), \
              mock.patch.object(recall_core.DrudgeClient, "search", search_mock), \
+             mock.patch.object(recall_core, "RELEVANCE_ENFORCE", enforce), \
              mock.patch.object(recall.sys, "stdout", captured), \
-             mock.patch.object(recall.sys, "stderr", stderr):
+             mock.patch.object(recall.sys, "stderr", stderr), \
+             mock.patch.object(recall_core.sys, "stderr", stderr):
             recall.main()
         return captured.getvalue(), stderr.getvalue()
 
@@ -394,29 +399,39 @@ class RecallFormattingTests(unittest.TestCase):
         self.assertIn("- [wiki-0007.md] fixed the cache", ctx)  # basename + whitespace collapsed
         self.assertIn("self-augmenting RAG recall", ctx)        # the injection fence is present
 
-    def test_vector_hit_beyond_relevance_floor_is_dropped(self):
-        # dist above RELEVANCE_MAX_DIST → excluded, the other hit still injects. The fixtures sit
-        # far either side of the constant so retuning it does not silently make this test vacuous.
-        out, _err = self._run_main(
-            "a sufficiently long prompt",
-            [
-                {"source_path": "x/near.md", "snippet": "close", "dist": 0.3, "dist_kind": "vector_cosine"},
-                {"source_path": "x/far.md", "snippet": "irrelevant", "dist": 0.9, "dist_kind": "vector_cosine"},
-            ],
-        )
-        payload = json.loads(out)
-        ctx = payload["hookSpecificOutput"]["additionalContext"]
+    _NEAR = {"source_path": "x/near.md", "snippet": "close", "dist": 0.3, "dist_kind": "vector_cosine"}
+    _FAR = {"source_path": "x/far.md", "snippet": "irrelevant", "dist": 0.9, "dist_kind": "vector_cosine"}
+    # The fixtures sit far either side of the constant so retuning it cannot make these vacuous.
+
+    def test_vector_hit_beyond_relevance_floor_is_dropped_when_enforcing(self):
+        out, err = self._run_main("a sufficiently long prompt", [self._NEAR, self._FAR], enforce=True)
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("- [near.md] close", ctx)
         self.assertNotIn("far.md", ctx)
+        self.assertIn("dropped 1/2", err)  # enforcing drops are still reported, never silent
 
-    def test_all_hits_beyond_relevance_floor_is_quiet_noop(self):
-        # every hit fails the floor → no injection at all, but still a clean no-op (no error).
-        out, err = self._run_main(
-            "a sufficiently long prompt",
-            [{"source_path": "x/far.md", "snippet": "irrelevant", "dist": 0.9, "dist_kind": "vector_cosine"}],
-        )
+    def test_enforcement_is_off_by_default(self):
+        # The guard against re-enabling an uncalibrated threshold by accident. Every other test in
+        # this class patches RELEVANCE_ENFORCE, so without this one the shipped default is never
+        # exercised and flipping it back would pass CI silently. The env knob is cleared at module
+        # load (see the neutralize list above), so this reads the shipped constant, not the host's.
+        self.assertIs(recall_core.RELEVANCE_ENFORCE, False)
+
+    def test_shadow_mode_keeps_the_hit_and_reports_what_it_would_have_dropped(self):
+        # Shadow: the ceiling is measured and reported but nothing is discarded.
+        out, err = self._run_main("a sufficiently long prompt", [self._NEAR, self._FAR])
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("- [near.md] close", ctx)
+        self.assertIn("- [far.md] irrelevant", ctx)
+        self.assertIn("would drop 1/2", err)
+        self.assertIn("far.md@0.9000", err)  # the dist is reported, so drops can be calibrated
+
+    def test_all_hits_beyond_relevance_floor_is_quiet_noop_when_enforcing(self):
+        # every hit fails the floor → no injection, but still a clean no-op: stdout stays empty so
+        # the prompt is never blocked, while stderr explains why nothing was injected.
+        out, err = self._run_main("a sufficiently long prompt", [self._FAR], enforce=True)
         self.assertEqual(out, "")
-        self.assertEqual(err, "")
+        self.assertIn("dropped 1/1", err)
 
     def test_text_rank_hit_is_never_relevance_filtered(self):
         # text_rank is ts_rank (higher=better, unbounded) — not comparable to a cosine ceiling.
