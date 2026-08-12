@@ -27,6 +27,7 @@ import boring_config  # noqa: E402
 import event_log  # noqa: E402
 import markers  # noqa: E402
 import omb_env  # noqa: E402
+import transcript  # noqa: E402
 import workflow_contract  # noqa: E402
 from resolution_quality import (  # noqa: E402
     ALLOWED_CLAIM_KINDS,
@@ -786,10 +787,21 @@ def _log_skip_event(session_id, origin, repo, resolution):
     log_skip_event(session_id, origin, repo, resolution, "llm_skip")
 
 
+#: Last-resort guard against *unbounded* input, not a quality knob — every agent path clamps with
+#: its own `transcript.*_distill_clamp()` first, so reaching this is a caller bug. The number and
+#: its rationale live in transcript.py with every other clamp; see `distill_backstop_clamp`.
+BACKSTOP_CLAMP = transcript.distill_backstop_clamp()
+
+
 def distill_and_remember(text, origin, repo, session_id=""):
     """Distill the transcript text via local LLM and write it through ohmyboring's remember tool."""
-    if len(text) > 12000:
-        text = text[:5000] + "\n…(truncated)…\n" + text[-7000:]
+    if len(text) > BACKSTOP_CLAMP:
+        text, _ = transcript.clamp_text(text, BACKSTOP_CLAMP)
+        print(
+            f"[distill-session] caller passed unclamped text; cut to {len(text)} chars by the "
+            f"{BACKSTOP_CLAMP}-char backstop. Raise the caller's own clamp, not this one.",
+            file=sys.stderr,
+        )
 
     resolution = _distill_resolution()
     prompt = _build_prompt(text, origin, repo, resolution=resolution)

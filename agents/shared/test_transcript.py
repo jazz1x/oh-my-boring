@@ -359,6 +359,19 @@ def test_clamp_text_snaps_to_newline_not_mid_line():
         assert line == "" or line in lines
 
 
+def test_kimi_distill_clamp_default_and_env_override():
+    """The kimi path had no accessor at all; its absence is what made the inner backstop
+    load-bearing for one path and dead for the others."""
+    for var in ("KIMI_DISTILL_CLAMP", "INGEST_CLAMP"):
+        os.environ.pop(var, None)
+    assert transcript.kimi_distill_clamp() == transcript.KIMI_CLAMP_DEFAULT
+    os.environ["KIMI_DISTILL_CLAMP"] = "7777"
+    try:
+        assert transcript.kimi_distill_clamp() == 7777
+    finally:
+        os.environ.pop("KIMI_DISTILL_CLAMP", None)
+
+
 def test_codex_distill_clamp_default_and_env_override():
     saved = {k: os.environ.pop(k, None) for k in ("CODEX_DISTILL_CLAMP", "INGEST_CLAMP")}
     try:
@@ -388,4 +401,5 @@ if __name__ == "__main__":
     test_clamp_text_keeps_short_input()
     test_clamp_text_snaps_to_newline_not_mid_line()
     test_codex_distill_clamp_default_and_env_override()
+    test_kimi_distill_clamp_default_and_env_override()
     print("ok - transcript parser")
