@@ -60,6 +60,8 @@ def main():
     golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
     for q in golden.get("queries", []):
         texts.append(q["query"])
+    for n in golden.get("negatives", []):
+        texts.append(n["query"])
 
     recorded = {}
     dim = None

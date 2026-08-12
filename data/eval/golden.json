@@ -6,7 +6,15 @@
       "expect": ["eval-pg-pool"]
     },
     {
+      "query": "relational backend rejects new sessions during traffic spikes because worker count exceeds the configured session limit",
+      "expect": ["eval-pg-pool"]
+    },
+    {
       "query": "users randomly logged out, token used before issued auth errors",
+      "expect": ["eval-jwt-clock-skew"]
+    },
+    {
+      "query": "authentication failures from time-based token checks when server clocks are slightly out of sync",
       "expect": ["eval-jwt-clock-skew"]
     },
     {
@@ -14,11 +22,23 @@
       "expect": ["eval-docker-layer-cache"]
     },
     {
+      "query": "container image rebuild is slow because manifest copying happens after source files invalidate the install step",
+      "expect": ["eval-docker-layer-cache"]
+    },
+    {
       "query": "list lags and re-renders every row while typing in the search box",
       "expect": ["eval-react-rerender"]
     },
     {
+      "query": "filterable grid becomes sluggish because each keystroke redraws every cell instead of only changed ones",
+      "expect": ["eval-react-rerender"]
+    },
+    {
       "query": "pod restarts with OOMKilled because memory limit too low",
+      "expect": ["eval-k8s-oomkill"]
+    },
+    {
+      "query": "container process killed by the kernel for exceeding its cgroup memory ceiling",
       "expect": ["eval-k8s-oomkill"]
     },
     {
@@ -60,6 +80,32 @@
     {
       "query": "when a popular cached entry expires every request recomputes against the db at once",
       "expect": ["eval-cache-stampede"]
+    },
+    {
+      "query": "hot cached value missing causes many parallel threads to repeat the same expensive backend computation",
+      "expect": ["eval-cache-stampede"]
+    }
+  ],
+  "negatives": [
+    {
+      "query": "kubernetes service mesh sidecar proxy memory overhead",
+      "why": "no service mesh or sidecar fixture"
+    },
+    {
+      "query": "elasticsearch cluster split brain after network partition",
+      "why": "no elasticsearch or distributed search fixture"
+    },
+    {
+      "query": "python global interpreter lock blocking multithreaded cpu workload",
+      "why": "no python or GIL fixture"
+    },
+    {
+      "query": "terraform state locking with dynamodb backend",
+      "why": "no terraform or infrastructure-as-code fixture"
+    },
+    {
+      "query": "grafana alertmanager notification routing silence",
+      "why": "no monitoring or alertmanager fixture"
     }
   ]
 }
