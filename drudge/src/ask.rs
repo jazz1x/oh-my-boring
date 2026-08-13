@@ -389,6 +389,20 @@ fn is_placeholder_bullet(label: &str, text: &str) -> bool {
     )
 }
 
+/// Total claim rows in the daily brief's claim context. Unchanged from the previous
+/// single-query budget: claims compete with 12 documents for a local model's attention
+/// and latency, and nothing measured justifies raising it.
+const BRIEF_CLAIM_BUDGET: i64 = 12;
+
+/// Reserved per-kind caps for the decision-relevant sections the brief prompt renders.
+/// Basis (ledger measured 2026-08-13, current claims): fact 4936, decision 1250, next 461,
+/// risk 150, blocked 62. Under one recency-ordered list the top 12 were fact 7 / decision 5 /
+/// next 0 / risk 0 / blocked 0, so Next / Blocked / Risks never had material. Caps reserve
+/// roughly half the budget for those kinds, weighted toward the scarcest and highest-stakes
+/// (blocked 62 → 2, next 461 → 3, risk 150 → 2, decision 1250 → 2); `fact` fills the rest.
+const BRIEF_CLAIM_RESERVE: &[(&str, i64)] =
+    &[("blocked", 2), ("next", 3), ("risk", 2), ("decision", 2)];
+
 /// Recency-first/supersede briefing: retrieve by `updated_at` descending rather than semantic similarity →
 /// synthesize so the latest beats the old. Called by the cron morning briefing (`/brief`). SRP: separate from `answer()`.
 pub async fn brief(
@@ -433,10 +447,63 @@ pub async fn brief(
         );
     }
 
-    // Authority injection: current claims (recency order) — even if old exploration notes (e.g. discarded Neo4j/SurrealDB)
+    // Authority injection: current claims — even if old exploration notes (e.g. discarded Neo4j/SurrealDB)
     // look recent by mtime, claim authority nails down the true current fact.
+    let claim_ctx = brief_claim_ctx(store).await?;
+    let (fo, fc) = data_fence("brief");
+    let rule = fence_rule(&fo, &fc);
+    let prompt = if claim_ctx.is_empty() {
+        format!("{rule}# Recent work records (newest-first, top is latest)\n{fo}\n{context}{fc}")
+    } else {
+        format!(
+            "{rule}# Recency-prioritized facts (prefer the most recent on conflict)\n{fo}\n{claim_ctx}{fc}\n# Recent work records (newest-first, top is latest)\n{fo}\n{context}{fc}"
+        )
+    };
+    // note_lang policy wins over "match the records": ko → always Korean, en → English, auto → records' language.
+    let lang_rule = match lang {
+        "ko" => {
+            " ALWAYS write the briefing in Korean (한국어), regardless of the records' language."
+        }
+        "en" => " ALWAYS write the briefing in English.",
+        _ => "",
+    };
+    let system = format!("{BRIEF_SYSTEM}{lang_rule}");
+    let answer_text = llm.generate(&system, &prompt).await?;
+
+    let sources: Vec<String> = docs.iter().map(|d| d.source_path.clone()).collect();
+    Ok(AnswerOut {
+        answer: coalesce_brief_answer(&answer_text),
+        sources,
+    })
+}
+
+/// Build the daily brief's claim context: reserved per-kind quotas for the decision-relevant
+/// sections the prompt renders, then `fact` fills the rest, plus the stalled block.
+///
+/// Section quota, not a single recency list: the prompt renders Next / Blocked / Risks /
+/// Decisions, but the ledger is fact-heavy (measured 2026-08-13: fact 4936, decision 1250,
+/// next 461, risk 150, blocked 62), so one kind-agnostic ORDER BY valid_from spends all 12
+/// rows on fact+decision and the rendered sections have no material. Reserve capped slots for
+/// the four decision-relevant kinds — scarcest/highest-stakes first — and let abundant `fact`
+/// fill whatever the reserves didn't use (an empty kind silently yields its slots; no
+/// placeholder section is ever emitted). Total stays 12: claims already compete with 12
+/// documents for a local model's attention, and nothing measured justifies raising it.
+async fn brief_claim_ctx(store: &Store) -> Result<String> {
+    let mut claims = Vec::new();
+    for (kind, cap) in BRIEF_CLAIM_RESERVE {
+        let kinds = [(*kind).to_owned()];
+        claims.extend(store.recent_claims(*cap, None, Some(&kinds), &[]).await?);
+    }
+    let fill = BRIEF_CLAIM_BUDGET - i64::try_from(claims.len()).unwrap_or(BRIEF_CLAIM_BUDGET);
+    if fill > 0 {
+        claims.extend(
+            store
+                .recent_claims(fill, None, Some(&["fact".to_owned()]), &[])
+                .await?,
+        );
+    }
     let mut claim_ctx = String::new();
-    for cl in store.recent_claims(12, None, None, &[]).await? {
+    for cl in &claims {
         let _ = writeln!(
             claim_ctx,
             "- [{}|{}] {} {} {}",
@@ -470,31 +537,7 @@ pub async fn brief(
             );
         }
     }
-    let (fo, fc) = data_fence("brief");
-    let rule = fence_rule(&fo, &fc);
-    let prompt = if claim_ctx.is_empty() {
-        format!("{rule}# Recent work records (newest-first, top is latest)\n{fo}\n{context}{fc}")
-    } else {
-        format!(
-            "{rule}# Recency-prioritized facts (prefer the most recent on conflict)\n{fo}\n{claim_ctx}{fc}\n# Recent work records (newest-first, top is latest)\n{fo}\n{context}{fc}"
-        )
-    };
-    // note_lang policy wins over "match the records": ko → always Korean, en → English, auto → records' language.
-    let lang_rule = match lang {
-        "ko" => {
-            " ALWAYS write the briefing in Korean (한국어), regardless of the records' language."
-        }
-        "en" => " ALWAYS write the briefing in English.",
-        _ => "",
-    };
-    let system = format!("{BRIEF_SYSTEM}{lang_rule}");
-    let answer_text = llm.generate(&system, &prompt).await?;
-
-    let sources: Vec<String> = docs.iter().map(|d| d.source_path.clone()).collect();
-    Ok(AnswerOut {
-        answer: coalesce_brief_answer(&answer_text),
-        sources,
-    })
+    Ok(claim_ctx)
 }
 
 const STATUS_SYSTEM: &str = "You are the user's personal assistant. Produce a concise project status summary in the same language as the records below.\n\
@@ -1018,6 +1061,27 @@ mod tests {
         assert_ne!(a_close, b_close);
         assert!(a_open.starts_with("«UNTRUSTED-DATA "));
         assert!(b_open.starts_with("«UNTRUSTED-DATA "));
+    }
+
+    #[test]
+    fn brief_claim_reserves_cover_rendered_sections_within_budget() {
+        use super::{BRIEF_CLAIM_BUDGET, BRIEF_CLAIM_RESERVE};
+        // The prompt renders Next / Blocked / Risks / Decisions — each must have a reserved
+        // quota, or a fact-heavy ledger starves that section under pure recency again.
+        for kind in ["next", "blocked", "risk", "decision"] {
+            assert!(
+                BRIEF_CLAIM_RESERVE.iter().any(|(k, _)| *k == kind),
+                "no reserved quota for rendered section kind {kind:?}"
+            );
+        }
+        // Reserves must leave room for the `fact` recency fill; caps at or above the whole
+        // budget would silently crowd facts (and the fill logic) out.
+        let reserved: i64 = BRIEF_CLAIM_RESERVE.iter().map(|(_, cap)| cap).sum();
+        assert!(
+            reserved < BRIEF_CLAIM_BUDGET,
+            "reserves {reserved} leave no room for fact fill within budget {BRIEF_CLAIM_BUDGET}"
+        );
+        assert!(BRIEF_CLAIM_RESERVE.iter().all(|(_, cap)| *cap > 0));
     }
 
     #[test]
