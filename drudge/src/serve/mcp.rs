@@ -1071,6 +1071,7 @@ async fn mcp_remember(s: &AppState, args: Option<&Value>) -> Result<String, (i32
         .map_err(|e| (-32603_i32, format!("dedup check: {e:#}")))?
     {
         if should_replace_duplicate(&note, &existing) {
+            let telemetry = dedup_decision_event(&note, Some(&existing), DedupOutcome::Replace);
             let Some(wiki_id) = crate::vault::wiki_stem(&existing.source_path) else {
                 return Err((
                     -32603,
@@ -1088,10 +1089,19 @@ async fn mcp_remember(s: &AppState, args: Option<&Value>) -> Result<String, (i32
                 .map_err(|e| (-32603_i32, format!("render wiki note: {e:#}")))?;
             std::fs::write(&path, content)
                 .map_err(|e| (-32603_i32, format!("wiki note write: {e}")))?;
+            log_dedup_decision(s, &telemetry).await;
             return finish_remembered_note(s, &path, &wiki_id, &front, true).await;
         }
+        log_dedup_decision(
+            s,
+            &dedup_decision_event(&note, Some(&existing), DedupOutcome::Skip),
+        )
+        .await;
         return Ok(format!("skipped — duplicate of {}", existing.source_path));
     }
+
+    // No duplicate — the store-new baseline that makes the replace/skip rates meaningful.
+    let telemetry = dedup_decision_event(&note, None, DedupOutcome::StoreNew);
 
     // 1. atomically allocate id + path, then write the wiki note (deterministic file IO — the SSOT artifact).
     //    Include existing vector-store ids so we never reuse a source_path that still lives in Postgres
@@ -1120,6 +1130,7 @@ async fn mcp_remember(s: &AppState, args: Option<&Value>) -> Result<String, (i32
     let content = vault::render_wiki_note(&wiki_id, &front, &note.body)
         .map_err(|e| (-32603_i32, format!("render wiki note: {e:#}")))?;
     std::fs::write(&path, content).map_err(|e| (-32603_i32, format!("wiki note write: {e}")))?;
+    log_dedup_decision(s, &telemetry).await;
 
     finish_remembered_note(s, &path, &wiki_id, &front, false).await
 }
@@ -1408,6 +1419,77 @@ fn note_quality(front: &FrontMatter, body: &str) -> NoteQuality {
     NoteQuality {
         score,
         evidence_signal,
+    }
+}
+
+/// The three ways the dedup gate can settle a `remember`. `status()` is the string written
+/// to the `event_log.status` column, so `GROUP BY event_name, status` reads as per-branch rates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupOutcome {
+    Replace,
+    Skip,
+    StoreNew,
+}
+
+impl DedupOutcome {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Replace => "replaced",
+            Self::Skip => "skipped",
+            Self::StoreNew => "stored",
+        }
+    }
+}
+
+fn duplicate_reason_str(reason: DuplicateReason) -> &'static str {
+    match reason {
+        DuplicateReason::SameSession => "same_session",
+        DuplicateReason::ProbableSession => "probable_session",
+        DuplicateReason::ExactTitle => "exact_title",
+        DuplicateReason::Embedding => "embedding",
+    }
+}
+
+/// Build the `event_log` payload for one dedup-gate decision. Carries the margin (incoming
+/// vs existing score) and the `DuplicateReason`, not just the verdict, so a refusal that
+/// barely missed `DUPLICATE_REPLACE_MIN_DELTA` is distinguishable from one nowhere close.
+/// Pure observation — the decision itself is made (and unchanged) by the caller.
+fn dedup_decision_event(
+    note: &RememberNote,
+    existing: Option<&DuplicateMatch>,
+    outcome: DedupOutcome,
+) -> Value {
+    let incoming = note_quality(&note.front, &note.body);
+    // Embedding matches carry no existing content (check_duplicate only has a path), so the
+    // existing score is genuinely unknown there — null, not a bogus score of an empty note.
+    let existing_score = existing.and_then(|m| match m.reason {
+        DuplicateReason::Embedding => None,
+        _ => Some(note_quality(&m.front, &m.body).score),
+    });
+    json!({
+        "component": "drudge.mcp.remember",
+        "event": "dedup_decision",
+        "status": outcome.status(),
+        "reason": existing.map(|m| duplicate_reason_str(m.reason)),
+        "incoming_score": incoming.score,
+        "existing_score": existing_score,
+        "score_delta": existing_score.map(|s| incoming.score.cast_signed() - s.cast_signed()),
+        "replace_min_delta": DUPLICATE_REPLACE_MIN_DELTA,
+        "omb_session_id": note.front.omb_session_id.as_deref(),
+        "existing_source_path": existing.map(|m| m.source_path.as_str()),
+    })
+}
+
+/// Emit one `dedup_decision` row through the existing `Store::log_event` writer (no second
+/// path — retention/redaction stay inherited). Telemetry is downstream of the decision: a
+/// logging failure warns and is ignored so the remember still succeeds — same
+/// degraded-but-honest idiom as the `project_links` warning in `mcp_forget`.
+async fn log_dedup_decision(s: &AppState, event: &Value) {
+    let Some(store) = s.store.as_ref() else {
+        return;
+    };
+    if let Err(e) = store.log_event(event).await {
+        eprintln!("[remember] dedup telemetry warning (ignored): {e:#}");
     }
 }
 
@@ -1738,8 +1820,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DuplicateMatch, DuplicateReason, RememberNote, apply_pii_gate, mcp_tools_list,
-        parse_remember_note, probable_session_duplicate, should_replace_duplicate,
+        DedupOutcome, DuplicateMatch, DuplicateReason, RememberNote, apply_pii_gate,
+        dedup_decision_event, mcp_tools_list, parse_remember_note, probable_session_duplicate,
+        should_replace_duplicate,
     };
     use crate::config::BoringConfig;
     use crate::frontmatter::FrontMatter;
@@ -2188,6 +2271,107 @@ mod tests {
         };
 
         assert!(!should_replace_duplicate(&note, &existing));
+    }
+
+    fn telemetry_note() -> RememberNote {
+        RememberNote {
+            front: FrontMatter {
+                title: Some("MCP ingestion".to_owned()),
+                claims: vec![crate::frontmatter::Claim {
+                    subject: "remember".to_owned(),
+                    predicate: "updates".to_owned(),
+                    value: "weak duplicate notes when the new note is richer".to_owned(),
+                    kind: "decision".to_owned(),
+                    confidence: "certain".to_owned(),
+                }],
+                omb_session_id: Some("session-a".to_owned()),
+                ..Default::default()
+            },
+            body: "## Evidence\nImplemented deterministic duplicate replacement. command: cargo test -p drudge duplicate_replacement".to_owned(),
+        }
+    }
+
+    fn telemetry_existing(reason: DuplicateReason) -> DuplicateMatch {
+        DuplicateMatch {
+            source_path: "/tmp/vault/wiki/wiki-0001.md".to_owned(),
+            reason,
+            front: FrontMatter {
+                title: Some("MCP ingestion".to_owned()),
+                omb_session_id: Some("session-a".to_owned()),
+                ..Default::default()
+            },
+            body: "Short summary.".to_owned(),
+        }
+    }
+
+    #[test]
+    fn dedup_decision_event_records_replace_with_margin() {
+        let note = telemetry_note();
+        let existing = telemetry_existing(DuplicateReason::SameSession);
+
+        let event = dedup_decision_event(&note, Some(&existing), DedupOutcome::Replace);
+
+        assert_eq!(event["event"], "dedup_decision");
+        assert_eq!(event["component"], "drudge.mcp.remember");
+        assert_eq!(event["status"], "replaced");
+        assert_eq!(event["reason"], "same_session");
+        assert_eq!(event["omb_session_id"], "session-a");
+        assert_eq!(
+            event["existing_source_path"],
+            "/tmp/vault/wiki/wiki-0001.md"
+        );
+        let incoming = event["incoming_score"].as_u64().unwrap();
+        let existing_score = event["existing_score"].as_u64().unwrap();
+        assert_eq!(
+            event["score_delta"].as_i64().unwrap(),
+            incoming.cast_signed() - existing_score.cast_signed()
+        );
+        assert_eq!(
+            event["replace_min_delta"].as_u64().unwrap(),
+            super::DUPLICATE_REPLACE_MIN_DELTA as u64
+        );
+    }
+
+    #[test]
+    fn dedup_decision_event_records_skip_with_margin() {
+        let note = telemetry_note();
+        let existing = telemetry_existing(DuplicateReason::ProbableSession);
+
+        let event = dedup_decision_event(&note, Some(&existing), DedupOutcome::Skip);
+
+        assert_eq!(event["status"], "skipped");
+        assert_eq!(event["reason"], "probable_session");
+        assert!(event["incoming_score"].is_u64());
+        assert!(event["existing_score"].is_u64());
+        assert!(event["score_delta"].is_i64());
+    }
+
+    #[test]
+    fn dedup_decision_event_store_new_is_baseline() {
+        let note = telemetry_note();
+
+        let event = dedup_decision_event(&note, None, DedupOutcome::StoreNew);
+
+        assert_eq!(event["status"], "stored");
+        assert!(event["incoming_score"].is_u64());
+        assert!(event["reason"].is_null());
+        assert!(event["existing_score"].is_null());
+        assert!(event["score_delta"].is_null());
+        assert!(event["existing_source_path"].is_null());
+    }
+
+    #[test]
+    fn dedup_decision_event_embedding_match_has_unknown_existing_score() {
+        let note = telemetry_note();
+        // check_duplicate loads no content for embedding matches — the score must read
+        // as unknown (null), never as the quality of an empty note.
+        let existing = telemetry_existing(DuplicateReason::Embedding);
+
+        let event = dedup_decision_event(&note, Some(&existing), DedupOutcome::Skip);
+
+        assert_eq!(event["reason"], "embedding");
+        assert!(event["existing_score"].is_null());
+        assert!(event["score_delta"].is_null());
     }
 
     #[test]
