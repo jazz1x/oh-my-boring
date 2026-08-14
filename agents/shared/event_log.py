@@ -263,6 +263,38 @@ def recent_events(
     return events[-limit:]
 
 
+#: Gates that must keep running. A gate that stops is indistinguishable from a gate that
+#: passes: `eval_graphrag_gate` emitted twenty `ok` rows over four days in July, then vanished
+#: for five weeks, and its stale success rows were later read as proof the graph was covered.
+#: Silence is the failure mode this probe exists to name.
+WATCHED_GATES = ("eval_gate",)
+GATE_STALE_DAYS = int(os.environ.get("BORING_GATE_STALE_DAYS") or "7")
+
+
+def stale_gates(max_days: int | None = None) -> list[tuple[str, Optional[int]]]:
+    """Return (gate, days_since_last_run) for watched gates that are stale or never seen.
+
+    `None` days means the gate has no recorded run at all — worse than stale, not better.
+    """
+    limit = GATE_STALE_DAYS if max_days is None else max_days
+    now = datetime.now(timezone.utc)
+    out: list[tuple[str, Optional[int]]] = []
+    for gate in WATCHED_GATES:
+        events = _fetch_engine_events(200, event_name=gate)
+        if events is None:
+            events = [e for e in iter_events() if e.get("event") == gate]
+        newest = None
+        for event in events:
+            ts = _parse_ts(str(event.get("ts") or ""))
+            if ts is not None and (newest is None or ts > newest):
+                newest = ts
+        if newest is None:
+            out.append((gate, None))
+        elif (now - newest).days > limit:
+            out.append((gate, (now - newest).days))
+    return out
+
+
 def recent_resolution_failures(limit: int = 3, hours: Optional[int] = None) -> list[dict[str, Any]]:
     if hours is None:
         raw_hours = os.environ.get("BORING_EVENT_RECENT_HOURS") or str(DEFAULT_RECENT_HOURS)
@@ -360,6 +392,7 @@ def _format_event(event: dict[str, Any]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect oh-my-boring workflow events")
     parser.add_argument("--recent-resolution-failures", action="store_true")
+    parser.add_argument("--stale-gates", action="store_true")
     parser.add_argument("--record", nargs=3, metavar=("COMPONENT", "EVENT", "STATUS"))
     parser.add_argument("--field", action="append", default=[], type=_parse_field)
     parser.add_argument("--tail", action="store_true")
@@ -384,6 +417,15 @@ def main() -> int:
             else:
                 print(_format_event(event))
         return 0
+
+    if args.stale_gates:
+        stale = stale_gates()
+        if not stale:
+            print(f"gates fresh (<= {GATE_STALE_DAYS}d) watched={len(WATCHED_GATES)}")
+            return 0
+        for gate, days in stale:
+            print(f"  gate={gate} last_run={'never' if days is None else str(days) + 'd ago'}")
+        return 1
 
     if args.recent_resolution_failures:
         failures = recent_resolution_failures(args.max, args.hours)
