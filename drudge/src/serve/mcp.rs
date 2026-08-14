@@ -808,17 +808,25 @@ async fn mcp_ask(s: &AppState, args: Option<&Value>) -> Result<Value, (i32, Stri
         .await
     }
     .map_err(|e| (-32603_i32, format!("ask: {e:#}")))?;
-    Ok(json!({"answer": out.answer, "sources": out.sources}))
+    Ok(json!({
+        "answer": out.answer,
+        "sources": out.sources,
+    }))
 }
 
 /// `brief` — recency-first work briefing (no query): the sanctioned `ask::brief` path (same as `/brief`).
-/// Vector-only — recency ordering needs pgvector. Returns `{answer, sources}`.
+/// Vector-only — recency ordering needs pgvector. Returns `{answer, sources, injected_claims}`;
+/// the last is what went into the prompt, so a consumer can tell whether the answer kept it.
 async fn mcp_brief(s: &AppState) -> Result<Value, (i32, String)> {
     let store = s.store.as_ref().ok_or_else(vec_off_rpc)?;
-    let out = ask::brief(store, &s.llm, &[], s.cfg.note_lang.as_str())
+    let (out, injected_claims) = ask::brief(store, &s.llm, &[], s.cfg.note_lang.as_str())
         .await
         .map_err(|e| (-32603_i32, format!("brief: {e:#}")))?;
-    Ok(json!({"answer": out.answer, "sources": out.sources}))
+    Ok(json!({
+        "answer": out.answer,
+        "sources": out.sources,
+        "injected_claims": injected_claims,
+    }))
 }
 
 /// `weekly_brief` — last 7 days by project. Returns `{answer, sources}`.

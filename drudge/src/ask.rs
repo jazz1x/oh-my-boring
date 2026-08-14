@@ -405,12 +405,19 @@ const BRIEF_CLAIM_RESERVE: &[(&str, i64)] =
 
 /// Recency-first/supersede briefing: retrieve by `updated_at` descending rather than semantic similarity →
 /// synthesize so the latest beats the old. Called by the cron morning briefing (`/brief`). SRP: separate from `answer()`.
+/// Returns the briefing plus the claims that were placed in its prompt, `kind|subject|
+/// predicate|value` per row. The second element exists because the briefing's real failure
+/// mode is loss across a stochastic stage — two `blocked` claims were injected on 2026-08-14
+/// and the model rendered neither — and nothing downstream could see it: the response carried
+/// only prose and sources, so a quality gate could score the output's shape and never notice
+/// that half its highest-priority input had vanished. Returned rather than re-queried so the
+/// record cannot drift from the prompt it describes.
 pub async fn brief(
     store: &Store,
     llm: &Llm,
     exclude_origins: &[String],
     lang: &str,
-) -> Result<AnswerOut> {
+) -> Result<(AnswerOut, Vec<String>)> {
     // Try increasingly wide recency windows until we have enough recent context.
     // 24h -> 48h -> 7d -> 30d. Keeps the briefing focused on "today/yesterday" when
     // there is activity, but gracefully falls back when the user was away.
@@ -428,10 +435,13 @@ pub async fn brief(
         }
     }
     if docs.is_empty() {
-        return Ok(AnswerOut {
-            answer: "No recent work records ingested. (ingest first?)".to_owned(),
-            sources: vec![],
-        });
+        return Ok((
+            AnswerOut {
+                answer: "No recent work records ingested. (ingest first?)".to_owned(),
+                sources: vec![],
+            },
+            Vec::new(),
+        ));
     }
 
     let mut context = String::new();
@@ -449,7 +459,7 @@ pub async fn brief(
 
     // Authority injection: current claims — even if old exploration notes (e.g. discarded Neo4j/SurrealDB)
     // look recent by mtime, claim authority nails down the true current fact.
-    let claim_ctx = brief_claim_ctx(store).await?;
+    let (claim_ctx, injected_claims) = brief_claim_ctx(store).await?;
     let (fo, fc) = data_fence("brief");
     let rule = fence_rule(&fo, &fc);
     let prompt = if claim_ctx.is_empty() {
@@ -471,10 +481,13 @@ pub async fn brief(
     let answer_text = llm.generate(&system, &prompt).await?;
 
     let sources: Vec<String> = docs.iter().map(|d| d.source_path.clone()).collect();
-    Ok(AnswerOut {
-        answer: coalesce_brief_answer(&answer_text),
-        sources,
-    })
+    Ok((
+        AnswerOut {
+            answer: coalesce_brief_answer(&answer_text),
+            sources,
+        },
+        injected_claims,
+    ))
 }
 
 /// Build the daily brief's claim context: reserved per-kind quotas for the decision-relevant
@@ -488,7 +501,7 @@ pub async fn brief(
 /// fill whatever the reserves didn't use (an empty kind silently yields its slots; no
 /// placeholder section is ever emitted). Total stays 12: claims already compete with 12
 /// documents for a local model's attention, and nothing measured justifies raising it.
-async fn brief_claim_ctx(store: &Store) -> Result<String> {
+async fn brief_claim_ctx(store: &Store) -> Result<(String, Vec<String>)> {
     let mut claims = Vec::new();
     for (kind, cap) in BRIEF_CLAIM_RESERVE {
         let kinds = [(*kind).to_owned()];
@@ -502,8 +515,18 @@ async fn brief_claim_ctx(store: &Store) -> Result<String> {
                 .await?,
         );
     }
+    // Record what actually went in, in the same pass that formats it — a second query would
+    // be a different sample and could disagree with the prompt it claims to describe.
+    let mut injected: Vec<String> = Vec::new();
     let mut claim_ctx = String::new();
     for cl in &claims {
+        injected.push(format!(
+            "{}|{}|{}|{}",
+            cl.kind(),
+            cl.subject.trim(),
+            cl.predicate.trim(),
+            cl.value.trim()
+        ));
         let _ = writeln!(
             claim_ctx,
             "- [{}|{}] {} {} {}",
@@ -537,7 +560,7 @@ async fn brief_claim_ctx(store: &Store) -> Result<String> {
             );
         }
     }
-    Ok(claim_ctx)
+    Ok((claim_ctx, injected))
 }
 
 const STATUS_SYSTEM: &str = "You are the user's personal assistant. Produce a concise project status summary in the same language as the records below.\n\
