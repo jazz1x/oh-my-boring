@@ -383,6 +383,18 @@ else
     bad "event log probe not found at $event_log_probe"; failed_resolution=1
 fi
 
+# (d4b) Gate staleness. A gate that stops running looks exactly like a gate that passes:
+# eval_graphrag_gate emitted twenty `ok` rows over four days in July, then went silent for five
+# weeks, and those stale rows were later read as evidence the graph was still covered. Silence
+# is the failure this names.
+if [ -f "$event_log_probe" ]; then
+    if BORING_EVENT_LOG="${BORING_EVENT_LOG:-$HOME/.cache/oh-my-boring/events.ndjson}" python3 "$event_log_probe" --stale-gates; then
+        ok "watched gates ran recently"
+    else
+        bad "a watched gate has gone stale — it is not failing, it stopped running"; failed_resolution=1
+    fi
+fi
+
 # (d5) Freshness window for briefing content. Existence alone is too weak: a green
 # stack with stale notes still cannot answer "can I trust tomorrow morning's briefing?"
 note_max_hours_raw="${BORING_READINESS_NOTE_MAX_HOURS:-48}"
