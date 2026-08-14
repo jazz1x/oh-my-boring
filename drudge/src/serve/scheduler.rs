@@ -186,7 +186,7 @@ async fn run_brief(
         eprintln!("[scheduler] daily brief already exists: {}", path.display());
         return;
     }
-    let out = match ask::brief(store, llm, &[], cfg.note_lang.as_str()).await {
+    let (out, _injected) = match ask::brief(store, llm, &[], cfg.note_lang.as_str()).await {
         Ok(o) => o,
         Err(e) => {
             eprintln!("[scheduler] brief generation error: {e:#}");

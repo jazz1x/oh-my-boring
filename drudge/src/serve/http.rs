@@ -73,6 +73,7 @@ pub(crate) async fn handle_ask(
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims: Vec::new(),
     }))
 }
 
@@ -81,7 +82,7 @@ pub(crate) async fn handle_ask(
 pub(crate) async fn handle_brief(State(s): State<AppState>) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
-    let out = ask::brief(store, &s.llm, &[], s.cfg.note_lang.as_str()).await?;
+    let (out, injected_claims) = ask::brief(store, &s.llm, &[], s.cfg.note_lang.as_str()).await?;
     spawn_query_log(
         s.store.clone(),
         "brief",
@@ -94,6 +95,7 @@ pub(crate) async fn handle_brief(State(s): State<AppState>) -> Result<Json<AskRe
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims,
     }))
 }
 
@@ -117,6 +119,7 @@ pub(crate) async fn handle_weekly(
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims: Vec::new(),
     }))
 }
 
@@ -141,6 +144,7 @@ pub(crate) async fn handle_project_status(
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims: Vec::new(),
     }))
 }
 
@@ -171,6 +175,7 @@ pub(crate) async fn handle_decisions(
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims: Vec::new(),
     }))
 }
 
@@ -201,6 +206,7 @@ pub(crate) async fn handle_risks(
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims: Vec::new(),
     }))
 }
 
@@ -231,6 +237,7 @@ pub(crate) async fn handle_next_actions(
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims: Vec::new(),
     }))
 }
 
@@ -262,6 +269,7 @@ pub(crate) async fn handle_stalled(
     Ok(Json(AskResp {
         answer: out.answer,
         sources: out.sources,
+        injected_claims: Vec::new(),
     }))
 }
 

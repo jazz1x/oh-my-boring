@@ -337,6 +337,12 @@ pub(crate) struct AskReq {
 pub(crate) struct AskResp {
     pub(crate) answer: String,
     pub(crate) sources: Vec<String>,
+    /// Claims placed in the prompt, `kind|subject|predicate|value`. Present so a consumer can
+    /// ask "did the answer keep what it was given?" — the briefing dropped both injected
+    /// `blocked` claims on 2026-08-14 and nothing downstream could tell. Empty on paths that
+    /// inject none, so existing consumers are unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) injected_claims: Vec<String>,
 }
 
 #[derive(Deserialize)]
