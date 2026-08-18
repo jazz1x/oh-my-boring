@@ -256,7 +256,7 @@ mod tests {
 #[allow(clippy::needless_borrow)] // tokio-postgres needs &&str to coerce to &dyn ToSql.
 pub(crate) fn spawn_query_log(
     store: Option<Arc<Store>>,
-    endpoint: &'static str,
+    endpoint: impl Into<String>,
     query: String,
     hit_paths: Vec<String>,
     sources: Vec<String>,
@@ -266,6 +266,7 @@ pub(crate) fn spawn_query_log(
     let Some(store) = store else {
         return;
     };
+    let endpoint = endpoint.into();
     tokio::spawn(async move {
         let latency_ms = i32::try_from(elapsed.as_millis()).ok();
         if let Err(e) = store
