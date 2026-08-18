@@ -14,7 +14,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use drudge::frontmatter::{Claim, FrontMatter};
-use drudge::store::{Doc, EventLogFilter, Store};
+use drudge::store::{DistKind, Doc, EventLogFilter, LoggedHit, Store};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
@@ -646,4 +646,113 @@ async fn stalled_claims_honor_requested_kinds() {
     assert_eq!(stalled[0].predicate, "follow-up");
 
     store.delete_document(&path).await.expect("cleanup");
+}
+
+/// query_log must keep "distance 0.0" and "no distance" distinct. 0.0 is a valid cosine distance
+/// (identical vector), while absence means the hit came from a source with no comparable signal.
+#[tokio::test]
+async fn query_log_preserves_zero_distance_and_absence_distinctly() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+    let endpoint = format!(
+        "dist-roundtrip-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let p1 = unique_path("dist-zero");
+    let p2 = unique_path("dist-absent");
+
+    store
+        .log_query(
+            &endpoint,
+            "test query",
+            &[
+                LoggedHit::with_distance(&p1, 0.0, DistKind::VectorCosine),
+                LoggedHit::without_distance(&p2),
+            ],
+            &[],
+            "snippet",
+            None,
+        )
+        .await
+        .expect("log query");
+
+    let rows = store.recent_queries(10).await.expect("recent queries");
+    let row = rows
+        .iter()
+        .find(|r| r.endpoint == endpoint)
+        .expect("row present");
+
+    assert_eq!(row.hit_paths, vec![p1.clone(), p2.clone()]);
+    assert_eq!(row.hit_dists.len(), 2);
+    assert_eq!(row.hit_dists[0], Some(0.0));
+    assert!(row.hit_dists[1].is_none(), "absent distance must be None");
+    assert_eq!(row.hit_dist_kinds.len(), 2);
+    assert_eq!(row.hit_dist_kinds[0].as_deref(), Some("vector_cosine"));
+    assert!(row.hit_dist_kinds[1].is_none(), "absent kind must be None");
+
+    let db = connect(&dsn).await;
+    db.execute("DELETE FROM query_log WHERE endpoint = $1;", &[&endpoint])
+        .await
+        .expect("cleanup query_log");
+}
+
+/// Legacy query_log rows (paths only) must read back with empty distance arrays, never zeros.
+#[tokio::test]
+async fn query_log_legacy_rows_read_empty_distances() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+    let endpoint = format!(
+        "dist-legacy-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let p1 = unique_path("dist-legacy-a");
+    let p2 = unique_path("dist-legacy-b");
+
+    let db = connect(&dsn).await;
+    db.execute(
+        "INSERT INTO query_log (endpoint, query, hit_paths, sources, answer_snippet, latency_ms)
+         VALUES ($1, $2, $3, $4, $5, $6);",
+        &[
+            &endpoint,
+            &"legacy query",
+            &vec![p1.clone(), p2.clone()],
+            &Vec::<String>::new(),
+            &"snippet",
+            &None::<i32>,
+        ],
+    )
+    .await
+    .expect("insert legacy row");
+
+    let rows = store.recent_queries(10).await.expect("recent queries");
+    let row = rows
+        .iter()
+        .find(|r| r.endpoint == endpoint)
+        .expect("row present");
+
+    assert_eq!(row.hit_paths, vec![p1, p2]);
+    assert!(
+        row.hit_dists.is_empty(),
+        "legacy row must read back empty hit_dists, not zeros"
+    );
+    assert!(
+        row.hit_dist_kinds.is_empty(),
+        "legacy row must read back empty hit_dist_kinds"
+    );
+
+    db.execute("DELETE FROM query_log WHERE endpoint = $1;", &[&endpoint])
+        .await
+        .expect("cleanup query_log");
 }

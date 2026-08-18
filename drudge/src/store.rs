@@ -45,6 +45,48 @@ pub enum DistKind {
     TextRank,
 }
 
+impl DistKind {
+    /// String used in the DB and the one place in `main.rs` that still prints a label.
+    /// Kept identical to the serde serialization so API, DB, and Python matcher cannot drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VectorCosine => "vector_cosine",
+            Self::TextRank => "text_rank",
+        }
+    }
+}
+
+/// One hit as stored in `query_log`. The Option makes "absent" unrepresentable as a value:
+/// `None` → SQL NULL in the array, `Some` → the distance/kind.
+#[derive(Debug)]
+pub struct LoggedHit {
+    pub path: String,
+    pub dist: Option<f32>,
+    pub dist_kind: Option<DistKind>,
+}
+
+impl LoggedHit {
+    pub fn with_distance(path: impl Into<String>, dist: f32, dist_kind: DistKind) -> Self {
+        Self {
+            path: path.into(),
+            dist: Some(dist),
+            dist_kind: Some(dist_kind),
+        }
+    }
+
+    pub fn without_distance(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            dist: None,
+            dist_kind: None,
+        }
+    }
+
+    pub fn without_distances(paths: Vec<String>) -> Vec<Self> {
+        paths.into_iter().map(Self::without_distance).collect()
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // some fields are for retrieve / display only
 pub struct Hit {
@@ -108,6 +150,8 @@ pub struct QueryLogRow {
     pub endpoint: String,
     pub query: String,
     pub hit_paths: Vec<String>,
+    pub hit_dists: Vec<Option<f32>>,
+    pub hit_dist_kinds: Vec<Option<String>>,
     pub sources: Vec<String>,
     pub answer_snippet: String,
     pub latency_ms: Option<i32>,
@@ -369,6 +413,8 @@ impl Store {
                      answer_snippet text NOT NULL DEFAULT '',
                      latency_ms    int
                  );
+                 ALTER TABLE query_log ADD COLUMN IF NOT EXISTS hit_dists real[] NOT NULL DEFAULT '{{}}';
+                 ALTER TABLE query_log ADD COLUMN IF NOT EXISTS hit_dist_kinds text[] NOT NULL DEFAULT '{{}}';
                  CREATE INDEX IF NOT EXISTS query_log_created ON query_log(created_at DESC);
                  CREATE TABLE IF NOT EXISTS event_log (
                      id               bigserial PRIMARY KEY,
@@ -1211,7 +1257,7 @@ impl Store {
         &self,
         endpoint: &str,
         query: &str,
-        hit_paths: &[String],
+        hits: &[LoggedHit],
         sources: &[String],
         answer_snippet: &str,
         latency_ms: Option<i32>,
@@ -1226,14 +1272,22 @@ impl Store {
             ),
             Err(_) => (query.to_owned(), answer_snippet.to_owned()),
         };
+        let hit_paths: Vec<String> = hits.iter().map(|h| h.path.clone()).collect();
+        let hit_dists: Vec<Option<f32>> = hits.iter().map(|h| h.dist).collect();
+        let hit_dist_kinds: Vec<Option<&str>> = hits
+            .iter()
+            .map(|h| h.dist_kind.map(DistKind::as_str))
+            .collect();
         self.db().await?
             .execute(
-                "INSERT INTO query_log (endpoint, query, hit_paths, sources, answer_snippet, latency_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6);",
+                "INSERT INTO query_log (endpoint, query, hit_paths, hit_dists, hit_dist_kinds, sources, answer_snippet, latency_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
                 &[
                     &endpoint,
                     &query,
                     &hit_paths,
+                    &hit_dists,
+                    &hit_dist_kinds,
                     &sources,
                     &answer_snippet,
                     &latency_ms,
@@ -1247,7 +1301,7 @@ impl Store {
     pub async fn recent_queries(&self, limit: i64) -> Result<Vec<QueryLogRow>> {
         let rows = self.db().await?
                         .query(
-                "SELECT id, created_at, endpoint, query, hit_paths, sources, answer_snippet, latency_ms
+                "SELECT id, created_at, endpoint, query, hit_paths, hit_dists, hit_dist_kinds, sources, answer_snippet, latency_ms
                  FROM query_log ORDER BY created_at DESC LIMIT $1;",
                 &[&limit],
             )
@@ -1261,9 +1315,11 @@ impl Store {
                 endpoint: r.get(2),
                 query: r.get(3),
                 hit_paths: r.get(4),
-                sources: r.get(5),
-                answer_snippet: r.get(6),
-                latency_ms: r.get(7),
+                hit_dists: r.get(5),
+                hit_dist_kinds: r.get(6),
+                sources: r.get(7),
+                answer_snippet: r.get(8),
+                latency_ms: r.get(9),
             })
             .collect())
     }
@@ -1705,9 +1761,11 @@ mod tests {
             serde_json::to_string(&DistKind::VectorCosine).unwrap(),
             "\"vector_cosine\""
         );
+        assert_eq!(DistKind::VectorCosine.as_str(), "vector_cosine");
         assert_eq!(
             serde_json::to_string(&DistKind::TextRank).unwrap(),
             "\"text_rank\""
         );
+        assert_eq!(DistKind::TextRank.as_str(), "text_rank");
     }
 }
