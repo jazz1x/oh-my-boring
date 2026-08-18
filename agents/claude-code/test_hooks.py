@@ -388,6 +388,46 @@ class RecallFormattingTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertEqual(err, "")
 
+    # ── admission: harness-injected text must not trigger a retrieval ────────────────
+    # `_MUST_NOT_SEARCH` makes these kill: if the skip fails, search raises, recall_core
+    # catches it and writes "[omb-recall] search failed" to stderr, and the empty-stderr
+    # assertion fires. Asserting only on empty stdout would pass even without the skip,
+    # because a raising search also produces no context block.
+    _MUST_NOT_SEARCH = AssertionError("recall searched on a prompt it should have skipped")
+
+    def test_task_notification_is_noop(self):
+        # 695 of 2,178 firings over 7 days were these — the harness talking, not the user.
+        out, err = self._run_main(
+            "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>",
+            [],
+            search_side_effect=self._MUST_NOT_SEARCH,
+        )
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+
+    def test_image_only_prompt_is_noop(self):
+        out, err = self._run_main("[Image #1] [Image #2]", [], search_side_effect=self._MUST_NOT_SEARCH)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+
+    def test_image_with_a_question_still_fires(self):
+        # An image plus words is a real turn; only the placeholder-only case is inert.
+        out, _err = self._run_main(
+            "[Image #1] 이 그래프가 왜 이래?",
+            [{"source_path": "vault/wiki/wiki-0007.md", "snippet": "graph"}],
+        )
+        self.assertIn("- [wiki-0007.md] graph", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+
+    def test_short_real_prompt_still_fires(self):
+        # Guards against re-introducing a length rule. Sampling production showed the
+        # sub-12-character prompts are mostly real turns; this one is exactly 8 chars and
+        # must survive both the existing < 8 gate and the injection predicate.
+        out, _err = self._run_main(
+            "어드바이저 불러",
+            [{"source_path": "vault/wiki/wiki-0007.md", "snippet": "advisor"}],
+        )
+        self.assertIn("- [wiki-0007.md] advisor", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+
     def test_formats_context_block(self):
         out, _err = self._run_main(
             "how did I fix the docker cache issue",
