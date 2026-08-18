@@ -79,7 +79,7 @@ def _throttled(session_id):
     return (time.time() - done_time) < THROTTLE_MIN * 60
 
 
-def _mark(session_id, retry=False):
+def _mark(session_id, retry=False, reason=""):
     """Write a done marker (.ts) or a retry marker (.retry).
 
     A .retry marker tells collect-sessions.py (the backfill scheduler) that this
@@ -93,7 +93,11 @@ def _mark(session_id, retry=False):
     if not session_id:
         return
     if retry:
-        markers.mark_retry(session_id)
+        # Pass the reason through. `mark_retry` already writes it into the marker and, on the
+        # fifth attempt, into the `.dead` file — but every production caller used to omit it,
+        # so dead letters recorded a timestamp and an attempt count and nothing about WHY.
+        # Two sessions died that way on 2026-08-06 and 08-09 and are unexplainable today.
+        markers.mark_retry(session_id, reason=reason)
     else:
         markers.mark_done(session_id)
 

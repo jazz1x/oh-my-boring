@@ -131,7 +131,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             if session_id:
-                _mark(session_id, retry=True)
+                _mark(session_id, retry=True, reason="remember failed")
             return 1
         print("[omb-distill-codex] transcript too short; skipping", file=sys.stderr)
         log_skip_event(session_id, origin, repo, _distill_resolution(), "too_short")
@@ -160,7 +160,7 @@ def main() -> int:
         print("[omb-distill-codex] remembered", file=sys.stderr)
         return 0
     else:
-        _mark(session_id, retry=True)
+        _mark(session_id, retry=True, reason="remember failed")
         print("[omb-distill-codex] remember failed; marked for retry", file=sys.stderr)
         return 1
 
