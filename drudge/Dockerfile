@@ -42,6 +42,13 @@ RUN useradd --system --uid 10001 --no-create-home drudge \
     && chown -R drudge /data
 USER drudge
 
+# ── Build identity ────────────────────────────────────────────────────────────
+# The commit this image was built from, so a running container can say what it is.
+# Left unset when the builder did not pass it — `/health` then reports null rather than
+# guessing, because a wrong sha is worse than an absent one.
+ARG BUILD_SHA
+ENV BORING_BUILD_SHA=$BUILD_SHA
+
 # ── Default env ───────────────────────────────────────────────────────────────
 ENV BORING_HTTP_ADDR=0.0.0.0:7700
 # DRUDGE_LLM_BASE_URL, DRUDGE_SOURCE_DIRS, DRUDGE_SYNC_HOURS: injected at runtime

@@ -590,6 +590,22 @@ pub(crate) struct HealthResp {
     /// omitted when no DB client is configured (vector off + code_index off) to avoid false alarms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) db_healthy: Option<bool>,
+    /// The commit this binary was built from, stamped by the image build (`BORING_BUILD_SHA`).
+    /// `null` when the builder did not pass one — merging is not deploying, and an absent sha
+    /// says "unknown" rather than asserting a wrong one. Compare against `git rev-parse HEAD`
+    /// to see whether what is running is what was merged; `scripts/doctor.sh` does exactly that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) build_sha: Option<String>,
+}
+
+/// Reads the build stamp. Empty or unset both mean "not stamped" — an empty string would
+/// otherwise serialize as a sha of `""` and compare unequal to everything, which reads as
+/// drift when the truth is that nobody recorded it.
+pub(crate) fn build_sha() -> Option<String> {
+    std::env::var("BORING_BUILD_SHA")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 /// Best-effort count of wiki notes (`vault/wiki/*.md`). `None` on any IO error — `/health` must stay a

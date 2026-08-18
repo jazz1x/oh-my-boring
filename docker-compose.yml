@@ -35,6 +35,9 @@ services:
   boring-drudge:
     build:
       context: ./drudge
+      args:
+        # Empty unless the builder passes it (see the `build` target in the Makefile).
+        BUILD_SHA: "${BUILD_SHA-}"
     image: boring-drudge
     container_name: boring-drudge
     restart: unless-stopped

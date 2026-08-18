@@ -38,6 +38,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResp> {
         sync,
         corpus_count: state.wiki_dir().as_deref().and_then(count_wiki_notes),
         db_healthy,
+        build_sha: crate::serve::build_sha(),
     })
 }
 
