@@ -8,6 +8,7 @@
 #   1. remember  — write a throwaway note via the `remember` MCP tool
 #   2. search    — vector mode: the note is the top hit for its nonce
 #   3. recall    — read it back via `recall`; assert body round-trips
+#   3b. query-log — vector mode: the recall call left an mcp.recall row
 #   4. neighbors — wiki mode: rejected with -32603; vector mode: returns results
 #   5. forget    — delete the throwaway note
 #   6. recall    — assert deletion
@@ -106,6 +107,25 @@ printf '%s' "$text" | grep -q "$NONCE" \
   || fail "round-trip failed — nonce '$NONCE' not found in recall result: $text"
 echo "   → round-trip OK (nonce recalled)"
 
+# --- 3b) query_log records the MCP call (vector mode only) ------------------------
+if [ "$VEC" = 1 ]; then
+  echo "3b) query-log (GET /query-log — assert the recall call left an mcp.recall row)…"
+  # The log write is a detached task, so poll briefly instead of asserting immediately.
+  # Wiki mode records nothing here because `store` is None — pre-existing behaviour,
+  # not a new gap, so this step runs in the vector branch only.
+  row=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    row=$(curl -sf -m10 "$URL/query-log?limit=50" | jq -r --arg n "$NONCE" \
+      '[.entries[]? | select(.endpoint == "mcp.recall") | select(.query | contains($n))][0].endpoint // empty' \
+      2>/dev/null) || true
+    [ -n "$row" ] && break
+    sleep 1
+  done
+  [ -n "$row" ] \
+    || fail "no query_log row with endpoint=mcp.recall containing nonce '$NONCE' after 10s"
+  echo "   → query_log has an mcp.recall row for the nonce"
+fi
+
 # --- 4) neighbors (mode-specific contract) --------------------------------------
 if [ "$VEC" = 0 ]; then
   echo "4) neighbors (MCP tools/call neighbors — assert vector-off error -32603)…"
@@ -126,6 +146,31 @@ else
   err=$(printf '%s' "$resp" | jq -r '.error.message // empty')
   [ -z "$err" ] || fail "neighbors returned JSON-RPC error in vector mode: $err"
   echo "   → neighbors returned results in vector mode"
+
+  # 4b) tags must actually VARY by tool. The nonce reached the engine through two
+  # different tools, so it must come back under two different endpoint tags. Asserting
+  # only `mcp.recall` (step 3b) cannot see a wiring bug that hardcodes the tag: a mutant
+  # passing a literal tool name to `mcp_endpoint_tag` destroys per-tool attribution —
+  # the whole point of this table — while every unit test, clippy and rg gate still pass.
+  # That mutant was run and survived everything before this step existed.
+  echo "4b) query-log (assert the tag varies by tool — mcp.neighbors, not just mcp.recall)…"
+  tags=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    tags=$(curl -sf -m10 "$URL/query-log?limit=50" | jq -r --arg n "$NONCE" \
+      '[.entries[]? | select(.query | contains($n)) | .endpoint] | unique | join(",")' \
+      2>/dev/null) || true
+    case "$tags" in *mcp.neighbors*) break ;; esac
+    sleep 1
+  done
+  case "$tags" in
+    *mcp.neighbors*) ;;
+    *) fail "no mcp.neighbors row for nonce '$NONCE' — tags seen: [$tags]. The endpoint tag is not derived from the tool name." ;;
+  esac
+  case "$tags" in
+    *mcp.recall*) ;;
+    *) fail "mcp.recall row vanished for nonce '$NONCE' — tags seen: [$tags]" ;;
+  esac
+  echo "   → nonce appears under two distinct tags: $tags"
 fi
 
 # --- 5) next_actions (mode-specific contract) -----------------------------------

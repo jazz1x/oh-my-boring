@@ -409,16 +409,126 @@ impl ToolOut {
     }
 }
 
+/// All MCP tool names — the single source of truth. Pinned against `mcp_tools_list()` by
+/// `quality_gate_mcp_tool_contract_is_explicit`; the endpoint-tag allowlist reads it too,
+/// so a newly added tool is logged automatically under a bounded tag.
+const MCP_TOOL_NAMES: [&str; 22] = [
+    "ask",
+    "brief",
+    "claims",
+    "classify_repo",
+    "code_index_status",
+    "code_search",
+    "code_symbol",
+    "config_get",
+    "context",
+    "corpus_status",
+    "decisions",
+    "events",
+    "forget",
+    "neighbors",
+    "next_actions",
+    "project_status",
+    "recall",
+    "remember",
+    "risks",
+    "stalled",
+    "sync",
+    "weekly_brief",
+];
+
+/// Dispatch outcome for one tools/call. `From<(i32, String)>` keeps every arm's `?`
+/// byte-identical to the pre-logging dispatch; only the unknown-tool arm is typed directly.
+enum ToolCallError {
+    UnknownTool(String),
+    Failed(i32, String),
+}
+
+impl From<(i32, String)> for ToolCallError {
+    fn from((code, message): (i32, String)) -> Self {
+        Self::Failed(code, message)
+    }
+}
+
+/// Endpoint tag for one tools/call: `mcp.<tool>` for a known tool, `mcp.unknown` otherwise.
+/// A dot, not an underscore — `_` is a SQL LIKE single-char wildcard, and six tool names
+/// collide with existing HTTP endpoint values. The tag set stays bounded: an unvalidated
+/// name is never interpolated into the tag.
+fn mcp_endpoint_tag(name: Option<&str>) -> String {
+    match name {
+        Some(name) if MCP_TOOL_NAMES.contains(&name) => format!("mcp.{name}"),
+        _ => "mcp.unknown".to_owned(),
+    }
+}
+
+/// Query text for the log row: first non-empty of a fixed key list, truncated to 500 chars.
+/// NEVER serialize the whole args object — `title`/`body` carry PII that has not passed
+/// `apply_pii_gate`, and `query_log` is exported by backup-db.sh.
+fn tool_query_arg(args: Option<&Value>) -> String {
+    let Some(args) = args else {
+        return String::new();
+    };
+    ["query", "question", "id"]
+        .iter()
+        .filter_map(|key| args.get(key).and_then(Value::as_str))
+        .find(|value| !value.is_empty())
+        .map(|value| value.chars().take(500).collect())
+        .unwrap_or_default()
+}
+
+/// Answer snippet for the log row, from either arm of the dispatch result, capped at 500 chars.
+///
+/// `Structured` results are serialized and truncated, so an MCP snippet is deliberately a
+/// NON-PARSEABLE fragment — it is for eyeballing what came back, never for machine reading.
+/// This reverses an earlier design note that wanted structured outcomes reduced to a bare
+/// "ok"; the fragment carries real diagnostic value (which fields came back) and the column
+/// is named `answer_snippet`, not `answer`. Recorded here because the reversal happened at
+/// the plan→contract seam without being written down, and a later reader would otherwise
+/// find the two documents contradicting each other.
+fn tool_outcome_snippet(out: &Result<ToolOut, ToolCallError>) -> String {
+    let raw = match out {
+        Ok(ToolOut::Text(text)) => text.clone(),
+        Ok(ToolOut::Structured(value)) => serde_json::to_string(value).unwrap_or_default(),
+        Err(ToolCallError::UnknownTool(name)) => format!("unknown tool: {name}"),
+        Err(ToolCallError::Failed(code, message)) => format!("error {code}: {message}"),
+    };
+    raw.chars().take(500).collect()
+}
+
 /// tools/call dispatcher — routes by tool name. The entry point through which the agent drives the engine.
 async fn mcp_call(s: &AppState, req: &Value) -> Result<Value, (i32, String)> {
+    let started = std::time::Instant::now();
     let params = req.get("params");
-    let name = params
-        .and_then(|p| p.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
     let args = params.and_then(|p| p.get("arguments"));
+    let out = dispatch(s, name.unwrap_or_default(), args).await;
+    // ONE log site, at the dispatch: every tools/call leaves a query_log row, success or
+    // failure, tagged `mcp.<tool>` so MCP rows can never be confused with HTTP rows.
+    // Fire-and-forget — a failed write must not fail the tool call.
+    crate::serve::spawn_query_log(
+        s.store.clone(),
+        mcp_endpoint_tag(name),
+        tool_query_arg(args),
+        Vec::new(),
+        Vec::new(),
+        tool_outcome_snippet(&out),
+        started.elapsed(),
+    );
+    match out {
+        Ok(out) => Ok(out.into_result()),
+        Err(ToolCallError::UnknownTool(other)) => Err((-32602, format!("unknown tool: {other}"))),
+        Err(ToolCallError::Failed(code, message)) => Err((code, message)),
+    }
+}
+
+/// The dispatch itself, held as a Result so failures are logged too before mapping to the RPC response.
+async fn dispatch(
+    s: &AppState,
+    name: &str,
+    args: Option<&Value>,
+) -> Result<ToolOut, ToolCallError> {
     // PROSE/ACK tools → text block; STRUCTURED/GENERATIVE tools → native `structuredContent` + text fallback.
-    let out = match name {
+    Ok(match name {
         "recall" => ToolOut::Text(mcp_recall(s, args).await?),
         "remember" => ToolOut::Text(mcp_remember(s, args).await?),
         "forget" => ToolOut::Text(mcp_forget(s, args).await?),
@@ -443,9 +553,8 @@ async fn mcp_call(s: &AppState, req: &Value) -> Result<Value, (i32, String)> {
         "risks" => ToolOut::Structured(mcp_risks(s, args).await?),
         "next_actions" => ToolOut::Structured(mcp_next_actions(s, args).await?),
         "stalled" => ToolOut::Structured(mcp_stalled(s, args).await?),
-        other => return Err((-32602, format!("unknown tool: {other}"))),
-    };
-    Ok(out.into_result())
+        other => return Err(ToolCallError::UnknownTool(other.to_owned())),
+    })
 }
 
 fn code_index_store(s: &AppState) -> Result<&crate::code_index::CodeIndexStore, (i32, String)> {
@@ -1820,38 +1929,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DedupOutcome, DuplicateMatch, DuplicateReason, RememberNote, apply_pii_gate,
-        dedup_decision_event, mcp_tools_list, parse_remember_note, probable_session_duplicate,
-        should_replace_duplicate,
+        DedupOutcome, DuplicateMatch, DuplicateReason, MCP_TOOL_NAMES, RememberNote, ToolCallError,
+        ToolOut, apply_pii_gate, dedup_decision_event, mcp_endpoint_tag, mcp_tools_list,
+        parse_remember_note, probable_session_duplicate, should_replace_duplicate,
+        tool_outcome_snippet, tool_query_arg,
     };
     use crate::config::BoringConfig;
     use crate::frontmatter::FrontMatter;
     use serde_json::json;
-
-    const MCP_TOOL_NAMES: [&str; 22] = [
-        "ask",
-        "brief",
-        "claims",
-        "classify_repo",
-        "code_index_status",
-        "code_search",
-        "code_symbol",
-        "config_get",
-        "context",
-        "corpus_status",
-        "decisions",
-        "events",
-        "forget",
-        "neighbors",
-        "next_actions",
-        "project_status",
-        "recall",
-        "remember",
-        "risks",
-        "stalled",
-        "sync",
-        "weekly_brief",
-    ];
 
     const VECTOR_REQUIRED_TOOLS: [&str; 11] = [
         "neighbors",
@@ -1912,6 +1997,99 @@ mod tests {
     #[test]
     fn quality_gate_mcp_tool_contract_is_explicit() {
         assert_eq!(actual_tool_names(), expected_tool_names());
+    }
+
+    #[test]
+    fn quality_gate_mcp_endpoint_tags_disjoint_from_http_endpoints() {
+        // Extract every endpoint string literal from http.rs: the first string literal
+        // after each HTTP logging call site is the endpoint argument. The needle is
+        // split so this file keeps exactly ONE log-site line (contract gate).
+        let needle = concat!("spawn_", "query_log(");
+        let http = repo_file("drudge/src/serve/http.rs");
+        let mut http_endpoints = std::collections::BTreeSet::new();
+        let mut rest = http.as_str();
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            let start = rest.find('"').unwrap() + 1;
+            let end = start + rest[start..].find('"').unwrap();
+            http_endpoints.insert(rest[start..end].to_owned());
+            rest = &rest[end..];
+        }
+        // ANTI-VACUITY GUARD: if a refactor breaks the extraction above, fail loudly
+        // instead of passing while checking nothing.
+        assert!(
+            !http_endpoints.is_empty(),
+            "no HTTP endpoint literals extracted from http.rs — extraction is broken"
+        );
+        // Build the tags through the REAL tag function, so mutating the tag scheme
+        // (e.g. dropping the `mcp.` prefix) fails here on the colliding names.
+        let mcp_tags: std::collections::BTreeSet<String> = MCP_TOOL_NAMES
+            .iter()
+            .map(|tool| mcp_endpoint_tag(Some(tool)))
+            .chain(std::iter::once(mcp_endpoint_tag(None)))
+            .collect();
+        let collisions: Vec<_> = http_endpoints.intersection(&mcp_tags).collect();
+        assert!(
+            collisions.is_empty(),
+            "MCP endpoint tags collide with HTTP endpoints: {collisions:?}"
+        );
+    }
+
+    #[test]
+    fn quality_gate_mcp_endpoint_tag_is_bounded() {
+        assert_eq!(mcp_endpoint_tag(Some("recall")), "mcp.recall");
+        assert_eq!(mcp_endpoint_tag(Some("stalled")), "mcp.stalled");
+        // Unknown/missing/malicious names never reach the tag — the set stays bounded.
+        assert_eq!(mcp_endpoint_tag(Some("not-a-tool")), "mcp.unknown");
+        assert_eq!(mcp_endpoint_tag(Some("mcp.recall")), "mcp.unknown");
+        assert_eq!(mcp_endpoint_tag(Some("'; DROP TABLE--")), "mcp.unknown");
+        assert_eq!(mcp_endpoint_tag(Some("")), "mcp.unknown");
+        assert_eq!(mcp_endpoint_tag(None), "mcp.unknown");
+    }
+
+    #[test]
+    fn quality_gate_tool_query_arg_uses_fixed_allowlist() {
+        // A remember-shaped args object logs "": title/body carry PII that has not passed
+        // the PII gate and must never reach query_log (backup-db.sh exports it).
+        let remember_args =
+            json!({"title": "secret title", "body": "secret body", "origin": "personal"});
+        assert_eq!(tool_query_arg(Some(&remember_args)), "");
+        assert_eq!(tool_query_arg(None), "");
+        assert_eq!(tool_query_arg(Some(&json!({}))), "");
+        assert_eq!(
+            tool_query_arg(Some(&json!({"query": "find this"}))),
+            "find this"
+        );
+        // First non-empty of query/question/id, in that order.
+        assert_eq!(
+            tool_query_arg(Some(&json!({"query": "", "question": "q?"}))),
+            "q?"
+        );
+        assert_eq!(
+            tool_query_arg(Some(&json!({"id": "wiki-0001"}))),
+            "wiki-0001"
+        );
+        // Truncated to 500 chars.
+        let long = "x".repeat(600);
+        assert_eq!(tool_query_arg(Some(&json!({"query": long}))).len(), 500);
+    }
+
+    #[test]
+    fn quality_gate_tool_outcome_snippet_covers_both_arms() {
+        let ok_text: Result<ToolOut, ToolCallError> = Ok(ToolOut::Text("answer text".to_owned()));
+        assert_eq!(tool_outcome_snippet(&ok_text), "answer text");
+        let ok_structured: Result<ToolOut, ToolCallError> =
+            Ok(ToolOut::Structured(json!({"a": 1})));
+        assert_eq!(tool_outcome_snippet(&ok_structured), "{\"a\":1}");
+        // Failures are logged too — "this tool always errors" must be visible.
+        let failed: Result<ToolOut, ToolCallError> =
+            Err(ToolCallError::Failed(-32603, "db down".to_owned()));
+        assert_eq!(tool_outcome_snippet(&failed), "error -32603: db down");
+        let unknown: Result<ToolOut, ToolCallError> =
+            Err(ToolCallError::UnknownTool("nope".to_owned()));
+        assert_eq!(tool_outcome_snippet(&unknown), "unknown tool: nope");
+        let big: Result<ToolOut, ToolCallError> = Ok(ToolOut::Text("y".repeat(600)));
+        assert_eq!(tool_outcome_snippet(&big).len(), 500);
     }
 
     #[test]
