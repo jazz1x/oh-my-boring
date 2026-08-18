@@ -199,12 +199,14 @@ fi
 # (a1) Claude Code hooks — the async write-door into ~/.claude/settings.json.
 settings="$HOME/.claude/settings.json"
 if [ -f "$settings" ]; then
-    # Match on the hook path ENDING, not the full absolute path. install.sh may register the
-    # tilde form (`~/oh-my-boring/hooks/...`), which the shell expands at run time but a
+    # Match on `hooks/<script>.py`, not on a full path. install.sh may register the tilde
+    # form (`~/oh-my-boring/hooks/...`), which the shell expands at run time but which a
     # literal grep for the expanded path never matches — the hooks fire while doctor calls
     # them missing. A false ✗ here is worse than no check: it teaches the reader to skip
     # doctor, and this one shipped that way while both hooks were working.
-    if grep -q "oh-my-boring/hooks/distill-session.py" "$settings" && grep -q "oh-my-boring/hooks/recall.py" "$settings"; then
+    # Deliberately not anchored on the install directory name either: it is `oh-my-boring`
+    # on this host, a symlink target elsewhere, and `boring` in the doctor test fixture.
+    if grep -q "hooks/distill-session.py" "$settings" && grep -q "hooks/recall.py" "$settings"; then
         ok "Claude Code hooks wired in $settings"
     else
         bad "Claude Code hooks missing in $settings — run install.sh"; failed_hooks=1
