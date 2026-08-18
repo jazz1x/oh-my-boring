@@ -448,6 +448,17 @@ pub(crate) struct SyncResp {
     pub(crate) ingest_new: usize,
     pub(crate) ingest_updated: usize,
     pub(crate) ingest_deleted: usize,
+    /// Notes the walk reached but did not ingest. Non-zero means the corpus is smaller than the
+    /// vault and the difference is NOT visible anywhere else — `new/updated/deleted` all stay
+    /// consistent while notes go missing. On 2026-08-14 three real notes vanished this way and
+    /// the only reason it was caught was a manual file-vs-DB diff.
+    pub(crate) ingest_skipped: usize,
+    /// Notes that errored on parse/ingest. The sync deliberately does not abort (resilience),
+    /// so this is the only signal that it happened.
+    pub(crate) ingest_failed: usize,
+    /// Notes whose frontmatter was rewritten on disk before re-ingesting. A silent mutation of
+    /// the user's files, so it is reported even when it succeeded.
+    pub(crate) ingest_repaired: usize,
     pub(crate) ingest_chunks: usize,
     pub(crate) graph_tools: usize,
     pub(crate) graph_concepts: usize,
