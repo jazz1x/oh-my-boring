@@ -285,10 +285,7 @@ async fn main() -> Result<()> {
             println!("'{query}' → {} hits", hits.len());
             for h in &hits {
                 let snip: String = h.content.chars().take(50).collect();
-                let kind_label = match h.dist_kind {
-                    store::DistKind::VectorCosine => "vector_cosine",
-                    store::DistKind::TextRank => "text_rank",
-                };
+                let kind_label = h.dist_kind.as_str();
                 println!(
                     "  [dist={:.4} {kind_label}] [{}/{}] {} — {snip}",
                     h.dist, h.origin, h.project, h.id

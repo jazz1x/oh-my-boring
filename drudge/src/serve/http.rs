@@ -18,7 +18,7 @@ use crate::serve::{
     QueryLogReq, QueryLogResp, SearchHit, SearchResp, StalledReq, SyncResp, SyncState,
     count_wiki_notes, spawn_query_log, vector_disabled,
 };
-use crate::store::EventLogFilter;
+use crate::store::{EventLogFilter, LoggedHit};
 
 const EVENT_LOG_MAX_LIMIT: i64 = 1000;
 const EVENT_INGEST_MAX_BATCH: usize = 100;
@@ -65,7 +65,7 @@ pub(crate) async fn handle_ask(
         s.store.clone(),
         "ask",
         req.question,
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -87,7 +87,7 @@ pub(crate) async fn handle_brief(State(s): State<AppState>) -> Result<Json<AskRe
         s.store.clone(),
         "brief",
         String::new(),
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -111,7 +111,7 @@ pub(crate) async fn handle_weekly(
         s.store.clone(),
         "weekly",
         String::new(),
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -136,7 +136,7 @@ pub(crate) async fn handle_project_status(
         s.store.clone(),
         "status",
         req.project.clone(),
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -167,7 +167,7 @@ pub(crate) async fn handle_decisions(
         s.store.clone(),
         "decisions",
         req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -198,7 +198,7 @@ pub(crate) async fn handle_risks(
         s.store.clone(),
         "risks",
         req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -229,7 +229,7 @@ pub(crate) async fn handle_next_actions(
         s.store.clone(),
         "next_actions",
         req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -261,7 +261,7 @@ pub(crate) async fn handle_stalled(
         s.store.clone(),
         "stalled",
         req.project.clone().unwrap_or_default(),
-        out.sources.clone(),
+        LoggedHit::without_distances(out.sources.clone()),
         out.sources.clone(),
         out.answer.chars().take(280).collect(),
         started.elapsed(),
@@ -356,12 +356,18 @@ pub(crate) async fn handle_search(
             })
             .collect()
     };
-    let hit_paths: Vec<String> = mapped.iter().map(|h| h.source_path.clone()).collect();
+    let hits: Vec<LoggedHit> = mapped
+        .iter()
+        .map(|h| match (h.dist, h.dist_kind) {
+            (Some(dist), Some(kind)) => LoggedHit::with_distance(h.source_path.clone(), dist, kind),
+            _ => LoggedHit::without_distance(h.source_path.clone()),
+        })
+        .collect();
     spawn_query_log(
         s.store.clone(),
         "search",
         req.query.clone(),
-        hit_paths,
+        hits,
         vec![],
         mapped
             .first()
@@ -388,7 +394,7 @@ pub(crate) async fn handle_graph(
         s.store.clone(),
         "graph",
         req.query.clone(),
-        hit,
+        LoggedHit::without_distances(hit),
         vec![],
         out.hit.chars().take(200).collect(),
         started.elapsed(),

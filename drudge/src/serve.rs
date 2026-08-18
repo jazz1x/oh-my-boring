@@ -25,7 +25,7 @@ use crate::code_index::CodeIndexStore;
 use crate::config;
 use crate::llm::Llm;
 use crate::pii;
-use crate::store::Store;
+use crate::store::{LoggedHit, Store};
 use crate::wiki_recall;
 
 mod http;
@@ -258,7 +258,7 @@ pub(crate) fn spawn_query_log(
     store: Option<Arc<Store>>,
     endpoint: impl Into<String>,
     query: String,
-    hit_paths: Vec<String>,
+    hits: Vec<LoggedHit>,
     sources: Vec<String>,
     answer_snippet: String,
     elapsed: std::time::Duration,
@@ -273,7 +273,7 @@ pub(crate) fn spawn_query_log(
             .log_query(
                 &endpoint,
                 &query,
-                &hit_paths,
+                &hits,
                 &sources,
                 &answer_snippet,
                 latency_ms,
