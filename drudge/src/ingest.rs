@@ -331,9 +331,15 @@ pub async fn ingest_file_with<C: Chunker, G: GraphExtractor>(
     stats: &mut Stats,
 ) -> Result<FileOutcome> {
     // IO boundary: non-UTF8 etc. are gracefully skipped (not a domain fallback).
-    let Ok(data) = std::fs::read_to_string(path) else {
-        stats.skipped += 1;
-        return Ok(FileOutcome::Skipped);
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(e) => {
+            // Say which note and why. A silent skip here is indistinguishable from "the file was
+            // never there": `new/updated/deleted` stay consistent while the note goes missing.
+            eprintln!("[ingest] skipped unreadable note {path}: {e}");
+            stats.skipped += 1;
+            return Ok(FileOutcome::Skipped);
+        }
     };
     let data = strip_nul(&data);
 
@@ -355,6 +361,9 @@ pub async fn ingest_file_with<C: Chunker, G: GraphExtractor>(
     let (front, body) = frontmatter::parse(&data, path, cfg)?;
     let pieces = C::default().chunk(body.trim());
     if pieces.iter().all(|p| p.trim().is_empty()) {
+        // Expected for placeholder notes (empty daily-briefs), but it must still be named —
+        // otherwise a note that lost its body is indistinguishable from one that never had one.
+        eprintln!("[ingest] skipped note with no chunkable body {path}");
         stats.skipped += 1;
         return Ok(FileOutcome::Skipped);
     }
