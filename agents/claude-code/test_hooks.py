@@ -346,7 +346,7 @@ class DistillExitCodeTests(unittest.TestCase):
                 rc = distill.main()
 
             self.assertEqual(rc, 1)
-            mark.assert_called_once_with("abc", retry=True)
+            mark.assert_called_once_with("abc", retry=True, reason="remember failed")
             self.assertIn("remember failed", stderr.getvalue())
         finally:
             os.unlink(path)

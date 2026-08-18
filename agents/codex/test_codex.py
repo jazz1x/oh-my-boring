@@ -79,7 +79,7 @@ def test_large_raw_parse_short_marks_retry():
         rc, err, mark = _run_main(payload, "too short")
         assert rc == 1
         assert "marked for retry" in err
-        mark.assert_called_once_with("codex-abc", retry=True)
+        mark.assert_called_once_with("codex-abc", retry=True, reason="remember failed")
     finally:
         os.unlink(path)
 

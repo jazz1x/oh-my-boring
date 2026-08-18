@@ -90,7 +90,7 @@ def main() -> int:
         print("[omb-distill] remembered", file=sys.stderr)
         return 0
     else:
-        _mark(session_id, retry=True)
+        _mark(session_id, retry=True, reason="remember failed")
         print("[omb-distill] remember failed; marked for retry", file=sys.stderr)
         return 1
 

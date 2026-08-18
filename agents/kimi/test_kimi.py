@@ -188,7 +188,7 @@ def test_distill_remember_failure_returns_nonzero_and_marks_retry():
 
     assert captured.getvalue() == ""
     assert rc == 1
-    mark.assert_called_once_with("session_abc", retry=True)
+    mark.assert_called_once_with("session_abc", retry=True, reason="remember failed")
     assert "remember failed" in stderr.getvalue()
 
 

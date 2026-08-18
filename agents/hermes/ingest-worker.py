@@ -256,7 +256,10 @@ def _reconcile():
                 "attempts without observable confirmation — leaving retry marker; not marking done.",
                 file=sys.stderr,
             )
-            markers.mark_retry(sid)
+            markers.mark_retry(
+                sid,
+                reason=f"wiki-first: {MAX_WIKI_ATTEMPTS} attempts without observable confirmation",
+            )
             markers.remove_pending(sid)
             _log_worker_event(
                 "ingest_reconcile",
