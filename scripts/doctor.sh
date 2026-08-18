@@ -58,6 +58,8 @@ failed_freshness=0
 
 ok()   { echo "✓ $1"; }
 bad()  { echo "✗ $1"; }
+# Non-fatal: something worth acting on that does not mean the write door is shut.
+warn() { echo "! $1"; }
 
 log_doctor_event() {
     status="$1"
@@ -212,6 +214,22 @@ fi
 if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$BORING_URL/health" 2>/dev/null)" = "200" ]; then
     if check_drudge_db_healthy "$BORING_URL"; then
         ok "engine /health 200 ($BORING_URL) — write door reachable"
+        # (a2b) deploy drift — merging is not deploying. On 2026-08-14 ten merged PRs were
+        # not running: the image predated them and nobody noticed for two days. Compare what
+        # the container says it was built from against the checkout, by sha and not by
+        # timestamp — a timestamp answers "when", never "what", and gets timezones wrong.
+        running_sha="$(curl -sf -m5 "$BORING_URL/health" 2>/dev/null \
+            | sed -n 's/.*"build_sha":"\([0-9a-f]*\)".*/\1/p')"
+        head_sha="$(git -C "$BORING_HOME" rev-parse HEAD 2>/dev/null || true)"
+        if [ -z "$running_sha" ]; then
+            warn "engine reports no build_sha — image predates the stamp, or was built without it. Rebuild with 'make build' to make drift detectable."
+        elif [ -z "$head_sha" ]; then
+            warn "cannot read HEAD at $BORING_HOME — drift not checked (engine is running ${running_sha%%????????*}…)"
+        elif [ "$running_sha" = "$head_sha" ]; then
+            ok "engine runs the checked-out commit ($(printf '%.8s' "$running_sha"))"
+        else
+            warn "DEPLOY DRIFT — engine runs $(printf '%.8s' "$running_sha"), checkout is at $(printf '%.8s' "$head_sha"). Merged work is not live until 'make build' + restart."
+        fi
     else
         bad "engine /health 200 but postgres is degraded ($BORING_URL) — distilled sessions are being DROPPED"; failed_engine=1
         drudge_down=1

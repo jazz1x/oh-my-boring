@@ -27,8 +27,8 @@ down: ## Stop the whole stack, including Postgres when vector mode was used (kee
 	  *) $(COMPOSE) down ;; \
 	esac
 
-build: ## Build images
-	$(COMPOSE) build
+build: ## Build images (stamps the image with the current commit; see /health build_sha)
+	BUILD_SHA=$$(git rev-parse HEAD 2>/dev/null || true) $(COMPOSE) build
 
 logs: ## engine logs
 	$(COMPOSE) logs -f boring-drudge
