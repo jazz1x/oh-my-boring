@@ -219,8 +219,7 @@ make readiness
 | `CODEX_DISTILL_CLAMP` | Codex セッション向けの同じ値。`INGEST_CLAMP`、次に `12000` |
 | `KIMI_DISTILL_CLAMP` | Kimi Code セッション向けの同じ値。`INGEST_CLAMP`、次に `12000` |
 | `DISTILL_BACKSTOP_CLAMP` | 呼び出し側が clamp せずに渡した場合だけ効く最終上限（`48000`）。上の 3 つのデフォルトより意図的に高く置き、そのいずれかを上げたときに黙って切り戻されないようにしています。ここに掛かった場合はどのノブを上げるべきかをログに出します |
-| `RECALL_RELEVANCE_MAX_DIST` | 取得した hit を主題外と判定する cosine 距離の上限（`0.514`）。`vector_cosine` のみを比較し、`text_rank` の hit や距離を持たない hit はこの値で判定しません |
-| `RECALL_RELEVANCE_ENFORCE` | `1` で上限が実際に hit を破棄します。**既定はオフ** — 出荷値が正解を捨てるためです（コーパスが実際に扱う内容の言い換えが `0.5278`、扱っていない話題が `0.4642`）。`data/eval` が代替メカニズムを採点できるようになるまではオフのままにします |
+| `RECALL_RELEVANCE_MAX_DIST` | 取得した hit が主題からどれだけ外れているかを*測る*ための cosine 距離の上限（`0.514`）。この値で破棄することはありません — スカラー 1 つでは 2 つのクラスを分離できません（`data/eval` のバンドが重なり、`0.514` はライブ注入 23 件のうち 47.8% を捨てる値でした）。よって支払う代わりに報告だけします。`vector_cosine` のみを比較し、`text_rank` の hit や距離を持たない hit はこの値で判定しません |
 | `BORING_EVENT_LOG` | ローカル NDJSON fallback スプール。デフォルトは `~/.cache/oh-my-boring/events.ndjson` |
 | `BORING_EVENT_SINK` | イベント sink モード: `db`(デフォルト)、`spool`、`both`。`db` はエンジン DB に先に書き、失敗時だけスプールします |
 | `BORING_EVENT_SPOOL` | fallback スプールポリシー: `on_failure`(DB 利用時のデフォルト)、`always`、`off` |
@@ -398,8 +397,10 @@ curl -s -X POST http://localhost:7700/mcp \
 - MCP `recall` は `max_tokens`、`max_results` を受け取ります。
 - HTTP `/search` は `max_tokens`、`max_results` を受け取ります。
 - `recall.py` は `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS` で注入 context を制限します。
-- `recall.py` は各 hit を `RECALL_RELEVANCE_MAX_DIST` で採点し、**捨てるはずだったもの**を stderr に
-  記録します。`RECALL_RELEVANCE_ENFORCE=1` でない限り実際には何も捨てません（理由は変数表を参照）。
+- `recall.py` は各 hit を `RECALL_RELEVANCE_MAX_DIST` で採点し、**フィルタが捨てていたもの**を stderr に
+  記録します。実際に捨てる経路はなく、有効化スイッチも存在しません（理由は変数表を参照）。再導入は
+  両面 predicate が `data/eval` を通過した場合のみです（false_drop 0/22、false_pass 2/6 以下、その値を
+  調整したコミットとは別のコミットで）。
 - `/search` の各 hit は、比較可能な値がある場合に `dist` と `dist_kind`（`vector_cosine` または
   `text_rank`）を返します。wiki-recall フォールバック経路は、比較できない 3 つ目の尺度をスコアとして
   出す代わりに、両フィールドを省略します。
