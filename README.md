@@ -219,8 +219,7 @@ The model ids must match what LM Studio reports. `make verify-llm` also calls `/
 | `CODEX_DISTILL_CLAMP` | same, for Codex sessions; falls back to `INGEST_CLAMP`, then `12000` |
 | `KIMI_DISTILL_CLAMP` | same, for Kimi Code sessions; falls back to `INGEST_CLAMP`, then `12000` |
 | `DISTILL_BACKSTOP_CLAMP` | last-resort ceiling (`48000`) applied only when a caller passes unclamped text. It sits well above the three defaults on purpose, so raising one of them is not silently undone; hitting it logs which knob to raise instead |
-| `RECALL_RELEVANCE_MAX_DIST` | cosine-distance ceiling above which a recalled hit is considered off-topic (`0.514`). Only compares `vector_cosine` distances; a `text_rank` hit or one with no distance is never judged by it |
-| `RECALL_RELEVANCE_ENFORCE` | `1` makes the ceiling actually drop hits. **Off by default** — the ceiling is measured and logged but discards nothing, because the shipped value drops correct answers (a paraphrase of covered work scores `0.5278` while an uncovered topic scores `0.4642`). Leave it off until `data/eval` can score a replacement |
+| `RECALL_RELEVANCE_MAX_DIST` | cosine-distance ceiling used to *measure* how off-topic a recalled hit is (`0.514`). Nothing is ever discarded on it — a scalar cannot separate the two classes (the `data/eval` bands overlap, and `0.514` would have discarded 47.8% of 23 live injections), so recall reports the cost instead of paying it. Only compares `vector_cosine` distances; a `text_rank` hit or one with no distance is never judged by it |
 | `BORING_EVENT_LOG` | local NDJSON fallback spool; defaults to `~/.cache/oh-my-boring/events.ndjson` |
 | `BORING_EVENT_SINK` | event sink mode: `db` (default), `spool`, or `both`. `db` writes the engine DB first and spools only on failure |
 | `BORING_EVENT_SPOOL` | fallback spool policy: `on_failure` (default when DB is enabled), `always`, or `off` |
@@ -447,9 +446,10 @@ Automatic retrieval can explode an agent's context window, so the retrieval surf
 - MCP `ask` and HTTP `/ask` accept `project` and `since_hours` to narrow retrieval.
 - `/context` caps each section at `max_items` (default 5) and needs no vector search.
 - `recall.py` caps its prompt-injection context via `RECALL_MAX_TOKENS` / `RECALL_MAX_RESULTS`.
-- `recall.py` also scores each hit against `RECALL_RELEVANCE_MAX_DIST` and reports what it *would*
-  drop on stderr. It discards nothing unless `RECALL_RELEVANCE_ENFORCE=1`; see the variable table
-  for why that is off.
+- `recall.py` also scores each hit against `RECALL_RELEVANCE_MAX_DIST` and reports what a filter
+  *would* have dropped on stderr. It never discards a hit — there is no enforcement switch; see the
+  variable table for why. Enforcement can only return behind a two-sided predicate that clears
+  `data/eval` (false_drop 0/22, false_pass ≤ 2/6) in a commit other than the one that tuned it.
 - `ask`/`brief` synthesis keeps retrieved context under a fixed character ceiling.
 
 ### Other agents

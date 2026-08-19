@@ -59,11 +59,13 @@ def source_ids(hits):
     return out
 
 
-def is_dropped(hit):
-    """True if enforcing the shipped ceiling would discard this hit.
+def over_ceiling(hit):
+    """True if a filter on the shipped ceiling would have discarded this hit.
 
     This is `recall_core.exceeds_relevance_ceiling` itself, not a copy of it — the point of
-    the gate is to score the predicate the agents actually run.
+    the gate is to score the predicate the agents actually run. Recall discards nothing on that
+    ceiling, so this measures the cost of a filter that does not exist yet, which is the whole
+    reason the numbers below are worth printing.
     """
     return exceeds_relevance_ceiling(hit)
 
@@ -104,7 +106,7 @@ def main():
             mrr_sum += 1.0 / rank
             if isinstance(hit.get("dist"), (int, float)):
                 positive_dists.append(float(hit["dist"]))
-            if is_dropped(hit):
+            if over_ceiling(hit):
                 false_drop += 1
                 print(
                     f"{query!r} -> rank={rank} ids={ids} "
@@ -121,8 +123,8 @@ def main():
 
     # Two-sided relevance pass: negatives are queries that should be suppressed by
     # a working relevance filter. A false_pass is a negative where at least one hit
-    # survives the filter. With RELEVANCE_ENFORCE off by default this does not gate
-    # the build; it reports the error rate a future threshold/mechanism must beat.
+    # would survive the ceiling. Recall enforces nothing, so this gates no build; it
+    # reports the error rate a future two-sided mechanism has to beat.
     false_pass = 0
     negative_dists: list[float] = []
     for neg in negatives:
@@ -131,7 +133,7 @@ def main():
         near = [float(h["dist"]) for h in hits if isinstance(h.get("dist"), (int, float))]
         if near:
             negative_dists.append(min(near))
-        surviving = [h for h in hits if not is_dropped(h)]
+        surviving = [h for h in hits if not over_ceiling(h)]
         if surviving:
             false_pass += 1
             ids = source_ids(surviving)
@@ -180,12 +182,15 @@ def main():
         )
 
     # The gate's original exit condition is preserved and no new failing condition is added.
-    # Not because these numbers cannot fail a build — is_dropped() ignores RELEVANCE_ENFORCE,
-    # so false_drop is a real forced-ON measurement, not zero by construction — but because
-    # nobody has yet characterised them on this fixture corpus. A bound picked in the same
-    # commit that first measures the quantity encodes today's accident as tomorrow's contract,
-    # which is exactly how the 0.514 ceiling this gate exists to judge came to be. Run it,
-    # read the numbers over a few commits, then choose a bound in a contract of its own.
+    # false_drop/false_pass here are real forced-ON measurements of a filter recall does not
+    # run: `over_ceiling` scores the predicate directly, so the numbers are not zero by
+    # construction. They gate nothing because a single distance scalar has already been ruled
+    # out as the mechanism — the bands above overlap, so no value of it can score both rates
+    # at once (see agents/shared/recall_core.py). This gate is the bar for the replacement:
+    # a two-sided predicate has to reach false_drop 0/22 and false_pass <= 2/6 in a commit
+    # other than the one that tuned it. A bound picked in the same commit that first measures
+    # the quantity encodes today's accident as tomorrow's contract — that is exactly how the
+    # 0.514 ceiling came to be.
     if recall_at_k < n:
         print("eval gate: FAIL")
         sys.exit(1)

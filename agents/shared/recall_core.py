@@ -39,22 +39,24 @@ SESSION_THROTTLE_SECONDS = int(os.environ.get("RECALL_SESSION_THROTTLE_SECONDS")
 # since the absolute scale is a property of bge-m3, not of the notes.
 RELEVANCE_MAX_DIST = float(os.environ.get("RECALL_RELEVANCE_MAX_DIST") or "0.514")
 
-# Shadow by default: the ceiling above is computed and reported on every recall, but nothing is
-# discarded unless this is explicitly turned on. The threshold has never actually run — the
-# deployed engine predates the field it reads — and an adversarial review reproduced both error
-# types against the live corpus: a paraphrase of work the vault *does* cover scored 0.5278 and
-# would be dropped even though its top hit was the correct note, while an uncovered topic scored
-# 0.4642 and would be injected with unrelated notes. Both classes sit inside the band the
-# calibration declared empty, because the calibration queries were written by the same person who
-# chose the constant. Enforcing on that basis would silently delete real recall.
-# Shadow mode keeps the measurement running against real traffic — the sample the calibration
-# never had — and `data/eval` is where the replacement mechanism has to prove itself before this
-# flips. Set RECALL_RELEVANCE_ENFORCE=1 to enforce.
-RELEVANCE_ENFORCE = (os.environ.get("RECALL_RELEVANCE_ENFORCE") or "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# Nothing is ever discarded on this ceiling. It is an instrument, not a filter, and there is no
+# knob to flip — three independent measurements say a single cosine scalar cannot separate the two
+# classes at any value:
+#   - both error types reproduce inside the band the calibration above declared empty: a paraphrase
+#     of work the vault *does* cover scored 0.5278 (its top hit was the correct note) while an
+#     uncovered topic scored 0.4642. The calibration queries were written by whoever picked 0.514.
+#   - the data/eval bands overlap outright — nearest negative 0.4073 below furthest positive
+#     0.5146 — so every threshold between them commits both errors on the golden set.
+#   - 23 live top-hit distances (docs/reports/2026-08-15-program-audit.md) put 47.8% of real
+#     injections above 0.514. Enforcing it would have deleted nearly half of production recall.
+# Waiting for more live traffic cannot settle it: query_log persists hit_dists but no correctness
+# label (drudge/src/store.rs), so a larger sample sharpens the histogram and still never says which
+# of those drops would have been wrong. Enforcement can only return behind a two-sided predicate —
+# distance AND a corroborating signal, e.g. a text_rank sibling or the hit-1/hit-2 gap — that scores
+# false_drop 0/22 and false_pass <= 2/6 on data/eval in a commit other than the one that tuned it.
+# The asymmetry is why reporting is the safe default: a hit kept in error costs one 280-char snippet
+# behind the injection fence below, while a hit dropped in error silently deletes the recall this
+# system exists to provide.
 
 
 def exceeds_relevance_ceiling(hit: dict) -> bool:
@@ -66,9 +68,9 @@ def exceeds_relevance_ceiling(hit: dict) -> bool:
     scores the filter with it, so a copy there would let the instrument and the shipped
     behaviour drift apart while the gate kept reporting green.
 
-    Note this answers "is it over the ceiling", not "will it be discarded" — discarding is
-    gated separately on RELEVANCE_ENFORCE, which is off. The eval gate wants the former: it
-    measures what enforcement *would* cost.
+    Note this answers "is it over the ceiling", not "will it be discarded" — nothing discards on
+    this ceiling (see the constant above). That is exactly what the eval gate wants: it measures
+    what enforcing *would* cost.
     """
     dist = hit.get("dist")
     return (
@@ -151,29 +153,25 @@ def run_recall(
         return
 
     lines = []
-    shadow_drops = []
+    over_ceiling = []
     for h in hits[:MAX_RESULTS]:
         dist = h.get("dist")
+        src = (h.get("source_path") or "").rsplit("/", 1)[-1]
         # Only "vector_cosine" is a distance (lower = closer) — "text_rank" and "missing" are not
         # comparable to RELEVANCE_MAX_DIST, so they are never judged by it (see the constant above).
-        over = exceeds_relevance_ceiling(h)
-        src = (h.get("source_path") or "").rsplit("/", 1)[-1]
-        if over:
-            shadow_drops.append((src, dist))
-            if RELEVANCE_ENFORCE:
-                continue
+        if exceeds_relevance_ceiling(h):
+            over_ceiling.append((src, dist))
         snip = " ".join((h.get("snippet") or "").split())[:280]
         if snip:
             lines.append(f"- [{src}] {snip}")
-    if shadow_drops:
-        # Every drop is reported, enforcing or not. A relevance filter that discards silently
-        # cannot be audited: an over-tight threshold looks exactly like "the vault had nothing",
-        # and that is not hypothetical — the 0.514 ceiling was measured against self-written
-        # queries and drops a paraphrase of covered work (0.5278) whose top hit is the right note.
-        verb = "dropped" if RELEVANCE_ENFORCE else "would drop"
-        detail = ", ".join(f"{s}@{d:.4f}" for s, d in shadow_drops)
+    if over_ceiling:
+        # The hit is kept and the measurement is printed anyway. This line is the only record of
+        # what a filter on this ceiling would have cost, and it has to keep coming from real
+        # traffic: a too-tight threshold looks exactly like "the vault had nothing", which is how
+        # 0.514 survived on self-written calibration queries as long as it did.
+        detail = ", ".join(f"{s}@{d:.4f}" for s, d in over_ceiling)
         print(
-            f"[omb-recall] {verb} {len(shadow_drops)}/{len(hits[:MAX_RESULTS])} over "
+            f"[omb-recall] would drop {len(over_ceiling)}/{len(hits[:MAX_RESULTS])} over "
             f"dist {RELEVANCE_MAX_DIST}: {detail}",
             file=sys.stderr,
         )
