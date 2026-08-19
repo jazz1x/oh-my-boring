@@ -11,8 +11,19 @@ make_fake_path() {
 
     cat >"$fakebin/curl" <<'SH'
 #!/bin/sh
+# Two shapes of /health call in doctor.sh: the status probe (-w %{http_code}) and the body read
+# that carries build_sha. Answering only the first is what left the drift check untestable.
 case " $* " in
-  *" -w %{http_code} "*) printf 200 ;;
+  *" -w %{http_code} "*) printf 200; exit 0 ;;
+esac
+case " $* " in
+  *"/health"*)
+    if [ -n "${DOCTOR_BUILD_SHA:-}" ]; then
+        printf '{"status":"ok","build_sha":"%s"}' "$DOCTOR_BUILD_SHA"
+    else
+        printf '{"status":"ok"}'
+    fi
+    ;;
 esac
 exit 0
 SH
@@ -98,6 +109,19 @@ fi
 echo "verify-llm ok"
 SH
     chmod +x "$boring/scripts/verify-llm.sh"
+}
+
+# doctor compares the engine's build_sha against `git -C "$BORING_HOME" rev-parse HEAD`, so a
+# fixture that is not a repo can only ever reach the "cannot read HEAD" branch. This makes the
+# case a one-commit repo and prints the sha the assertions compare against.
+make_case_repo() {
+    case_dir="$1"
+    make_case "$case_dir" yes
+    git init -q "$case_dir/boring"
+    git -C "$case_dir/boring" \
+        -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false \
+        commit -q --allow-empty -m "fixture head"
+    git -C "$case_dir/boring" rev-parse HEAD
 }
 
 run_strict() {
@@ -214,6 +238,107 @@ case "$(cat "$TMP/invalid-ttl.out")" in
   *)
     cat "$TMP/invalid-ttl.out"
     echo "FAIL: strict doctor did not report invalid marker TTL" >&2
+    exit 1
+    ;;
+esac
+
+# (a2b) deploy drift. Merging is not deploying — ten merged PRs ran nowhere for two days once.
+# The check only warns, so nothing but these assertions can tell it from a deleted block.
+make_case "$TMP/build-sha-absent" yes
+if ! run_strict "$TMP/build-sha-absent" "$TMP/build-sha-absent.out"; then
+    cat "$TMP/build-sha-absent.out"
+    echo "FAIL: a missing build_sha is a warning, not a strict failure" >&2
+    exit 1
+fi
+case "$(cat "$TMP/build-sha-absent.out")" in
+  *"engine reports no build_sha"*) ;;
+  *)
+    cat "$TMP/build-sha-absent.out"
+    echo "FAIL: strict doctor did not report the missing build_sha" >&2
+    exit 1
+    ;;
+esac
+
+head_sha="$(make_case_repo "$TMP/build-sha-drift")"
+if ! ( DOCTOR_BUILD_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+       run_strict "$TMP/build-sha-drift" "$TMP/build-sha-drift.out" ); then
+    cat "$TMP/build-sha-drift.out"
+    echo "FAIL: deploy drift is a warning, not a strict failure" >&2
+    exit 1
+fi
+case "$(cat "$TMP/build-sha-drift.out")" in
+  *"DEPLOY DRIFT — engine runs deadbeef, checkout is at "*) ;;
+  *)
+    cat "$TMP/build-sha-drift.out"
+    echo "FAIL: strict doctor did not report deploy drift" >&2
+    exit 1
+    ;;
+esac
+case "$(cat "$TMP/build-sha-drift.out")" in
+  *"runs the checked-out commit"*)
+    cat "$TMP/build-sha-drift.out"
+    echo "FAIL: drifted engine was reported as running the checkout" >&2
+    exit 1
+    ;;
+esac
+
+matched_sha="$(make_case_repo "$TMP/build-sha-match")"
+if ! ( DOCTOR_BUILD_SHA="$matched_sha" \
+       run_strict "$TMP/build-sha-match" "$TMP/build-sha-match.out" ); then
+    cat "$TMP/build-sha-match.out"
+    echo "FAIL: strict doctor should pass when the engine runs the checkout" >&2
+    exit 1
+fi
+case "$(cat "$TMP/build-sha-match.out")" in
+  *"engine runs the checked-out commit ($(printf '%.8s' "$matched_sha"))"*) ;;
+  *)
+    cat "$TMP/build-sha-match.out"
+    echo "FAIL: strict doctor did not confirm the engine runs the checkout" >&2
+    exit 1
+    ;;
+esac
+case "$(cat "$TMP/build-sha-match.out")" in
+  *"DEPLOY DRIFT"*)
+    cat "$TMP/build-sha-match.out"
+    echo "FAIL: matching shas were reported as drift" >&2
+    exit 1
+    ;;
+esac
+
+# (a1) hook wiring. install.sh may register the tilde form, which the shell expands at run time
+# but which a grep for the expanded path never matches — doctor called working hooks missing.
+make_case "$TMP/hooks-tilde" yes
+cat >"$TMP/hooks-tilde/home/.claude/settings.json" <<'JSON'
+{"hooks":["~/oh-my-boring/hooks/distill-session.py","~/oh-my-boring/hooks/recall.py"]}
+JSON
+if ! run_strict "$TMP/hooks-tilde" "$TMP/hooks-tilde.out"; then
+    cat "$TMP/hooks-tilde.out"
+    echo "FAIL: tilde-form hook paths are wired and must not be called missing" >&2
+    exit 1
+fi
+case "$(cat "$TMP/hooks-tilde.out")" in
+  *"Claude Code hooks wired in"*) ;;
+  *)
+    cat "$TMP/hooks-tilde.out"
+    echo "FAIL: strict doctor did not recognise tilde-form hook wiring" >&2
+    exit 1
+    ;;
+esac
+
+make_case "$TMP/hooks-partial" yes
+cat >"$TMP/hooks-partial/home/.claude/settings.json" <<'JSON'
+{"hooks":["~/oh-my-boring/hooks/distill-session.py"]}
+JSON
+if run_strict "$TMP/hooks-partial" "$TMP/hooks-partial.out"; then
+    cat "$TMP/hooks-partial.out"
+    echo "FAIL: strict doctor should fail when only one hook is wired" >&2
+    exit 1
+fi
+case "$(cat "$TMP/hooks-partial.out")" in
+  *"Claude Code hooks missing in"*) ;;
+  *)
+    cat "$TMP/hooks-partial.out"
+    echo "FAIL: strict doctor did not report the half-wired hooks" >&2
     exit 1
     ;;
 esac
