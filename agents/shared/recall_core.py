@@ -37,7 +37,7 @@ SESSION_THROTTLE_SECONDS = int(os.environ.get("RECALL_SESSION_THROTTLE_SECONDS")
 # midpoint, and at that value both error rates are 0/12. Raw per-query numbers are in the commit
 # message; re-measure with the same method if the embedding model or corpus changes materially,
 # since the absolute scale is a property of bge-m3, not of the notes.
-RELEVANCE_MAX_DIST = float(os.environ.get("RECALL_RELEVANCE_MAX_DIST") or "0.514")
+RELEVANCE_MAX_DIST = float(os.environ.get("RECALL_RELEVANCE_MAX_DIST") or "0.55")
 
 # Shadow by default: the ceiling above is computed and reported on every recall, but nothing is
 # discarded unless this is explicitly turned on. The threshold has never actually run — the
