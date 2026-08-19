@@ -84,6 +84,10 @@
     {
       "query": "hot cached value missing causes many parallel threads to repeat the same expensive backend computation",
       "expect": ["eval-cache-stampede"]
+    },
+    {
+      "query": "a secret was baked into the project's recorded history",
+      "expect": ["eval-secret-in-git"]
     }
   ],
   "negatives": [
@@ -106,6 +110,10 @@
     {
       "query": "grafana alertmanager notification routing silence",
       "why": "no monitoring or alertmanager fixture"
+    },
+    {
+      "query": "postgres primary and replica both accept writes after a network partition",
+      "why": "no postgres split-brain or multi-primary fixture"
     }
   ]
 }
