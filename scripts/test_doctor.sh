@@ -49,6 +49,13 @@ case "${1:-}" in
         fi
         exit 0
     fi
+    if [ "${2:-}" = --stale-gates ]; then
+        if [ "${DOCTOR_STALE_GATES_FAIL:-0}" = 1 ]; then
+            echo "stale gate: eval_graphrag_gate last_seen_days=35"
+            exit 1
+        fi
+        exit 0
+    fi
     echo "resolution_quality recent_failures=0 log=/tmp/events.ndjson"
     exit 0
     ;;
@@ -146,7 +153,7 @@ case "$(cat "$TMP/fail/events.calls")" in
 esac
 
 make_case "$TMP/provider-fail" yes
-if DOCTOR_VERIFY_LLM_FAIL=1 run_strict "$TMP/provider-fail" "$TMP/provider-fail.out"; then
+if ( DOCTOR_VERIFY_LLM_FAIL=1 run_strict "$TMP/provider-fail" "$TMP/provider-fail.out" ); then
     cat "$TMP/provider-fail.out"
     echo "FAIL: strict doctor should fail when verify-llm fails" >&2
     exit 1
@@ -164,7 +171,7 @@ make_case "$TMP/stale-note" yes
 old_note="$TMP/stale-note/boring/vault/wiki/wiki-0001.md"
 old_epoch=$(( $(date +%s) - 7200 ))
 python3 -c 'import os, sys; os.utime(sys.argv[1], (int(sys.argv[2]), int(sys.argv[2])))' "$old_note" "$old_epoch"
-if BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/stale-note" "$TMP/stale-note.out"; then
+if ( BORING_READINESS_NOTE_MAX_HOURS=1 run_strict "$TMP/stale-note" "$TMP/stale-note.out" ); then
     cat "$TMP/stale-note.out"
     echo "FAIL: strict doctor should fail when newest note is stale" >&2
     exit 1
@@ -182,7 +189,7 @@ make_case "$TMP/stale-marker" yes
 touch "$TMP/stale-marker/home/.cache/boring-distill/stale.pending"
 old_marker_epoch=$(( $(date +%s) - 7200 ))
 python3 -c 'import os, sys; os.utime(sys.argv[1], (int(sys.argv[2]), int(sys.argv[2])))' "$TMP/stale-marker/home/.cache/boring-distill/stale.pending" "$old_marker_epoch"
-if BORING_READINESS_PENDING_TTL=60 run_strict "$TMP/stale-marker" "$TMP/stale-marker.out"; then
+if ( BORING_READINESS_PENDING_TTL=60 run_strict "$TMP/stale-marker" "$TMP/stale-marker.out" ); then
     cat "$TMP/stale-marker.out"
     echo "FAIL: strict doctor should fail when pending marker is stale" >&2
     exit 1
@@ -197,7 +204,7 @@ case "$(cat "$TMP/stale-marker.out")" in
 esac
 
 make_case "$TMP/invalid-ttl" yes
-if BORING_READINESS_PENDING_TTL=abc run_strict "$TMP/invalid-ttl" "$TMP/invalid-ttl.out"; then
+if ( BORING_READINESS_PENDING_TTL=abc run_strict "$TMP/invalid-ttl" "$TMP/invalid-ttl.out" ); then
     cat "$TMP/invalid-ttl.out"
     echo "FAIL: strict doctor should fail on invalid marker TTL" >&2
     exit 1
@@ -207,6 +214,22 @@ case "$(cat "$TMP/invalid-ttl.out")" in
   *)
     cat "$TMP/invalid-ttl.out"
     echo "FAIL: strict doctor did not report invalid marker TTL" >&2
+    exit 1
+    ;;
+esac
+
+# A gate that stopped running is the failure doctor.sh (d4b) names — silence reads as green.
+make_case "$TMP/stale-gates" yes
+if ( DOCTOR_STALE_GATES_FAIL=1 run_strict "$TMP/stale-gates" "$TMP/stale-gates.out" ); then
+    cat "$TMP/stale-gates.out"
+    echo "FAIL: strict doctor should fail when a watched gate has gone stale" >&2
+    exit 1
+fi
+case "$(cat "$TMP/stale-gates.out")" in
+  *"a watched gate has gone stale — it is not failing, it stopped running"*) ;;
+  *)
+    cat "$TMP/stale-gates.out"
+    echo "FAIL: strict doctor did not report the stale gate" >&2
     exit 1
     ;;
 esac
