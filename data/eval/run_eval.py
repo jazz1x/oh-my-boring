@@ -88,6 +88,10 @@ def main():
     recall_at_k = 0
     mrr_sum = 0.0
     false_drop = 0
+    # Distances of the hits that actually matched, so the band the positives occupy is
+    # visible on every run. Without this the gate can say "false_drop 0/21" while every
+    # positive sits far below the ceiling — true, and worth nothing for judging a bound.
+    positive_dists: list[float] = []
 
     for q in queries:
         query = q["query"]
@@ -98,6 +102,8 @@ def main():
         if rank:
             recall_at_k += 1
             mrr_sum += 1.0 / rank
+            if isinstance(hit.get("dist"), (int, float)):
+                positive_dists.append(float(hit["dist"]))
             if is_dropped(hit):
                 false_drop += 1
                 print(
@@ -118,9 +124,13 @@ def main():
     # survives the filter. With RELEVANCE_ENFORCE off by default this does not gate
     # the build; it reports the error rate a future threshold/mechanism must beat.
     false_pass = 0
+    negative_dists: list[float] = []
     for neg in negatives:
         query = neg["query"]
         hits = search(query)
+        near = [float(h["dist"]) for h in hits if isinstance(h.get("dist"), (int, float))]
+        if near:
+            negative_dists.append(min(near))
         surviving = [h for h in hits if not is_dropped(h)]
         if surviving:
             false_pass += 1
@@ -131,6 +141,36 @@ def main():
             )
         else:
             print(f"[negative] {query!r} -> suppressed ({len(hits)} hits dropped)")
+
+    # The bands themselves. false_drop/false_pass are rates; these are the distances the
+    # rates are computed over, and a rate cannot be read without them. If every positive
+    # sits far below the ceiling, false_drop is 0 by construction rather than by merit —
+    # that is exactly the state this corpus was in when the numbers below were first read.
+    if positive_dists or negative_dists:
+        print("\nDistance bands (what the rates above are computed over):")
+        if positive_dists:
+            band = sorted(positive_dists)
+            mid = band[len(band) // 2]
+            margin = RELEVANCE_MAX_DIST - band[-1]
+            print(
+                f"  positive dist: min {band[0]:.4f} / median {mid:.4f} / max {band[-1]:.4f}"
+                f"  (n={len(band)})"
+            )
+            print(
+                f"  margin to ceiling {RELEVANCE_MAX_DIST}: {margin:+.4f}"
+                f"{'  <-- no positive is near the ceiling; false_drop cannot discriminate' if margin > 0.05 else ''}"
+            )
+        if negative_dists:
+            nb = sorted(negative_dists)
+            print(
+                f"  negative dist (nearest hit): min {nb[0]:.4f} / max {nb[-1]:.4f}  (n={len(nb)})"
+            )
+        if positive_dists and negative_dists:
+            overlap = min(negative_dists) < max(positive_dists)
+            print(
+                f"  bands overlap: {overlap}"
+                f"{'  <-- distance alone cannot separate these two sets' if overlap else ''}"
+            )
 
     if negatives:
         print(f"\nRelevance filter (forced ON, max_dist={RELEVANCE_MAX_DIST}):")
