@@ -5,12 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/), versioning per [
 
 ## [Unreleased]
 
+### Added
+- **Code graph indexing** — an AST-based index over the repo, queryable through the `code_index_status`, `code_search`, and `code_symbol` MCP tools.
+- **Retrieval distance is part of the contract** — `/search` hits carry `dist` and `dist_kind`, `query_log` persists both per hit (absent stays distinguishable from `0`), and MCP tool calls are recorded with the tag that names the tool.
+- **The engine says which commit it is running** — `/health` reports `build_sha`, and `doctor` compares it against the checkout by sha, not timestamp, so a merged-but-not-deployed image is caught instead of assumed.
+- **Gates that stop running are named** — `doctor --stale-gates` fails on a watched gate that has gone silent, because a gate that stopped looks exactly like a gate that passes.
+- **The accuracy gate is two-sided** — `data/eval` scores negatives as well as positives and reports `false_drop` / `false_pass` separately, plus the distance bands those rates are computed over and whether the bands overlap.
+- **Dedup and briefing decisions are recorded** — `remember` logs every dedup decision with its margin, and the briefing reports which claim kinds went into its prompt.
+- **Distillation sees more of the session** — Claude and Codex transcripts pass a wider slice of what the session actually did to the model.
+
 ### Changed
+- **The relevance ceiling is a measurement, not a filter** — `RECALL_RELEVANCE_MAX_DIST` is still computed and reported on every recall, but nothing is discarded on it and `RECALL_RELEVANCE_ENFORCE` no longer exists. A single cosine scalar cannot separate on-topic from off-topic hits: the `data/eval` bands overlap, and on the maintainer's live corpus the shipped value would have discarded nearly half of the injections measured (23 samples). Enforcement can only return behind a two-sided predicate that clears `data/eval` in a commit other than the one that tuned it.
+- **One clamp decision per path** — each distillation entry point resolves its own clamp once, with a backstop ceiling that logs which knob to raise instead of silently undoing a raised one.
+- **Gate fixtures are mutation-verified** — the `doctor` and eval fixtures now fail when the checks they cover are deleted or reworded, which they previously did not.
+- **Dependencies refreshed**, including major versions.
 - **Project name resolution is now git-first** — distillation and ingestion derive the canonical repo slug from `git remote.origin.url` (walking up to the git root first), falling back to the working-directory folder name only when no remote exists. `boring.json` repo rules also match remote URL before cwd, so a checkout folder name never overrides the repository's configured origin.
 - **Briefing readability** — daily/weekly Slack digests are now grouped by priority (Blocked → Next → Stalled → Risks → Decisions → Done) with a short summary count, and Block Kit payloads no longer double-escape section text.
 
 ### Fixed
 - `agents/hermes/ingest-worker.py` now reuses the same git-first repo-slug logic as the session hooks instead of reading only the cwd basename.
+- **Recall no longer retrieves on text the harness wrote** — task notifications and image-only prompts are not user turns, and they were driving a large share of daily retrievals.
+- **`doctor` no longer calls working hooks missing** — hook wiring is matched on `hooks/<script>.py`, so the tilde form `install.sh` registers is recognised instead of reported as absent.
+- **Postgres connection drops are survivable** — the engine recovers from a dropped connection and says so, instead of failing writes silently.
+- **Sessions that keep failing are dead-lettered with a reason**, and Codex stops retrying sessions that have nothing to distill; double-scheduled collection is now detectable.
+- **A named section with no content is not a section** — the distillation verifier rejects it instead of accepting the heading.
+- **`sync` reports the notes it dropped** instead of counting them privately.
+- **The briefing renders the claim kinds its own prompt asks for.**
 
 ## [0.1.0] - 2026-06-30
 
