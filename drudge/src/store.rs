@@ -157,6 +157,27 @@ pub struct QueryLogRow {
     pub latency_ms: Option<i32>,
 }
 
+/// One correctness label on one hit of one logged query. `judge` distinguishes who said it.
+#[derive(Debug)]
+pub struct RecallLabelRow {
+    pub query_log_id: i32,
+    pub hit_index: i32,
+    pub judge: String,
+    pub verdict: String,
+    pub model: String,
+    pub note: String,
+}
+
+/// Label counts for one judge, plus the agreement with the other judge where both labelled the
+/// same hit. `agreed`/`compared` is the honesty check on an LLM judge: reported, never assumed.
+#[derive(Debug, Default)]
+pub struct RecallLabelStats {
+    pub judge: String,
+    pub relevant: i64,
+    pub irrelevant: i64,
+    pub unsure: i64,
+}
+
 /// One structured workflow event stored in Postgres. Shape follows the OpenTelemetry log model
 /// while preserving the legacy adapter keys used by readiness (`component`, `event`, `status`, etc.).
 #[derive(Debug)]
@@ -416,6 +437,24 @@ impl Store {
                  ALTER TABLE query_log ADD COLUMN IF NOT EXISTS hit_dists real[] NOT NULL DEFAULT '{{}}';
                  ALTER TABLE query_log ADD COLUMN IF NOT EXISTS hit_dist_kinds text[] NOT NULL DEFAULT '{{}}';
                  CREATE INDEX IF NOT EXISTS query_log_created ON query_log(created_at DESC);
+                 -- recall_label: the correctness label query_log cannot carry. A distance says how
+                 --   far a hit was, never whether it was worth injecting, so precision was
+                 --   unmeasurable and every relevance threshold was argued from distances alone.
+                 --   One row per (query_log row, hit position, judge): `llm` and `human` verdicts
+                 --   are stored SIDE BY SIDE, never overwriting each other, so their agreement rate
+                 --   is itself a measurement — an LLM judge sharing the system's embedding family
+                 --   is a biased instrument until that rate says otherwise.
+                 CREATE TABLE IF NOT EXISTS recall_label (
+                     query_log_id int NOT NULL REFERENCES query_log(id) ON DELETE CASCADE,
+                     hit_index    int NOT NULL,
+                     judge        text NOT NULL,
+                     verdict      text NOT NULL,
+                     model        text NOT NULL DEFAULT '',
+                     note         text NOT NULL DEFAULT '',
+                     created_at   timestamptz NOT NULL DEFAULT now(),
+                     PRIMARY KEY (query_log_id, hit_index, judge)
+                 );
+                 CREATE INDEX IF NOT EXISTS recall_label_created ON recall_label(created_at DESC);
                  CREATE TABLE IF NOT EXISTS event_log (
                      id               bigserial PRIMARY KEY,
                      observed_at      timestamptz NOT NULL DEFAULT now(),
@@ -1322,6 +1361,103 @@ impl Store {
                 latency_ms: r.get(9),
             })
             .collect())
+    }
+
+    /// Record one judge's verdict on one hit. Re-labelling the same (query, hit, judge) replaces
+    /// that judge's own verdict and nothing else — a human audit never silently rewrites the LLM
+    /// row it disagrees with, because the disagreement is the measurement.
+    pub async fn record_recall_label(
+        &self,
+        query_log_id: i32,
+        hit_index: i32,
+        judge: &str,
+        verdict: &str,
+        model: &str,
+        note: &str,
+    ) -> Result<()> {
+        self.db()
+            .await?
+            .execute(
+                "INSERT INTO recall_label (query_log_id, hit_index, judge, verdict, model, note)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (query_log_id, hit_index, judge)
+                 DO UPDATE SET verdict = EXCLUDED.verdict, model = EXCLUDED.model,
+                               note = EXCLUDED.note, created_at = now();",
+                &[&query_log_id, &hit_index, &judge, &verdict, &model, &note],
+            )
+            .await
+            .context("record recall label")?;
+        Ok(())
+    }
+
+    /// Labels newest-first. The sampler reads these to skip pairs it has already judged.
+    pub async fn recent_recall_labels(&self, limit: i64) -> Result<Vec<RecallLabelRow>> {
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "SELECT query_log_id, hit_index, judge, verdict, model, note
+                 FROM recall_label ORDER BY created_at DESC LIMIT $1;",
+                &[&limit],
+            )
+            .await
+            .context("recent recall labels")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RecallLabelRow {
+                query_log_id: r.get(0),
+                hit_index: r.get(1),
+                judge: r.get(2),
+                verdict: r.get(3),
+                model: r.get(4),
+                note: r.get(5),
+            })
+            .collect())
+    }
+
+    /// Per-judge verdict counts, plus how often the two judges agreed on hits both of them
+    /// labelled. `unsure` is counted, never folded into either side — an abstention is not a vote.
+    pub async fn recall_label_stats(&self) -> Result<(Vec<RecallLabelStats>, i64, i64)> {
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "SELECT judge,
+                        count(*) FILTER (WHERE verdict = 'relevant')   AS relevant,
+                        count(*) FILTER (WHERE verdict = 'irrelevant') AS irrelevant,
+                        count(*) FILTER (WHERE verdict = 'unsure')     AS unsure
+                 FROM recall_label GROUP BY judge ORDER BY judge;",
+                &[],
+            )
+            .await
+            .context("recall label stats")?;
+        let per_judge = rows
+            .into_iter()
+            .map(|r| RecallLabelStats {
+                judge: r.get(0),
+                relevant: r.get(1),
+                irrelevant: r.get(2),
+                unsure: r.get(3),
+            })
+            .collect();
+        // Agreement is computed only over pairs BOTH judges labelled with a real verdict; an
+        // `unsure` on either side is not agreement or disagreement, so it leaves the denominator.
+        let agree = self
+            .db()
+            .await?
+            .query_one(
+                "SELECT
+                   count(*) FILTER (WHERE l.verdict = h.verdict) AS agreed,
+                   count(*)                                     AS compared
+                 FROM recall_label l JOIN recall_label h
+                   ON l.query_log_id = h.query_log_id AND l.hit_index = h.hit_index
+                 WHERE l.judge = 'llm' AND h.judge = 'human'
+                   AND l.verdict <> 'unsure' AND h.verdict <> 'unsure';",
+                &[],
+            )
+            .await
+            .context("recall label agreement")?;
+        Ok((per_judge, agree.get(0), agree.get(1)))
     }
 
     /// Store adapter/workflow events in the local DB using an OpenTelemetry-shaped log row.

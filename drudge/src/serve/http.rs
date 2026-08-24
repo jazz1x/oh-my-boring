@@ -15,8 +15,9 @@ use crate::retrieve;
 use crate::serve::{
     AppError, AppState, AskReq, AskResp, CompactResp, EventIngestResp, EventLogEntry, EventLogReq,
     EventLogResp, GraphReq, GraphResp, HealthResp, MCP_MAX_RESULTS, MCP_MAX_TOKENS, QueryLogEntry,
-    QueryLogReq, QueryLogResp, SearchHit, SearchResp, StalledReq, SyncResp, SyncState,
-    count_wiki_notes, spawn_query_log, vector_disabled,
+    QueryLogReq, QueryLogResp, RecallLabelEntry, RecallLabelJudgeStats, RecallLabelReq,
+    RecallLabelStatsResp, RecallLabelsReq, RecallLabelsResp, SearchHit, SearchResp, StalledReq,
+    SyncResp, SyncState, count_wiki_notes, spawn_query_log, vector_disabled,
 };
 use crate::store::{EventLogFilter, LoggedHit};
 
@@ -431,6 +432,8 @@ pub(crate) async fn handle_query_log(
             endpoint: r.endpoint,
             query: r.query,
             hit_paths: r.hit_paths,
+            hit_dists: r.hit_dists,
+            hit_dist_kinds: r.hit_dist_kinds,
             sources: r.sources,
             answer_snippet: r.answer_snippet,
             latency_ms: r.latency_ms,
@@ -507,6 +510,92 @@ pub(crate) async fn handle_events(
         })
         .collect();
     Ok(Json(EventLogResp { entries }))
+}
+
+const RECALL_VERDICTS: [&str; 3] = ["relevant", "irrelevant", "unsure"];
+const RECALL_JUDGES: [&str; 2] = ["llm", "human"];
+
+/// Record one judge's verdict on one injected hit. Parse-don't-validate: an unknown judge or
+/// verdict is rejected at the boundary rather than stored and later averaged into a metric.
+pub(crate) async fn handle_recall_label_record(
+    State(s): State<AppState>,
+    Json(req): Json<RecallLabelReq>,
+) -> Result<Json<Value>, AppError> {
+    let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    if !RECALL_JUDGES.contains(&req.judge.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "judge must be one of {RECALL_JUDGES:?}, got {:?}",
+            req.judge
+        )));
+    }
+    if !RECALL_VERDICTS.contains(&req.verdict.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "verdict must be one of {RECALL_VERDICTS:?}, got {:?}",
+            req.verdict
+        )));
+    }
+    if req.hit_index < 0 {
+        return Err(AppError::bad_request("hit_index must be >= 0".to_string()));
+    }
+    store
+        .record_recall_label(
+            req.query_log_id,
+            req.hit_index,
+            &req.judge,
+            &req.verdict,
+            &req.model,
+            &req.note,
+        )
+        .await?;
+    Ok(Json(json!({"recorded": true})))
+}
+
+/// Existing labels, newest-first — the sampler reads these to skip what it already judged.
+pub(crate) async fn handle_recall_labels(
+    State(s): State<AppState>,
+    Query(params): Query<RecallLabelsReq>,
+) -> Result<Json<RecallLabelsResp>, AppError> {
+    let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    let limit = params.limit.clamp(1, 5000);
+    let entries = store
+        .recent_recall_labels(limit)
+        .await?
+        .into_iter()
+        .map(|r| RecallLabelEntry {
+            query_log_id: r.query_log_id,
+            hit_index: r.hit_index,
+            judge: r.judge,
+            verdict: r.verdict,
+            model: r.model,
+            note: r.note,
+        })
+        .collect();
+    Ok(Json(RecallLabelsResp { entries }))
+}
+
+/// Per-judge counts, per-judge precision, and llm/human agreement over hits both decided.
+pub(crate) async fn handle_recall_label_stats(
+    State(s): State<AppState>,
+) -> Result<Json<RecallLabelStatsResp>, AppError> {
+    let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    let (per_judge, agreed, compared) = store.recall_label_stats().await?;
+    // Counts only. Precision is one division and it belongs in exactly one place — the reporter
+    // (`agents/shared/label_core.py::precision`), which also owns the "too small to report" rule.
+    // A second definition here is how an empty sample starts rendering as 0%.
+    let judges = per_judge
+        .into_iter()
+        .map(|j| RecallLabelJudgeStats {
+            judge: j.judge,
+            relevant: j.relevant,
+            irrelevant: j.irrelevant,
+            unsure: j.unsure,
+        })
+        .collect();
+    Ok(Json(RecallLabelStatsResp {
+        judges,
+        agreed,
+        compared,
+    }))
 }
 
 /// Store one event or an `{events: [...]}` batch in the local event DB.
