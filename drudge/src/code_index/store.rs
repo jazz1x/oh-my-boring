@@ -27,8 +27,12 @@ const POOL_TIMEOUTS: Timeouts = Timeouts {
 
 impl CodeIndexStore {
     /// Connect without creating or migrating schema. Read-only commands use this path.
-    #[allow(clippy::unused_async)] // kept async to match the existing caller contract.
-    pub async fn connect(dsn: &str) -> Result<Self, CodeIndexError> {
+    ///
+    /// Not async: building a deadpool `Pool` is synchronous — the first connection is opened
+    /// lazily on `db()`. It was declared async to match its callers and carried an
+    /// `unused_async` allow, which is how it survived until a newer clippy named the same
+    /// thing again. The callers await one fewer future instead.
+    pub fn connect(dsn: &str) -> Result<Self, CodeIndexError> {
         let pg_config: PgConfig = dsn.parse()?;
         let manager = Manager::from_config(
             pg_config,

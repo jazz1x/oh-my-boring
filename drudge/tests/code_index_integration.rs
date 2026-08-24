@@ -41,9 +41,7 @@ async fn connect(dsn: &str) -> Client {
 }
 
 async fn initialized_store(dsn: &str) -> CodeIndexStore {
-    let store = CodeIndexStore::connect(dsn)
-        .await
-        .expect("connect code index");
+    let store = CodeIndexStore::connect(dsn).expect("connect code index");
     store.initialize().await.expect("initialize code index");
     store
 }
