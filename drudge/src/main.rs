@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
                     .map_or_else(String::new, |id| format!(" repository '{id}'"))
             );
             let dsn = config::pg_dsn();
-            let mut code_store = code_index::CodeIndexStore::connect(&dsn).await?;
+            let mut code_store = code_index::CodeIndexStore::connect(&dsn)?;
             code_store.initialize().await?;
             for source in selected {
                 let report = code_index::sync_repository(&mut code_store, source).await?;
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
         }
         Cmd::CodeStatus { repository } => {
             let dsn = config::pg_dsn();
-            let code_store = code_index::CodeIndexStore::connect(&dsn).await?;
+            let code_store = code_index::CodeIndexStore::connect(&dsn)?;
             let statuses = code_store.status(repository.as_deref()).await?;
             if let Some(requested) = repository.as_deref() {
                 anyhow::ensure!(

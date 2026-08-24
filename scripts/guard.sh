@@ -64,6 +64,7 @@ python3 agents/shared/test_markers.py
 python3 agents/shared/test_resolution_quality.py
 python3 agents/shared/test_transcript.py
 python3 agents/shared/test_recall_core.py
+python3 agents/shared/test_label_core.py
 python3 agents/shared/test_drudge_client.py
 python3 agents/claude-code/test_hooks.py
 python3 agents/kimi/test_kimi.py

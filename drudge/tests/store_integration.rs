@@ -702,6 +702,178 @@ async fn query_log_preserves_zero_distance_and_absence_distinctly() {
         .expect("cleanup query_log");
 }
 
+/// Seed one logged query with two hits and return its id. Shared by the label tests.
+async fn seed_labelled_query(store: &Store, endpoint: &str) -> i32 {
+    store
+        .log_query(
+            endpoint,
+            "labelled query",
+            &[
+                LoggedHit::with_distance(unique_path("label-hit-a"), 0.31, DistKind::VectorCosine),
+                LoggedHit::with_distance(unique_path("label-hit-b"), 0.52, DistKind::VectorCosine),
+            ],
+            &[],
+            "snippet",
+            None,
+        )
+        .await
+        .expect("log query");
+    store
+        .recent_queries(10)
+        .await
+        .expect("recent queries")
+        .into_iter()
+        .find(|r| r.endpoint == endpoint)
+        .expect("row present")
+        .id
+}
+
+fn unique_endpoint(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Both judges' verdicts on one hit live side by side, and re-labelling replaces only the row of
+/// the judge doing it. A human audit that overwrote the llm row would erase the disagreement the
+/// audit exists to measure.
+#[tokio::test]
+async fn recall_labels_keep_both_judges_independent() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+    let endpoint = unique_endpoint("label-independent");
+    let qid = seed_labelled_query(&store, &endpoint).await;
+
+    store
+        .record_recall_label(qid, 0, "llm", "relevant", "gemma4:12b", "")
+        .await
+        .expect("llm label");
+    store
+        .record_recall_label(qid, 0, "human", "irrelevant", "human", "off topic")
+        .await
+        .expect("human label");
+
+    let mine = |labels: Vec<drudge::store::RecallLabelRow>| {
+        labels
+            .into_iter()
+            .filter(|l| l.query_log_id == qid)
+            .collect::<Vec<_>>()
+    };
+    let rows = mine(store.recent_recall_labels(200).await.expect("labels"));
+    assert_eq!(
+        rows.len(),
+        2,
+        "a human verdict must not overwrite the llm's"
+    );
+    let llm = rows
+        .iter()
+        .find(|l| l.judge == "llm")
+        .expect("llm verdict present");
+    assert_eq!(llm.verdict, "relevant");
+    assert_eq!(llm.model, "gemma4:12b");
+
+    store
+        .record_recall_label(qid, 0, "llm", "irrelevant", "gemma4:12b", "second pass")
+        .await
+        .expect("relabel");
+    let rows = mine(store.recent_recall_labels(200).await.expect("labels again"));
+    assert_eq!(rows.len(), 2, "re-labelling must update, not append");
+    assert_eq!(
+        rows.iter()
+            .find(|l| l.judge == "llm")
+            .expect("llm verdict")
+            .verdict,
+        "irrelevant"
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|l| l.judge == "human")
+            .expect("human verdict")
+            .verdict,
+        "irrelevant",
+        "the human row must be untouched by the llm relabel"
+    );
+
+    let db = connect(&dsn).await;
+    db.execute("DELETE FROM query_log WHERE endpoint = $1;", &[&endpoint])
+        .await
+        .expect("cleanup query_log");
+}
+
+/// An `unsure` verdict is an abstention: it leaves the agreement denominator entirely. Counting it
+/// either way would move the rate that decides whether the llm judge is usable at all. Labels also
+/// cascade with the query they describe — a label pointing at a pruned query is unauditable.
+#[tokio::test]
+async fn recall_label_agreement_excludes_unsure_and_cascades() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+    let endpoint = unique_endpoint("label-agreement");
+    let qid = seed_labelled_query(&store, &endpoint).await;
+    let (_, agreed_before, compared_before) = store
+        .recall_label_stats()
+        .await
+        .expect("baseline stats before labelling");
+
+    // hit 0: both judges decided. hit 1: the person abstained.
+    for (hit, judge, verdict) in [
+        (0, "llm", "relevant"),
+        (0, "human", "relevant"),
+        (1, "llm", "relevant"),
+        (1, "human", "unsure"),
+    ] {
+        store
+            .record_recall_label(qid, hit, judge, verdict, "test", "")
+            .await
+            .expect("label");
+    }
+
+    let (judges, agreed_after, compared_after) = store.recall_label_stats().await.expect("stats");
+    assert!(
+        judges.iter().any(|j| j.judge == "llm") && judges.iter().any(|j| j.judge == "human"),
+        "both judges must appear in the stats"
+    );
+    // Deltas against the pre-seed baseline, so this asserts on the store's own aggregation rather
+    // than on a copy of its SQL (a copy would pass no matter what the shipped query did). Two hits
+    // were labelled by both judges; only hit 0 is decided on both sides.
+    assert_eq!(
+        compared_after - compared_before,
+        1,
+        "the unsure pair must not enter the agreement denominator"
+    );
+    assert_eq!(
+        agreed_after - agreed_before,
+        1,
+        "hit 0 matched on both sides and must count as agreement"
+    );
+
+    let db = connect(&dsn).await;
+    db.execute("DELETE FROM query_log WHERE endpoint = $1;", &[&endpoint])
+        .await
+        .expect("cleanup query_log");
+    let leftover: i64 = db
+        .query_one(
+            "SELECT count(*) FROM recall_label WHERE query_log_id = $1;",
+            &[&qid],
+        )
+        .await
+        .expect("count leftovers")
+        .get(0);
+    assert_eq!(
+        leftover, 0,
+        "labels must cascade with the query they describe"
+    );
+}
+
 /// Legacy query_log rows (paths only) must read back with empty distance arrays, never zeros.
 #[tokio::test]
 async fn query_log_legacy_rows_read_empty_distances() {

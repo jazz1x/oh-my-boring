@@ -502,9 +502,64 @@ pub(crate) struct QueryLogEntry {
     pub(crate) endpoint: String,
     pub(crate) query: String,
     pub(crate) hit_paths: Vec<String>,
+    // Distances were persisted by #209 but never surfaced here, so a caller could see WHICH notes
+    // were injected and not how far they were — the labeller needs both to sample the band where a
+    // relevance decision would actually bite. Absent stays `null`, never 0.
+    pub(crate) hit_dists: Vec<Option<f32>>,
+    pub(crate) hit_dist_kinds: Vec<Option<String>>,
     pub(crate) sources: Vec<String>,
     pub(crate) answer_snippet: String,
     pub(crate) latency_ms: Option<i32>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RecallLabelReq {
+    pub(crate) query_log_id: i32,
+    pub(crate) hit_index: i32,
+    pub(crate) judge: String,
+    pub(crate) verdict: String,
+    #[serde(default)]
+    pub(crate) model: String,
+    #[serde(default)]
+    pub(crate) note: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RecallLabelsReq {
+    #[serde(default = "default_query_log_limit")]
+    pub(crate) limit: i64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RecallLabelsResp {
+    pub(crate) entries: Vec<RecallLabelEntry>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RecallLabelEntry {
+    pub(crate) query_log_id: i32,
+    pub(crate) hit_index: i32,
+    pub(crate) judge: String,
+    pub(crate) verdict: String,
+    pub(crate) model: String,
+    pub(crate) note: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RecallLabelStatsResp {
+    pub(crate) judges: Vec<RecallLabelJudgeStats>,
+    /// Hits where both judges gave a real verdict, and how many of those matched. Reported even
+    /// when tiny, because a precision number from an unaudited LLM judge is not evidence.
+    pub(crate) agreed: i64,
+    pub(crate) compared: i64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RecallLabelJudgeStats {
+    pub(crate) judge: String,
+    pub(crate) relevant: i64,
+    pub(crate) irrelevant: i64,
+    pub(crate) unsure: i64,
 }
 
 #[derive(Deserialize)]
@@ -662,7 +717,7 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
         .any(config::CodeIndexSource::enabled)
     {
         let dsn = config::pg_dsn();
-        Some(Arc::new(CodeIndexStore::connect(&dsn).await?))
+        Some(Arc::new(CodeIndexStore::connect(&dsn)?))
     } else {
         None
     };
@@ -705,6 +760,11 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
         .route("/graph", post(http::handle_graph))
         .route("/audit", get(http::handle_audit))
         .route("/query-log", get(http::handle_query_log))
+        .route(
+            "/recall-labels",
+            get(http::handle_recall_labels).post(http::handle_recall_label_record),
+        )
+        .route("/recall-label-stats", get(http::handle_recall_label_stats))
         .route(
             "/events",
             get(http::handle_events).post(http::handle_event_ingest),
