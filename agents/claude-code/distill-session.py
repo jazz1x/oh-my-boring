@@ -79,7 +79,7 @@ def main() -> int:
     if is_final:
         # Before the length gate on purpose: a session too short to be worth distilling still
         # received injections, and whether the agent used them is the same measurement.
-        log_uptake_event(session_id, repo, text)
+        log_uptake_event(session_id, repo, text, "claude-code")
     if len(text) < 500:
         print("[omb-distill] transcript too short; skipping", file=sys.stderr)
         log_skip_event(session_id, origin, repo, _distill_resolution(), "too_short")

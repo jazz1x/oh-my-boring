@@ -66,6 +66,17 @@ def test_a_phrase_the_user_already_said_is_not_evidence():
     assert (used, total) == (0, 1)
 
 
+def test_a_note_name_the_user_typed_is_not_evidence():
+    # The subtraction applied to phrases was missing for the source name, which is the easiest
+    # evidence for a user to hand the agent: naming the note in the prompt and having it echoed
+    # back would have scored as uptake.
+    prompt = "wiki-0007.md 다시 보고 pool 문제 정리해줘"
+    record = uptake_core.injection_record("s1", prompt, [_hit()], 3)
+    transcript = f"[user] {prompt}\n[assistant] wiki-0007.md 를 다시 읽어보겠습니다.\n"
+    used, total, _, _ = uptake_core.session_uptake([record], transcript)
+    assert (used, total) == (0, 1)
+
+
 def test_only_assistant_turns_are_scanned():
     record = uptake_core.injection_record("s1", "unrelated question", [_hit()], 3)
     transcript = (
@@ -127,6 +138,23 @@ def test_ledger_roundtrip_and_prune_keep_other_sessions():
         uptake_core.prune_session("s1", path)
         assert uptake_core.load_records("s1", path) == []
         assert len(uptake_core.load_records("s2", path)) == 1, "pruning one session must not touch another"
+
+
+def test_abandoned_sessions_are_pruned_by_age():
+    # A session killed before SessionEnd leaves rows nothing will ever measure or remove.
+    import json as _json
+    import time as _time
+
+    with tempfile.TemporaryDirectory() as d:
+        path = str(Path(d) / "injections.jsonl")
+        old = uptake_core.injection_record("dead", "p", [_hit()], 3)
+        old["ts"] = _time.time() - 10 * 86400
+        Path(path).write_text(_json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
+        uptake_core.append_record(uptake_core.injection_record("fresh", "p", [_hit()], 3), path)
+
+        uptake_core.prune_session("unrelated", path)
+        assert uptake_core.load_records("dead", path) == [], "an abandoned session must age out"
+        assert len(uptake_core.load_records("fresh", path)) == 1, "recent rows must survive"
 
 
 def test_ledger_failures_are_silent_not_fatal():

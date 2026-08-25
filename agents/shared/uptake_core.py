@@ -19,6 +19,7 @@ No I/O beyond a JSONL append the caller hands a path to; the hooks own the rest.
 import json
 import os
 import re
+import time
 
 def ledger_path():
     """Where the recall hook leaves its record — resolved per call, never cached at import.
@@ -66,6 +67,13 @@ def phrases(snippet, size=PHRASE_WORDS, limit=MAX_PHRASES):
     return [windows[int(i * step)] for i in range(limit)]
 
 
+#: A session whose SessionEnd never fires (killed terminal, crash) leaves its rows behind
+#: forever: nothing prunes what nothing measures. Those rows are also a selection bias — the
+#: sessions that report are the ones that ended cleanly — so they are dropped by age rather than
+#: silently counted later against a transcript that no longer exists.
+LEDGER_MAX_AGE_DAYS = 3
+
+
 def injection_record(session_id, prompt, hits, max_results):
     """The row the recall hook appends when it injects.
 
@@ -90,6 +98,7 @@ def injection_record(session_id, prompt, hits, max_results):
         return None
     return {
         "session_id": session_id,
+        "ts": time.time(),
         "prompt_words": _words(prompt)[:400],
         "hits": injected,
     }
@@ -150,10 +159,14 @@ def hit_was_used(hit, assistant_words_text, prompt_words):
     A phrase the user already used is not evidence: the agent would have said it anyway. That
     subtraction is what keeps this from being a similarity score between prompt and answer.
     """
-    src = (hit.get("src") or "").lower()
-    if src and src in assistant_words_text:
-        return True
     prompt_blob = " ".join(prompt_words or [])
+    src = (hit.get("src") or "").lower()
+    # The same subtraction the phrases get. It was missing here, and a note name is the easiest
+    # thing for a user to type: "wiki-1292.md 다시 봐" would have counted as the agent using a
+    # memory it was told to look at. Every path into this function has to survive the question
+    # "would the agent have said this anyway".
+    if src and src in assistant_words_text and src not in prompt_blob:
+        return True
     for phrase in hit.get("phrases") or []:
         if phrase and phrase in assistant_words_text and phrase not in prompt_blob:
             return True
@@ -180,14 +193,20 @@ def session_uptake(records, transcript_text):
     return used_hits, total_hits, used_prompts, len(records)
 
 
-def prune_session(session_id, path=None):
-    """Drop one session's records once its uptake has been recorded. Never raises."""
+def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_DAYS):
+    """Drop this session's records, and any left behind by sessions that never ended.
+
+    Never raises. Rows older than `max_age_days` go regardless of session: without that the
+    ledger grows without bound, because the only thing that prunes a session is the SessionEnd
+    that also measures it — and a killed session has neither.
+    """
     target = path or ledger_path()
     try:
         with open(target, encoding="utf-8") as handle:
             lines = handle.readlines()
     except OSError:
         return False
+    cutoff = (now if now is not None else time.time()) - max_age_days * 86400
     kept = []
     for line in lines:
         try:
@@ -195,8 +214,12 @@ def prune_session(session_id, path=None):
         except ValueError:
             kept.append(line)  # keep what we cannot parse rather than silently deleting it
             continue
-        if row.get("session_id") != session_id:
-            kept.append(line)
+        if row.get("session_id") == session_id:
+            continue
+        ts = row.get("ts")
+        if isinstance(ts, (int, float)) and ts < cutoff:
+            continue
+        kept.append(line)
     try:
         with open(target, "w", encoding="utf-8") as handle:
             handle.writelines(kept)
