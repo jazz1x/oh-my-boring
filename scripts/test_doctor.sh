@@ -44,7 +44,19 @@ if [ "${1:-}" = compose ] && [ "${2:-}" = ps ]; then
     echo "boring-drudge Up"
     exit 0
 fi
-exit 1
+# `compose exec … drudge audit` is doctor's config probe: it asks the RUNNING binary to parse the
+# config on disk, because a config written for a newer binary is invisible until a restart turns
+# it into a crash loop.
+if [ "${1:-}" = compose ] && [ "${2:-}" = exec ]; then
+    if [ "${DOCTOR_CONFIG_UNREADABLE:-0}" = 1 ]; then
+        echo "Error: deserialize boring.json" >&2
+        echo "    unknown variant \`cobol\`, expected one of \`rust\`, \`python\`, \`shell\`" >&2
+        exit 1
+    fi
+    exit 0
+fi
+echo "fake docker: unmodelled call: $*" >&2
+exit 7
 SH
 
     cat >"$fakebin/jq" <<'SH'
@@ -322,6 +334,11 @@ if "$TMP/fakebin/curl" -sf http://127.0.0.1:7700/some-endpoint-the-fake-does-not
     exit 1
 fi
 
+if "$TMP/fakebin/docker" compose logs boring-drudge >/dev/null 2>&1; then
+    echo "FAIL: fake docker answers unmodelled calls successfully — checks built on it are vacuous" >&2
+    exit 1
+fi
+
 # (a1) hook wiring. install.sh may register the tilde form, which the shell expands at run time
 # but which a grep for the expanded path never matches — doctor called working hooks missing.
 make_case "$TMP/hooks-tilde" yes
@@ -356,6 +373,24 @@ case "$(cat "$TMP/hooks-partial.out")" in
   *)
     cat "$TMP/hooks-partial.out"
     echo "FAIL: strict doctor did not report the half-wired hooks" >&2
+    exit 1
+    ;;
+esac
+
+# (a2c) A config the running binary cannot parse is invisible until something restarts the engine,
+# and then it is a crash loop rather than a start. On 2026-08-25 that took the live engine down
+# days after the edit that caused it. The engine is healthy in this case — that is the point.
+make_case "$TMP/config-unreadable" yes
+if ( DOCTOR_CONFIG_UNREADABLE=1 run_strict "$TMP/config-unreadable" "$TMP/config-unreadable.out" ); then
+    cat "$TMP/config-unreadable.out"
+    echo "FAIL: a config the running engine cannot parse must fail readiness before a restart" >&2
+    exit 1
+fi
+case "$(cat "$TMP/config-unreadable.out")" in
+  *"the next restart will crash-loop, not start"*) ;;
+  *)
+    cat "$TMP/config-unreadable.out"
+    echo "FAIL: strict doctor did not name the unreadable config" >&2
     exit 1
     ;;
 esac
