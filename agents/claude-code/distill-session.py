@@ -25,6 +25,7 @@ from distill_core import (  # noqa: F401
     distill_and_remember,
     git_remote_url,
     log_skip_event,
+    log_uptake_event,
     repo_slug,
 )
 
@@ -33,7 +34,7 @@ from distill_core import (  # noqa: F401
 __all__ = [
     "_extract_json", "_mark", "_strip_trailing_metadata",
     "_build_prompt", "_call_llm", "_call_remember", "_throttled",
-    "distill_and_remember", "git_remote_url", "log_skip_event", "repo_slug", "extract", "main", "run",
+    "distill_and_remember", "git_remote_url", "log_skip_event", "log_uptake_event", "repo_slug", "extract", "main", "run",
 ]
 # fmt: on
 
@@ -75,6 +76,10 @@ def main() -> int:
     origin, _rule = boring_config.classify(cwd, remote_url or None)
     repo = repo_slug(cwd)
     text = extract(transcript_path)
+    if is_final:
+        # Before the length gate on purpose: a session too short to be worth distilling still
+        # received injections, and whether the agent used them is the same measurement.
+        log_uptake_event(session_id, repo, text)
     if len(text) < 500:
         print("[omb-distill] transcript too short; skipping", file=sys.stderr)
         log_skip_event(session_id, origin, repo, _distill_resolution(), "too_short")

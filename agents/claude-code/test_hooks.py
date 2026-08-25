@@ -54,6 +54,9 @@ def _load(name, filename):
 distill = _load("distill_session_hook", "distill-session.py")
 recall = _load("recall_hook", "recall.py")
 import distill_core  # noqa: E402
+# The recall tests drive the real injection path, which appends to the injection ledger.
+# Redirect it before import or the suite writes into the owner's live cache.
+os.environ["BORING_INJECTION_LEDGER"] = str(Path(tempfile.mkdtemp()) / "injections.jsonl")
 import recall_core  # noqa: E402
 import markers  # noqa: E402
 
