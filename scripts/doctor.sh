@@ -245,6 +245,24 @@ if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$BORING_URL/health" 2>/dev/n
             failed_engine=1
         fi
 
+        # (a2b2) the host CLI binary. `make build` builds the image; the binary that
+        # `schedule-maintenance.sh` runs daily for code-sync is a separate artifact that only
+        # `cargo build --release` refreshes, and the drift check above asks the engine — so a
+        # stale host binary ran old logic against live data with every gate green. Checked only
+        # when it exists: a wiki-first install never builds it.
+        host_cli="$BORING_HOME/drudge/target/release/drudge"
+        if [ -x "$host_cli" ] && [ -n "$head_sha" ]; then
+            host_sha="$("$host_cli" version 2>/dev/null | tail -1)"
+            case "$host_sha" in
+                "$head_sha") ok "host CLI built from the checked-out commit ($(printf '%.8s' "$host_sha"))" ;;
+                unstamped|"") warn "host CLI reports no build stamp — rebuild with 'cargo build --release' to make its drift detectable" ;;
+                *)
+                    bad "HOST CLI DRIFT — $host_cli was built from $(printf '%.8s' "$host_sha"), checkout is at $(printf '%.8s' "$head_sha"). Daily code-sync runs that older binary."
+                    failed_engine=1
+                    ;;
+            esac
+        fi
+
         # (a2c) config the running binary cannot read. boring.json is bind-mounted, so an edit is
         # visible to the container immediately but is only *parsed* at startup — a config written
         # for a newer binary sits harmless until something restarts the engine, and then it is a

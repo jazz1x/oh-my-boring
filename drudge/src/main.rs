@@ -41,6 +41,8 @@ enum Cmd {
     Audit,
     /// Retrieval test (vector + BM25 RRF)
     Search { query: String },
+    /// Print the commit this binary was built from — the host answer to /health.build_sha
+    Version,
     /// Single query — retrieval + LLM synthesis + sources
     Ask { question: String },
     /// Recency-first briefing — recency (updated_at) retrieval + supersede synthesis (morning briefing)
@@ -199,6 +201,17 @@ async fn main() -> Result<()> {
     };
 
     match cmd {
+        Cmd::Version => {
+            // Empty means the build could not resolve a commit (no .git, no BUILD_SHA), which is
+            // a different statement from a stale sha and must not be dressed up as one.
+            let stamp = env!("BORING_BUILT_FROM");
+            if stamp.is_empty() {
+                println!("unstamped");
+            } else {
+                println!("{stamp}");
+            }
+            return Ok(());
+        }
         Cmd::Selftest => {
             let store = store.as_ref().context(VEC_OFF)?;
             let ol = llm::Llm::from_config(&cfg);
