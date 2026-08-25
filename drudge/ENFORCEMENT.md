@@ -52,3 +52,23 @@
 - **pre-commit** = `scripts/guard.sh` (stack-free): `cargo fmt --check` → `cargo clippy --all-targets -D warnings` → `cargo test`. Install: `git config core.hooksPath .githooks`.
 - **release acceptance / CI** = `make quality`: MCP tool inventory, vector-mode support docs, and removed dangerous CLI surfaces stay synchronized.
 - **pre-deploy / CI** = `scripts/eval-gate.sh`: confirm drudge is up → copy `data/eval/fixtures/` into the vault → `/sync` → `run_eval.py` recall floor. The harness is committed (`data/eval/run_eval.py` + `golden.json` + 7 fixtures). CI runs it without a GPU via `data/eval/stub_embedder.py` (replays real bge-m3 vectors recorded by `record_embeddings.py` into `recorded_embeddings.json`) — so CI recall == real recall. Recall@3 < 1.00 → non-zero → merge/deploy halted. Locally, `make eval` runs the same gate against a live LLM.
+
+## Gates assert their own preconditions
+
+A gate that cannot fail protects nothing, and this repo has shipped three of them at once:
+
+- `data/eval/run_eval.py` exits non-zero on `recall_at_k < n` and nothing else — `false_pass`
+  could be 6/6 and the gate still passes. (That one is deliberate while no filter exists, but it
+  means the gate measures retrieval liveness, not retrieval quality.)
+- The six DB suites return green when `BORING_TEST_DATABASE_URL` is unset (`SKIP:` is a skip, not
+  a failure), and nothing asserts that a nonzero number of tests actually ran. Local pre-commit
+  runs in exactly that state.
+- A `CHECK` widened inside `CREATE TABLE IF NOT EXISTS` never reaches a database that already
+  exists, and every suite starts from an empty container, so no test could see it. This one
+  shipped and was masked by a hand-run `ALTER` on the live database.
+
+`scripts/test_schema_parity.sh` is the first enforcement of this rule: it starts one database
+from the shipped `data/schema/baseline.sql` and requires it to end up identical to a fresh one.
+
+Remaining derivations, unscheduled: make "0 tests executed" a failure in CI context, and assert
+the eval gate loaded its 18 fixture files.

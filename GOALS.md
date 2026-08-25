@@ -1,7 +1,10 @@
+<!-- derived-from: PRD v1 -->
 # GOALS
 
-This file is the SSOT for the current self-verification loop. It turns the broad
-"keep improving ingestion condition" intent into measurable gates.
+Derived from `docs/PRD.md`. The PRD says what the product is; this file says which of its
+requirements the current slice enforces, and with which gates. Every gate row carries the `[R#]`
+it comes from — a gate that derives from no requirement does not belong here, which is how this
+file stops becoming a defect log again.
 
 ## North Star
 
@@ -10,21 +13,37 @@ The write door stays gated, deterministic, and observable; the read door stays f
 
 ## Current Slice
 
-Scope for this slice:
+**Injection-channel demand verdict** (2026-08-26 → 09-09). Derived from **[R1]** and the PRD's
+§2 contract. The instrumentation shipped; this slice spends the window collecting, and ships no
+change to the channel being measured.
 
-- Codex session harvesting keeps moving without zombie/duplicate accumulation.
-- Weak duplicate notes can be replaced only through conservative identity signals.
-- Compile, lint, test, readiness, and data hygiene are continuously observed.
-- Rust workflow graph remains the transition contract; Python adapters project host I/O into that contract.
+In scope:
 
-Out of scope for this slice:
+- Run the uptake window to its end — treatment and control counts per session **[R1]**.
+- Accumulate labels: the daily pass collects 24, and human `--audit` runs alongside **[R1]**.
+- Two documents: remove the throttle falsehood from the Claude adapter README, and keep this
+  file in step with the PRD **[R1]**.
 
-- Bulk vault mutation.
-- Renumbering.
-- DB reset.
-- Moving host I/O orchestration into Rust.
+Out of scope for this slice — and why:
 
-## Verification Contract
+- **Any change to injection frequency, budget, position, or ranking.** The window's sample is
+  defined on the current channel; changing it mid-window voids the contract **[R1]**.
+- **Distillation changes**, including R3's derived work. They change the notes the channel will
+  inject, so they are not orthogonal to the measurement. Starts after 09-09 **[R3]**.
+- Bulk vault mutation, renumbering, DB reset **[R4]**.
+
+Work that is orthogonal to the channel — gate hardening, schema parity, doc corrections — stays
+allowed. The discipline is "do not touch the thing being measured", not "do not build".
+
+Requirements this slice carries no new work for, and why:
+
+- **[R5]** boundaries (origin split, PII gate, injection fence) are in place and enforced by the
+  existing gates; this slice guards against regression only. The `forget` path-traversal question
+  is the one open item and it is the owner's to confirm.
+- **[R6]** the read door is deliberately frozen: its parameters are the thing being measured.
+  Changing budget, position, or throttle mid-window voids the §2 contract.
+
+## Verification Contract [R4]
 
 All numbers below are gate thresholds, not descriptive examples.
 
@@ -41,7 +60,7 @@ All numbers below are gate thresholds, not descriptive examples.
 | recent resolution failures | 0 in doctor window | Block readiness. |
 | sync-degraded collector event | allowed only if remember batch succeeded | Keep visible; does not block bootstrap/soak unless paired with failed batch. |
 
-## Stage Contract
+## Stage Contract [R4]
 
 The live self-verification loop writes a TSV summary with one row per step.
 `scripts/self-verify-contract.py` evaluates that summary.
@@ -54,7 +73,7 @@ The live self-verification loop writes a TSV summary with one row per step.
 
 No stage may advance with a failed row in the evaluated summary.
 
-## Graph Contract
+## Graph Contract [R2]
 
 The Rust workflow graph is the closed transition vocabulary.
 
@@ -75,7 +94,7 @@ Required graph paths:
 - duplicate path: `remember_requested --duplicate--> done_marked`
 - skip path: `transcript_prepared --skip--> skipped -> resolution_event_recorded -> readiness_projected`
 
-## Operating Policy
+## Operating Policy [R3]
 
 - If a gate fails, do not add timeout/retry/null-check symptom treatment before writing the root cause.
 - If the root cause is a contract mismatch, update the graph/test contract first.
@@ -85,16 +104,7 @@ Required graph paths:
 
 ## Current Live Loop
 
-The active one-day loop is expected to produce:
-
-- 72 cycles over 24 hours at 20-minute intervals.
-- 13 guard runs (`cycle 1`, then every 6-cycle boundary through cycle 72).
-- 0 failed rows.
-
-The check command is:
-
-```sh
-make self-verify-check STAGE=bootstrap
-make self-verify-check STAGE=soak-2h
-make self-verify-check STAGE=day
-```
+Retired 2026-08-26. Nothing in the PRD requires 72 self-verification cycles a day, and nobody
+had read the result in weeks — enforcement of **[R3]** and **[R4]** is carried by readiness,
+dead-letter, and the CI gates, which are checked. `make self-verify-check` still exists for
+anyone who wants a stage report; it is no longer a standing expectation.
