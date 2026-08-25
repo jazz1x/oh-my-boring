@@ -362,7 +362,7 @@ CREATE TABLE IF NOT EXISTS code_index.repository (
     id text PRIMARY KEY,
     name text NOT NULL,
     root_path text NOT NULL,
-    language text NOT NULL CHECK (language IN ('rust')),
+    language text NOT NULL CHECK (language IN ('rust', 'python', 'shell')),
     last_synced_at timestamptz NOT NULL
 );
 
@@ -473,6 +473,23 @@ WHERE relation.id = deterministic_relation_ids.old_id;
 
 DO $$
 BEGIN
+    -- The language CHECK is written by CREATE TABLE, which never runs again once the table
+    -- exists. Widening the literal above therefore reaches new databases only: an existing
+    -- index keeps CHECK (language IN ('rust')) and rejects every python/shell repository with
+    -- a constraint violation that no test using a fresh container can reproduce. Rebuild it
+    -- from the current allowed set instead, and keep the two in sync by construction.
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'repository_language_check'
+          AND conrelid = 'code_index.repository'::regclass
+          AND pg_get_constraintdef(oid) NOT LIKE '%python%'
+    ) THEN
+        ALTER TABLE code_index.repository DROP CONSTRAINT repository_language_check;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'repository_language_check' AND conrelid = 'code_index.repository'::regclass) THEN
+        ALTER TABLE code_index.repository ADD CONSTRAINT repository_language_check
+            CHECK (language IN ('rust', 'python', 'shell'));
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'file_repository_id_id_key' AND conrelid = 'code_index.file'::regclass) THEN
         ALTER TABLE code_index.file ADD CONSTRAINT file_repository_id_id_key UNIQUE (repository_id, id);
     END IF;

@@ -427,6 +427,22 @@ if [ -f "$event_log_probe" ]; then
     fi
 fi
 
+# (d6) Code index freshness. last_synced_at older than BORING_CODE_INDEX_MAX_DAYS (default 7)
+# is a warning, not a strict failure — the index can still be read; it is just no longer current.
+max_days="${BORING_CODE_INDEX_MAX_DAYS:-7}"
+stale=$("$BORING_HOME/drudge/target/release/drudge" code-status 2>/dev/null | while IFS= read -r line; do
+    ts=$(printf '%s' "$line" | sed -n 's/.* synced=\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\)Z.*/\1/p')
+    [ -n "$ts" ] || continue
+    epoch=$(date -d "${ts}Z" +%s 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null || echo 0)
+    age=$(( (now_s - epoch) / 86400 ))
+    [ "$age" -gt "$max_days" ] && printf '%s ' "$(printf '%s' "$line" | awk '{print $1}')"
+done)
+if [ -z "$stale" ]; then
+    ok "code index is fresh (within ${max_days} days)"
+else
+    warn "code index is stale (> ${max_days} days): $stale"
+fi
+
 # (d5) Freshness window for briefing content. Existence alone is too weak: a green
 # stack with stale notes still cannot answer "can I trust tomorrow morning's briefing?"
 note_max_hours_raw="${BORING_READINESS_NOTE_MAX_HOURS:-48}"

@@ -39,6 +39,10 @@ run_maintenance() {
     # retention pass.
     echo "--- recall labels ---"
     python3 scripts/label-recall.py --judge --queries 8 --hits 3 || echo "(label pass failed — continuing)"
+    # The code index is a separate corpus and it goes stale silently — nothing else re-runs it,
+    # and doctor only notices after the fact. Failure must not fail housekeeping either.
+    echo "--- code-sync ---"
+    ./drudge/target/release/drudge code-sync || echo "(code-sync failed — continuing)"
     echo "=== maintenance finished at $(date) ==="
 }
 

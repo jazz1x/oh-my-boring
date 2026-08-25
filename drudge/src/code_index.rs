@@ -283,6 +283,12 @@ fn prepare_changed(
                 CodeLanguage::Rust => {
                     parser::parse_rust(source.id(), &file.relative_path, &file.id, &file.content)?
                 }
+                CodeLanguage::Python => {
+                    parser::parse_python(source.id(), &file.relative_path, &file.id, &file.content)?
+                }
+                CodeLanguage::Shell => {
+                    parser::parse_shell(source.id(), &file.relative_path, &file.id, &file.content)?
+                }
             };
             Ok(PreparedFile {
                 collected: file,
@@ -295,6 +301,10 @@ fn prepare_changed(
 fn matches_language(path: &Path, language: CodeLanguage) -> bool {
     match language {
         CodeLanguage::Rust => path.extension().is_some_and(|extension| extension == "rs"),
+        CodeLanguage::Python => path.extension().is_some_and(|extension| extension == "py"),
+        CodeLanguage::Shell => path
+            .extension()
+            .is_some_and(|extension| extension == "sh" || extension == "bash"),
     }
 }
 

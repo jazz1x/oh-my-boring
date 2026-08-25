@@ -1,6 +1,7 @@
 //! ohmyboring personal RAG — Rust (pgvector: vector + node/edge graph + recursive CTE + audit).
 //! First milestone: embed → store → vector search round-trip proof (selftest).
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use drudge::{
     ask, audit, code_index, config, frontmatter, graph, ingest, llm, retrieve, serve, store, vault,
@@ -167,8 +168,9 @@ async fn main() -> Result<()> {
                 );
             }
             for status in statuses {
+                let synced = DateTime::<Utc>::from(status.last_synced_at);
                 println!(
-                    "{} ({}) language={} root={} files={} symbols={} relations={} error_files={} parse_errors={} synced={:?}",
+                    "{} ({}) language={} root={} files={} symbols={} relations={} error_files={} parse_errors={} synced={}",
                     status.repository_id,
                     status.name,
                     status.language,
@@ -178,7 +180,7 @@ async fn main() -> Result<()> {
                     status.relations,
                     status.files_with_errors,
                     status.parse_errors,
-                    status.last_synced_at
+                    synced.format("%Y-%m-%dT%H:%M:%SZ")
                 );
             }
             return Ok(());

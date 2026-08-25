@@ -114,7 +114,7 @@
               "id": {"type": "string", "minLength": 1, "description": "Stable repository persistence id."},
               "name": {"type": "string", "minLength": 1, "description": "Stable human-facing repository name."},
               "root": {"type": "string", "minLength": 1, "description": "Repository root path."},
-              "language": {"type": "string", "enum": ["rust"]},
+              "language": {"type": "string", "enum": ["rust", "python", "shell"]},
               "enabled": {"type": "boolean", "default": false}
             },
             "additionalProperties": false
