@@ -28,9 +28,19 @@ docker run -d --name "$NAME" -p 127.0.0.1::5432 \
     -e POSTGRES_USER=boring -e POSTGRES_PASSWORD=boring -e POSTGRES_DB=boring \
     pgvector/pgvector:pg16 >/dev/null || { echo "✗ failed to start $NAME" >&2; exit 1; }
 
+# The postgres image runs a temporary server during initdb and shuts it down before starting the
+# real one, so a single pg_isready can pass against a server that is about to disappear — CI hit
+# exactly that ("the database system is shutting down" one second after ready). Require the
+# readiness to hold, and prove it with a real query rather than a socket probe.
 ready=0
-for _ in $(seq 1 30); do
-    docker exec "$NAME" pg_isready -U boring -d boring >/dev/null 2>&1 && { ready=1; break; }
+streak=0
+for _ in $(seq 1 60); do
+    if docker exec "$NAME" psql -U boring -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+        streak=$((streak + 1))
+        [ "$streak" -ge 3 ] && { ready=1; break; }
+    else
+        streak=0
+    fi
     sleep 1
 done
 [ "$ready" = 1 ] || { echo "✗ pgvector container never became ready" >&2; exit 1; }

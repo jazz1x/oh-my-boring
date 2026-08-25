@@ -137,9 +137,11 @@ test-db: ## Run the DB gate suites (origin_boundary/store_integration/context_in
 	docker run -d --name "$$name" -p 127.0.0.1::5432 \
 	  -e POSTGRES_USER=boring -e POSTGRES_PASSWORD=boring -e POSTGRES_DB=boring \
 	  pgvector/pgvector:pg16 >/dev/null || { echo "failed to start $$name"; exit 1; }; \
-	ready=0; \
-	for _ in $$(seq 1 30); do \
-	  docker exec "$$name" pg_isready -U boring -d boring >/dev/null 2>&1 && { ready=1; break; }; \
+	ready=0; streak=0; \
+	for _ in $$(seq 1 60); do \
+	  if docker exec "$$name" psql -U boring -d boring -tAc 'SELECT 1' >/dev/null 2>&1; then \
+	    streak=$$((streak + 1)); [ "$$streak" -ge 3 ] && { ready=1; break; }; \
+	  else streak=0; fi; \
 	  sleep 1; \
 	done; \
 	[ "$$ready" = 1 ] || { echo "pgvector container never became ready"; exit 1; }; \
