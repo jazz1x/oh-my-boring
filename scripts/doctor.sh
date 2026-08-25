@@ -244,6 +244,23 @@ if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$BORING_URL/health" 2>/dev/n
             bad "DEPLOY DRIFT — engine runs $(printf '%.8s' "$running_sha"), checkout is at $(printf '%.8s' "$head_sha"). Merged work is not live until 'make build' + restart."
             failed_engine=1
         fi
+
+        # (a2c) config the running binary cannot read. boring.json is bind-mounted, so an edit is
+        # visible to the container immediately but is only *parsed* at startup — a config written
+        # for a newer binary sits harmless until something restarts the engine, and then it is a
+        # crash loop under `restart: unless-stopped`. That is not hypothetical: adding python and
+        # shell code_index sources before the binary that understood them was deployed took the
+        # engine down on 2026-08-25, days after the edit. Ask the running binary to parse what is
+        # on disk now, while it is still up and can be asked.
+        if [ -n "${DOCTOR_COMPOSE:-$(command -v docker)}" ] && [ "${BORING_SKIP_CONFIG_PROBE:-0}" != 1 ]; then
+            if docker compose exec -T boring-drudge drudge audit >/dev/null 2>&1; then
+                ok "running engine can parse the config on disk"
+            else
+                config_err="$(docker compose exec -T boring-drudge drudge audit 2>&1 | head -2 | tr '\n' ' ')"
+                bad "the running engine CANNOT parse boring.json — the next restart will crash-loop, not start: $config_err"
+                failed_engine=1
+            fi
+        fi
     else
         bad "engine /health 200 but postgres is degraded ($BORING_URL) — distilled sessions are being DROPPED"; failed_engine=1
         drudge_down=1
