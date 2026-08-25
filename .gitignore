@@ -39,6 +39,10 @@ vault/.obsidian/
 
 # 개인 문서·작업 핸드오프(회사명 등 포함) — 공개 제외
 docs/*
+# The PRD is the product definition and a CI gate reads it (quality_gate_goals_derives_from_prd).
+# `docs/*` exists for personal working docs; a tracked contract needs an explicit exception —
+# this is the second artifact caught by that rule after data/schema/baseline.sql.
+!docs/PRD.md
 
 # 개인 정책 설정 — 예시 파일(boring.example.json)만 추적
 boring.json
