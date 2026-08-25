@@ -31,6 +31,14 @@ run_maintenance() {
     python3 scripts/data-steward.py --fix --yes
     echo "--- retention ---"
     python3 scripts/retention.py --apply --yes
+    # Injection precision is the product's first-class metric and it cannot be computed from
+    # distances — only from labels on real injections. Collecting them by hand never happened,
+    # so the daily run takes a bounded sample. Bounded on purpose: the local model judges 24
+    # hits in roughly a minute, and a backlog sweep would make this run unbounded. Failure here
+    # must not fail housekeeping — a missing day of labels is a smaller loss than a skipped
+    # retention pass.
+    echo "--- recall labels ---"
+    python3 scripts/label-recall.py --judge --queries 8 --hits 3 || echo "(label pass failed — continuing)"
     echo "=== maintenance finished at $(date) ==="
 }
 
