@@ -2092,6 +2092,68 @@ mod tests {
         assert_eq!(tool_outcome_snippet(&big).len(), 500);
     }
 
+    /// GOALS.md derives from docs/PRD.md, and this asserts the two stayed in step.
+    ///
+    /// It cannot check that GOALS is *true* — no machine rule can — but it removes the silence.
+    /// The failure mode it exists for is a PRD that moves while its derived contract quietly
+    /// rots, which is exactly what happened to GOALS.md for 39 commits before the PRD existed.
+    /// Editing the PRD's version without touching GOALS now turns CI red.
+    ///
+    /// What it deliberately does NOT catch, verified by mutation: removing one of several `[R1]`
+    /// mentions still passes, because the check is existence-level. Tightening it to per-gate-row
+    /// tagging needs GOALS.md rewritten into a parseable grammar, and that cost is not paid yet.
+    /// So this gate removes silence, not staleness — the remaining gap is the reviewer's.
+    #[test]
+    fn quality_gate_goals_derives_from_prd() {
+        let prd = repo_file("docs/PRD.md");
+        let goals = repo_file("GOALS.md");
+
+        let version = prd
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("<!-- prd-version:")?
+                    .strip_suffix("-->")
+                    .map(|v| v.trim().to_owned())
+            })
+            .expect("docs/PRD.md must open with <!-- prd-version: N -->");
+        let expected = format!("<!-- derived-from: PRD v{version} -->");
+        assert!(
+            goals.contains(&expected),
+            "GOALS.md must declare {expected} — the PRD moved to v{version} and its derived \
+             contract did not follow"
+        );
+
+        // Every requirement the PRD defines has to be enforced by, or explicitly named in, the
+        // current slice; and the slice cannot cite a requirement that does not exist. Both
+        // directions matter: the first catches a requirement nobody carries, the second catches
+        // a gate justified by an R-id that was renamed or removed.
+        let defined: Vec<String> = (1..=9)
+            .map(|n| format!("R{n}"))
+            .filter(|r| prd.contains(&format!("### {r}.")))
+            .collect();
+        assert!(
+            defined.len() >= 3,
+            "expected the PRD to define several ### R#. requirements, found {defined:?}"
+        );
+        for r in &defined {
+            assert!(
+                goals.contains(&format!("[{r}]")),
+                "GOALS.md never references [{r}], so nothing in the current slice carries it — \
+                 either enforce it or say in GOALS why this slice does not"
+            );
+        }
+        for n in 1..=9 {
+            let tag = format!("[R{n}]");
+            if goals.contains(&tag) {
+                assert!(
+                    defined.contains(&format!("R{n}")),
+                    "GOALS.md cites {tag} but docs/PRD.md defines no such requirement"
+                );
+            }
+        }
+    }
+
     #[test]
     fn quality_gate_readmes_match_mcp_tool_inventory() {
         let docs = [

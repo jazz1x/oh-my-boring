@@ -7,7 +7,7 @@ This adapter wires oh-my-boring into Claude Code via hooks.
 | Hook | Script | What it does |
 |---|---|---|
 | `SessionStart` | `session-start-recall.py` | Calls `POST /context` and injects `{decisions, risks, facts, glossary}` as compact additional context. Falls back to recent work if no project is detected. |
-| `UserPromptSubmit` | `recall.py` | Pulls relevant memory excerpts on demand and prepends them to the user prompt (throttled to once per session). |
+| `UserPromptSubmit` | `recall.py` | Prepends relevant memory excerpts to **every** prompt (no throttle on this adapter — Kimi's throttles, this one does not). Also records what it injected, so `SessionEnd` can measure whether any of it was used. |
 | `SessionEnd` / `Stop` | `distill-session.py` | Distills the session into a durable note and stores it via `ohmyboring/remember`. |
 
 `distill-session.py` emits `distill_resolution` events with
