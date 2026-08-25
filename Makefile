@@ -1,4 +1,4 @@
-.PHONY: help up down build logs agent-logs events ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality test-db self-verify-check deny eval bench-llm psql reset
+.PHONY: help up down build logs agent-logs events ask sync remember collect distill-now collect-kimi smoke e2e doctor readiness heal verify-llm maintenance maintenance-install maintenance-uninstall maintenance-status steward steward-fix vault-cleanup-check vault-cleanup-fix retention retention-apply backup-db restore-db compact models ollama hermes-build guard quality test-db test-db-upgrade self-verify-check deny eval bench-llm psql reset
 
 # Some Docker Desktop installs have a broken `docker compose` plugin while the
 # standalone `docker-compose` binary works. Fall back transparently.
@@ -152,6 +152,9 @@ test-db: ## Run the DB gate suites (origin_boundary/store_integration/context_in
 	  (cd drudge && cargo test -p drudge --test "$$suite" -- --test-threads=1) || { echo "FAILED: $$suite"; fail=1; }; \
 	done; \
 	exit "$$fail"
+
+test-db-upgrade: ## Schema parity — a DB upgraded from data/schema/baseline.sql must equal a fresh one
+	@sh scripts/test_schema_parity.sh
 
 self-verify-check: ## Check self-verification stage contract: make self-verify-check [STAGE=bootstrap] [SUMMARY=/path/summary.tsv]
 	@python3 scripts/self-verify-contract.py --stage "$${STAGE:-bootstrap}" $${SUMMARY:+--summary "$$SUMMARY"}
