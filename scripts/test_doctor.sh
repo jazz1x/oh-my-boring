@@ -23,9 +23,15 @@ case " $* " in
     else
         printf '{"status":"ok"}'
     fi
+    exit 0
     ;;
 esac
-exit 0
+# Anything this fake does not recognise is an unmodelled call, and answering it with a
+# cheerful exit 0 is how a fixture stops being able to see a check at all — #217 removed
+# exactly this catch-all from the fake python3, and it was re-introduced here one binary
+# over. A new curl-based doctor check must fail loudly here until this fake models it.
+echo "fake curl: unmodelled call: $*" >&2
+exit 7
 SH
 
     cat >"$fakebin/docker" <<'SH'
@@ -260,10 +266,12 @@ case "$(cat "$TMP/build-sha-absent.out")" in
 esac
 
 head_sha="$(make_case_repo "$TMP/build-sha-drift")"
-if ! ( DOCTOR_BUILD_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
-       run_strict "$TMP/build-sha-drift" "$TMP/build-sha-drift.out" ); then
+# Drift fails readiness as of 2026-08-25. It was a warning, and the warning did not work:
+# #221 sat merged-but-not-deployed and collected zero labels while readiness stayed green.
+if ( DOCTOR_BUILD_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+     run_strict "$TMP/build-sha-drift" "$TMP/build-sha-drift.out" ); then
     cat "$TMP/build-sha-drift.out"
-    echo "FAIL: deploy drift is a warning, not a strict failure" >&2
+    echo "FAIL: deploy drift must fail strict readiness, not merely warn" >&2
     exit 1
 fi
 case "$(cat "$TMP/build-sha-drift.out")" in
@@ -304,6 +312,15 @@ case "$(cat "$TMP/build-sha-match.out")" in
     exit 1
     ;;
 esac
+
+# The fixture's own fakes are checked here, because a fake that answers an unmodelled call with
+# exit 0 makes every future check built on it vacuous — that is #217's defect, and it was living
+# in the fake curl until 2026-08-25. Nothing else in this file exercises an unmodelled call, so
+# without this assertion the guard would be unprovable.
+if "$TMP/fakebin/curl" -sf http://127.0.0.1:7700/some-endpoint-the-fake-does-not-model >/dev/null 2>&1; then
+    echo "FAIL: fake curl answers unmodelled calls successfully — checks built on it are vacuous" >&2
+    exit 1
+fi
 
 # (a1) hook wiring. install.sh may register the tilde form, which the shell expands at run time
 # but which a grep for the expanded path never matches — doctor called working hooks missing.

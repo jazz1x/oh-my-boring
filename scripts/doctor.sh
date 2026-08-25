@@ -235,7 +235,14 @@ if [ "$(curl -s -o /dev/null -w '%{http_code}' -m5 "$BORING_URL/health" 2>/dev/n
         elif [ "$running_sha" = "$head_sha" ]; then
             ok "engine runs the checked-out commit ($(printf '%.8s' "$running_sha"))"
         else
-            warn "DEPLOY DRIFT — engine runs $(printf '%.8s' "$running_sha"), checkout is at $(printf '%.8s' "$head_sha"). Merged work is not live until 'make build' + restart."
+            # Was a warning until 2026-08-25, and the warning did not work: #221 shipped the
+            # only instrument that can measure injection precision, sat merged-but-not-running,
+            # and collected zero labels while readiness stayed green. A gate that reports the
+            # product is stale without failing teaches the reader to scroll past it. Readiness
+            # answers "can I trust tomorrow's briefing" — an engine running older code than the
+            # checkout cannot be trusted to, so this is a failure, not a note.
+            bad "DEPLOY DRIFT — engine runs $(printf '%.8s' "$running_sha"), checkout is at $(printf '%.8s' "$head_sha"). Merged work is not live until 'make build' + restart."
+            failed_engine=1
         fi
     else
         bad "engine /health 200 but postgres is degraded ($BORING_URL) — distilled sessions are being DROPPED"; failed_engine=1
