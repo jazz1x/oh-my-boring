@@ -27,19 +27,26 @@ def test_session_throttle_blocks_repeated_calls():
 
 
 def test_session_throttle_expires_after_window():
+    # Moves the clock instead of sleeping. The sleeping version asserted on a one-second window
+    # and went red inside guard.sh once under machine load while passing standalone — a timing
+    # test is a load test nobody asked for, and it also spent 1.1s of every CI run.
     _tmp_throttle()
+    import time as _time
+
     original_ttl = recall_core.SESSION_THROTTLE_SECONDS
+    original_time = recall_core.time.time
+    clock = [1_000_000.0]
     try:
-        recall_core.SESSION_THROTTLE_SECONDS = 1
+        recall_core.SESSION_THROTTLE_SECONDS = 3600
+        recall_core.time.time = lambda: clock[0]
         assert recall_core._session_throttled("s3") is False
         assert recall_core._session_throttled("s3") is True
-        # Sleep past the 1-second window.
-        import time
-
-        time.sleep(1.1)
+        clock[0] += 3601
         assert recall_core._session_throttled("s3") is False
     finally:
+        recall_core.time.time = original_time
         recall_core.SESSION_THROTTLE_SECONDS = original_ttl
+        del _time
 
 
 def test_empty_session_id_never_throttled():

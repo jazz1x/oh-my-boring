@@ -24,7 +24,8 @@ import urllib.request
 # sibling agents/shared dir is found from the real file location, not the symlink's dir.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "shared"))
 import boring_config  # noqa: E402
-import event_log  # noqa: E402
+import event_log
+import uptake_core  # noqa: E402
 import markers  # noqa: E402
 import omb_env  # noqa: E402
 import transcript  # noqa: E402
@@ -785,6 +786,39 @@ def log_skip_event(session_id, origin, repo, resolution, reason):
         reason=reason,
         **workflow_contract.skip_fields(),
     )
+
+
+def log_uptake_event(session_id, repo, transcript_text):
+    """Record whether the agent used any of what was injected into this session.
+
+    Runs at SessionEnd because that is the first moment the whole conversation exists. Emits even
+    when uptake is zero — a session where nothing landed is the observation, and dropping those
+    rows would leave a ledger that only ever reports success.
+
+    Never raises and never blocks distillation: uptake is a measurement of the product, not part
+    of the write door.
+    """
+    try:
+        records = uptake_core.load_records(session_id)
+        if not records:
+            return
+        used_hits, total_hits, used_prompts, prompts = uptake_core.session_uptake(
+            records, transcript_text
+        )
+        event_log.try_append_event(
+            "recall-uptake",
+            "injection_uptake",
+            "ok",
+            session_id=session_id,
+            repo=repo,
+            used_hits=used_hits,
+            total_hits=total_hits,
+            used_prompts=used_prompts,
+            total_prompts=prompts,
+        )
+        uptake_core.prune_session(session_id)
+    except Exception as e:  # noqa: BLE001 — a measurement must never cost a session its note
+        print(f"[distill-session] uptake measurement failed: {e}", file=sys.stderr)
 
 
 def _log_skip_event(session_id, origin, repo, resolution):
