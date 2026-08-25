@@ -788,12 +788,17 @@ def log_skip_event(session_id, origin, repo, resolution, reason):
     )
 
 
-def log_uptake_event(session_id, repo, transcript_text):
+def log_uptake_event(session_id, repo, transcript_text, agent):
     """Record whether the agent used any of what was injected into this session.
 
     Runs at SessionEnd because that is the first moment the whole conversation exists. Emits even
     when uptake is zero — a session where nothing landed is the observation, and dropping those
     rows would leave a ledger that only ever reports success.
+
+    `agent` is required, not inferred: Claude Code injects on every prompt while Kimi throttles to
+    once per session (`agents/kimi/recall.py`), so the two adapters are running different products
+    and a pooled rate would answer neither. The verdict this measurement exists to settle has to
+    be readable per adapter.
 
     Never raises and never blocks distillation: uptake is a measurement of the product, not part
     of the write door.
@@ -802,19 +807,30 @@ def log_uptake_event(session_id, repo, transcript_text):
         records = uptake_core.load_records(session_id)
         if not records:
             return
-        used_hits, total_hits, used_prompts, prompts = uptake_core.session_uptake(
-            records, transcript_text
-        )
+        (
+            used_hits,
+            total_hits,
+            used_prompts,
+            prompts,
+            used_controls,
+            total_controls,
+        ) = uptake_core.session_uptake(records, transcript_text)
         event_log.try_append_event(
             "recall-uptake",
             "injection_uptake",
             "ok",
             session_id=session_id,
             repo=repo,
+            agent=agent,
             used_hits=used_hits,
             total_hits=total_hits,
             used_prompts=used_prompts,
             total_prompts=prompts,
+            # The chance rate, recorded beside the treatment rate so no reader can quote one
+            # without the other. A verdict from treatment alone cannot tell an effect from a
+            # coincidence on the same topic.
+            used_controls=used_controls,
+            total_controls=total_controls,
         )
         uptake_core.prune_session(session_id)
     except Exception as e:  # noqa: BLE001 — a measurement must never cost a session its note
