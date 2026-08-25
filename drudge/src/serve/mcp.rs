@@ -2092,6 +2092,40 @@ mod tests {
         assert_eq!(tool_outcome_snippet(&big).len(), 500);
     }
 
+    /// `forget` deletes a file, and its `id` comes from an MCP argument — the one place a
+    /// recall-injection attack would aim. The boundary check exists (#102, 2026-06-21 red team)
+    /// but nothing asserted it, so it could be refactored away in silence. This pins the
+    /// rejected shapes to the source rather than to a running engine.
+    #[test]
+    fn forget_rejects_path_navigation_in_the_note_id() {
+        let src = repo_file("drudge/src/serve/mcp.rs");
+        let start = src
+            .find("async fn mcp_forget")
+            .expect("mcp_forget must exist");
+        let body = &src[start..start + 2000.min(src.len() - start)];
+        for needle in [r"id.contains('/')", r"id.contains('\\')"] {
+            assert!(
+                body.contains(needle),
+                "mcp_forget must contain {needle} — path navigation has to be rejected before \
+                 the filesystem is touched"
+            );
+        }
+        assert!(
+            body.contains(r#"id.contains("..")"#),
+            "mcp_forget must reject an id containing `..`"
+        );
+        let guard = body
+            .find("invalid note id")
+            .expect("rejection must be explicit");
+        let join = body
+            .find("wiki_dir.join")
+            .expect("mcp_forget must build a path");
+        assert!(
+            guard < join,
+            "the id must be rejected BEFORE it is joined onto the vault path"
+        );
+    }
+
     /// GOALS.md derives from docs/PRD.md, and this asserts the two stayed in step.
     ///
     /// It cannot check that GOALS is *true* — no machine rule can — but it removes the silence.

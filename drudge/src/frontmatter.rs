@@ -63,10 +63,16 @@ impl Claim {
         if k.is_empty() { "fact" } else { k }
     }
 
-    /// Normalized confidence, or `"certain"` when absent/unknown.
+    /// Normalized confidence, or `"unknown"` when the note did not say.
+    ///
+    /// It used to default to `"certain"`, which promoted silence to the strongest claim the
+    /// vocabulary has: 24 vault claims carry `confidence: ''` — benchmark numbers the distiller
+    /// declined to vouch for — and they were being stored, ranked and rendered as certain.
+    /// `kind` keeps its `"fact"` default because a claim genuinely is a fact unless it says
+    /// otherwise; confidence has no such neutral reading. Not saying is not the same as being sure.
     pub fn confidence(&self) -> &str {
         let c = self.confidence.trim();
-        if c.is_empty() { "certain" } else { c }
+        if c.is_empty() { "unknown" } else { c }
     }
 }
 
@@ -209,6 +215,37 @@ mod tests {
         assert_eq!(back.project, "oh-my-boring");
         assert_eq!(back.tags, vec!["a", "b"]);
         assert_eq!(body, "본문");
+    }
+
+    /// A claim the distiller declined to vouch for must not be stored as the strongest thing the
+    /// vocabulary can say. 24 vault claims carry `confidence: ''` and were reading as `certain`.
+    #[test]
+    fn absent_confidence_is_unknown_not_certain() {
+        let claim = super::Claim {
+            subject: "recall_core.py".to_owned(),
+            predicate: "threshold-value".to_owned(),
+            value: "0.514".to_owned(),
+            kind: String::new(),
+            confidence: String::new(),
+        };
+        assert_eq!(claim.confidence(), "unknown");
+        assert_ne!(
+            claim.confidence(),
+            "certain",
+            "silence must not become certainty"
+        );
+        // `kind` keeps its default on purpose: a claim is a fact unless it says otherwise.
+        assert_eq!(claim.kind(), "fact");
+
+        let spoken = super::Claim {
+            confidence: "  likely  ".to_owned(),
+            ..claim
+        };
+        assert_eq!(
+            spoken.confidence(),
+            "likely",
+            "a stated value is still honoured"
+        );
     }
 
     #[test]

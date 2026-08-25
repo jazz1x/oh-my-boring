@@ -44,7 +44,8 @@ Claims are the most important field for later recall. Each claim is a `(subject,
 - `predicate`: property/decision axis (e.g., `model-interface`, `status`, `release-version`)
 - `value`: concrete fact (e.g., `bedrock-converse`, `removed`, `0.1.3`)
 - `kind`: one of `fact` (default), `decision`, `assumption`, `risk`, `blocked`, `goal`, `term`, `next`
-- `confidence`: one of `certain` (default), `likely`, `assumption`, `outdated`
+- `confidence`: one of `certain`, `likely`, `assumption`, `outdated`. Omitting it stores
+  `unknown` — silence is not certainty, so there is no strongest-value default.
 
 Aim for 3–5 claims per session-distilled note. Avoid vague values like "검토" or "확인" — they sound like next-steps, not facts.
 
