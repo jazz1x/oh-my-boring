@@ -1,19 +1,25 @@
 use std::collections::HashMap;
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Language, Node, Parser};
 
 use super::{
     CodeIndexError, ParseStatus, ParsedFile, Relation, RelationKind, Symbol, SymbolKind, stable_id,
 };
 
-pub(super) fn parse_rust(
+struct LanguageProfile {
+    language: Language,
+    symbol_kind: fn(&str) -> Option<SymbolKind>,
+}
+
+fn parse_with_profile(
+    profile: &LanguageProfile,
     repository_id: &str,
     relative_path: &str,
     _file_id: &str,
     source: &str,
 ) -> Result<ParsedFile, CodeIndexError> {
     let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+    parser.set_language(&profile.language)?;
     let tree = parser
         .parse(source, None)
         .ok_or(CodeIndexError::ParserCancelled)?;
@@ -39,11 +45,97 @@ pub(super) fn parse_rust(
         relative_path,
         None,
         "",
+        profile,
         &mut symbol_occurrences,
         &mut relation_occurrences,
         &mut output,
     );
     Ok(output)
+}
+
+pub(super) fn parse_rust(
+    repository_id: &str,
+    relative_path: &str,
+    file_id: &str,
+    source: &str,
+) -> Result<ParsedFile, CodeIndexError> {
+    fn rust_symbol_kind(node_kind: &str) -> Option<SymbolKind> {
+        match node_kind {
+            "function_item" | "function_signature_item" => Some(SymbolKind::Function),
+            "struct_item" => Some(SymbolKind::Struct),
+            "enum_item" => Some(SymbolKind::Enum),
+            "union_item" => Some(SymbolKind::Union),
+            "trait_item" => Some(SymbolKind::Trait),
+            "type_item" => Some(SymbolKind::TypeAlias),
+            "const_item" => Some(SymbolKind::Constant),
+            "static_item" => Some(SymbolKind::Static),
+            "mod_item" => Some(SymbolKind::Module),
+            "macro_definition" => Some(SymbolKind::Macro),
+            _ => None,
+        }
+    }
+
+    parse_with_profile(
+        &LanguageProfile {
+            language: tree_sitter_rust::LANGUAGE.into(),
+            symbol_kind: rust_symbol_kind,
+        },
+        repository_id,
+        relative_path,
+        file_id,
+        source,
+    )
+}
+
+pub(super) fn parse_python(
+    repository_id: &str,
+    relative_path: &str,
+    file_id: &str,
+    source: &str,
+) -> Result<ParsedFile, CodeIndexError> {
+    fn python_symbol_kind(node_kind: &str) -> Option<SymbolKind> {
+        match node_kind {
+            "function_definition" => Some(SymbolKind::Function),
+            "class_definition" => Some(SymbolKind::Struct),
+            _ => None,
+        }
+    }
+
+    parse_with_profile(
+        &LanguageProfile {
+            language: tree_sitter_python::LANGUAGE.into(),
+            symbol_kind: python_symbol_kind,
+        },
+        repository_id,
+        relative_path,
+        file_id,
+        source,
+    )
+}
+
+pub(super) fn parse_shell(
+    repository_id: &str,
+    relative_path: &str,
+    file_id: &str,
+    source: &str,
+) -> Result<ParsedFile, CodeIndexError> {
+    fn shell_symbol_kind(node_kind: &str) -> Option<SymbolKind> {
+        match node_kind {
+            "function_definition" => Some(SymbolKind::Function),
+            _ => None,
+        }
+    }
+
+    parse_with_profile(
+        &LanguageProfile {
+            language: tree_sitter_bash::LANGUAGE.into(),
+            symbol_kind: shell_symbol_kind,
+        },
+        repository_id,
+        relative_path,
+        file_id,
+        source,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -54,6 +146,7 @@ fn walk(
     relative_path: &str,
     parent_symbol_id: Option<&str>,
     parent_qualified_name: &str,
+    profile: &LanguageProfile,
     symbol_occurrences: &mut HashMap<String, usize>,
     relation_occurrences: &mut HashMap<String, usize>,
     output: &mut ParsedFile,
@@ -62,7 +155,7 @@ fn walk(
         .then(|| impl_name(node, source))
         .flatten()
         .map(|name| qualify(parent_qualified_name, &name));
-    let definition = symbol_definition(node, source);
+    let definition = symbol_definition(node, source, profile.symbol_kind);
     let (scope_symbol_id, scope_qualified_name) = if let Some((kind, name)) = definition {
         let qualified_name = if parent_qualified_name.is_empty() {
             name.clone()
@@ -134,6 +227,7 @@ fn walk(
             relative_path,
             scope_symbol_id.as_deref(),
             &scope_qualified_name,
+            profile,
             symbol_occurrences,
             relation_occurrences,
             output,
@@ -149,20 +243,12 @@ fn qualify(parent: &str, name: &str) -> String {
     }
 }
 
-fn symbol_definition(node: Node<'_>, source: &[u8]) -> Option<(SymbolKind, String)> {
-    let kind = match node.kind() {
-        "function_item" | "function_signature_item" => SymbolKind::Function,
-        "struct_item" => SymbolKind::Struct,
-        "enum_item" => SymbolKind::Enum,
-        "union_item" => SymbolKind::Union,
-        "trait_item" => SymbolKind::Trait,
-        "type_item" => SymbolKind::TypeAlias,
-        "const_item" => SymbolKind::Constant,
-        "static_item" => SymbolKind::Static,
-        "mod_item" => SymbolKind::Module,
-        "macro_definition" => SymbolKind::Macro,
-        _ => return None,
-    };
+fn symbol_definition(
+    node: Node<'_>,
+    source: &[u8],
+    symbol_kind: fn(&str) -> Option<SymbolKind>,
+) -> Option<(SymbolKind, String)> {
+    let kind = symbol_kind(node.kind())?;
     node.child_by_field_name("name")
         .and_then(|name| node_text(name, source))
         .map(|name| (kind, name))

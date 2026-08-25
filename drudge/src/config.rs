@@ -275,6 +275,8 @@ impl RepositoryDisplayName {
 #[serde(rename_all = "lowercase")]
 pub enum CodeLanguage {
     Rust,
+    Python,
+    Shell,
 }
 
 impl CodeLanguage {
@@ -282,6 +284,8 @@ impl CodeLanguage {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Shell => "shell",
         }
     }
 }
@@ -993,7 +997,7 @@ mod tests {
     #[test]
     fn code_index_rejects_unsupported_language_and_duplicate_identity() {
         let unsupported = BoringConfig::from_str(
-            r#"{"schema_version":2,"code_index":{"sources":[{"id":"x","name":"X","root":"/x","language":"python","enabled":true}]}}"#,
+            r#"{"schema_version":2,"code_index":{"sources":[{"id":"x","name":"X","root":"/x","language":"cpp","enabled":true}]}}"#,
         );
         assert!(unsupported.is_err());
 

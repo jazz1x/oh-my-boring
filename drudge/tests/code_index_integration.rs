@@ -22,14 +22,16 @@ fn unique_id(prefix: &str) -> String {
 }
 
 fn source(id: &str, root: &std::path::Path) -> CodeIndexSource {
-    CodeIndexSource::new(
-        id,
-        format!("Test {id}"),
-        root.to_path_buf(),
-        CodeLanguage::Rust,
-        true,
-    )
-    .expect("valid test source")
+    source_with_language(id, root, CodeLanguage::Rust)
+}
+
+fn source_with_language(
+    id: &str,
+    root: &std::path::Path,
+    language: CodeLanguage,
+) -> CodeIndexSource {
+    CodeIndexSource::new(id, format!("Test {id}"), root.to_path_buf(), language, true)
+        .expect("valid test source")
 }
 
 async fn connect(dsn: &str) -> Client {
@@ -308,4 +310,159 @@ async fn composite_foreign_keys_reject_cross_repository_ownership() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn python_symbols_are_indexed_as_functions_and_classes() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("module.py"),
+        "class Widget:\n    def draw(self):\n        pass\n\ndef helper():\n    pass\n",
+    )
+    .unwrap();
+    let repository_id = unique_id("code-python");
+    let configured = source_with_language(&repository_id, root.path(), CodeLanguage::Python);
+    let mut store = initialized_store(&dsn).await;
+    let report = sync_repository(&mut store, &configured)
+        .await
+        .expect("sync python fixture");
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.changed, 1);
+
+    let status = &store.status(Some(&repository_id)).await.unwrap()[0];
+    assert_eq!(status.files, 1);
+    assert!(
+        status.symbols >= 2,
+        "expected at least 2 symbols, got {}",
+        status.symbols
+    );
+
+    let db = connect(&dsn).await;
+    let kinds: Vec<String> = db
+        .query(
+            "SELECT DISTINCT kind FROM code_index.symbol WHERE repository_id = $1 ORDER BY kind",
+            &[&repository_id],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(kinds.contains(&"function".to_string()));
+    assert!(kinds.contains(&"struct".to_string()));
+
+    db.execute(
+        "DELETE FROM code_index.repository WHERE id = $1",
+        &[&repository_id],
+    )
+    .await
+    .expect("clean up python repository");
+}
+
+#[tokio::test]
+async fn shell_function_definitions_are_indexed() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("script.sh"),
+        "helper() { echo ok; }\nmain() { helper; }\n",
+    )
+    .unwrap();
+    let repository_id = unique_id("code-shell");
+    let configured = source_with_language(&repository_id, root.path(), CodeLanguage::Shell);
+    let mut store = initialized_store(&dsn).await;
+    let report = sync_repository(&mut store, &configured)
+        .await
+        .expect("sync shell fixture");
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.changed, 1);
+
+    let status = &store.status(Some(&repository_id)).await.unwrap()[0];
+    assert_eq!(status.files, 1);
+    assert!(
+        status.symbols >= 1,
+        "expected at least 1 symbol, got {}",
+        status.symbols
+    );
+
+    let db = connect(&dsn).await;
+    let kinds: Vec<String> = db
+        .query(
+            "SELECT DISTINCT kind FROM code_index.symbol WHERE repository_id = $1 ORDER BY kind",
+            &[&repository_id],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(kinds.contains(&"function".to_string()));
+
+    db.execute(
+        "DELETE FROM code_index.repository WHERE id = $1",
+        &[&repository_id],
+    )
+    .await
+    .expect("clean up shell repository");
+}
+
+/// An index created before python/shell existed still carries `CHECK (language IN ('rust'))`.
+/// `CREATE TABLE IF NOT EXISTS` never revisits it, so widening the literal in SCHEMA reaches new
+/// databases only — and every test that starts from a fresh container passes while the owner's
+/// actual index rejects the first python repository it is handed. This test starts from the old
+/// constraint on purpose: it is the only place that can fail.
+#[tokio::test]
+async fn initialize_widens_a_pre_existing_rust_only_language_check() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    // Reach the current schema first, then put the pre-widening constraint back to simulate an
+    // index built before this change shipped.
+    initialized_store(&dsn).await;
+    let db = connect(&dsn).await;
+    db.batch_execute(
+        "ALTER TABLE code_index.repository DROP CONSTRAINT IF EXISTS repository_language_check;
+         ALTER TABLE code_index.repository ADD CONSTRAINT repository_language_check
+             CHECK (language IN ('rust'));",
+    )
+    .await
+    .expect("install the legacy rust-only constraint");
+
+    let repository_id = unique_id("legacy-check");
+    let legacy_insert = db
+        .execute(
+            "INSERT INTO code_index.repository (id, name, root_path, language, last_synced_at)
+             VALUES ($1, $1, '/tmp', 'python', now())",
+            &[&repository_id],
+        )
+        .await;
+    assert!(
+        legacy_insert.is_err(),
+        "the legacy constraint must reject python — otherwise this test proves nothing"
+    );
+
+    // The migration must repair it without anyone running SQL by hand.
+    initialized_store(&dsn).await;
+    db.execute(
+        "INSERT INTO code_index.repository (id, name, root_path, language, last_synced_at)
+         VALUES ($1, $1, '/tmp', 'python', now())",
+        &[&repository_id],
+    )
+    .await
+    .expect("initialize() must widen the language check on an existing index");
+
+    db.execute(
+        "DELETE FROM code_index.repository WHERE id = $1",
+        &[&repository_id],
+    )
+    .await
+    .expect("clean up legacy-check repository");
 }
