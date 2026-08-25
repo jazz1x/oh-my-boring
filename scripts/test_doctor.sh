@@ -118,6 +118,15 @@ JSON
     cat >"$home/.claude/settings.json" <<JSON
 {"hooks":["$boring/hooks/distill-session.py","$boring/hooks/recall.py"]}
 JSON
+    if [ -n "${DOCTOR_HOST_CLI_SHA:-}" ]; then
+        mkdir -p "$boring/drudge/target/release"
+        cat >"$boring/drudge/target/release/drudge" <<SH
+#!/bin/sh
+[ "\${1:-}" = version ] && { echo "$DOCTOR_HOST_CLI_SHA"; exit 0; }
+exit 0
+SH
+        chmod +x "$boring/drudge/target/release/drudge"
+    fi
     cat >"$boring/scripts/verify-llm.sh" <<'SH'
 #!/bin/sh
 if [ "${DOCTOR_VERIFY_LLM_FAIL:-0}" = 1 ]; then
@@ -373,6 +382,54 @@ case "$(cat "$TMP/hooks-partial.out")" in
   *)
     cat "$TMP/hooks-partial.out"
     echo "FAIL: strict doctor did not report the half-wired hooks" >&2
+    exit 1
+    ;;
+esac
+
+# (a2b2) The host CLI is a separate artifact from the image: `make build` does not refresh it, and
+# the daily code-sync runs it. A stale one ran old logic against live data with every gate green.
+matched_host="$(make_case_repo "$TMP/host-cli-ok")"
+DOCTOR_HOST_CLI_SHA="$matched_host" make_case "$TMP/host-cli-ok" yes
+if ! ( DOCTOR_BUILD_SHA="$matched_host" DOCTOR_HOST_CLI_SHA="$matched_host" \
+       run_strict "$TMP/host-cli-ok" "$TMP/host-cli-ok.out" ); then
+    cat "$TMP/host-cli-ok.out"
+    echo "FAIL: a host CLI built from the checkout must pass" >&2
+    exit 1
+fi
+
+drift_host="$(make_case_repo "$TMP/host-cli-drift")"
+DOCTOR_HOST_CLI_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef make_case "$TMP/host-cli-drift" yes
+if ( DOCTOR_BUILD_SHA="$drift_host" DOCTOR_HOST_CLI_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+     run_strict "$TMP/host-cli-drift" "$TMP/host-cli-drift.out" ); then
+    cat "$TMP/host-cli-drift.out"
+    echo "FAIL: a host CLI older than the checkout must fail readiness" >&2
+    exit 1
+fi
+case "$(cat "$TMP/host-cli-drift.out")" in
+  *"HOST CLI DRIFT"*) ;;
+  *)
+    cat "$TMP/host-cli-drift.out"
+    echo "FAIL: strict doctor did not name the stale host CLI" >&2
+    exit 1
+    ;;
+esac
+
+# An unstamped host CLI (built without git, or an old binary from before the stamp existed) is a
+# different statement from a stale one: there is nothing to compare, so it warns and readiness
+# still passes. Treating "unknown" as "wrong" would block every wiki-first install.
+unstamped_host="$(make_case_repo "$TMP/host-cli-unstamped")"
+DOCTOR_HOST_CLI_SHA=unstamped make_case "$TMP/host-cli-unstamped" yes
+if ! ( DOCTOR_BUILD_SHA="$unstamped_host" DOCTOR_HOST_CLI_SHA=unstamped \
+       run_strict "$TMP/host-cli-unstamped" "$TMP/host-cli-unstamped.out" ); then
+    cat "$TMP/host-cli-unstamped.out"
+    echo "FAIL: an unstamped host CLI must warn, not fail readiness" >&2
+    exit 1
+fi
+case "$(cat "$TMP/host-cli-unstamped.out")" in
+  *"host CLI reports no build stamp"*) ;;
+  *)
+    cat "$TMP/host-cli-unstamped.out"
+    echo "FAIL: strict doctor did not report the unstamped host CLI" >&2
     exit 1
     ;;
 esac

@@ -10,6 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+# The commit being built, consumed by build.rs. Declared in this stage because an ARG is scoped
+# to the stage that declares it; the runtime stage declares its own for the /health env var.
+ARG BUILD_SHA
+ENV BUILD_SHA=$BUILD_SHA
+
 # 의존성 레이어 캐시: Cargo 매니페스트를 먼저 복사 후 더미 빌드 → 소스 변경 시 재빌드 최소화
 COPY Cargo.toml Cargo.lock ./
 # 더미 main + lib 으로 deps만 미리 컴파일 (Cargo.toml에 [lib]가 있으므로 둘 다 필요).
@@ -18,6 +23,10 @@ RUN mkdir src && printf 'pub mod dummy {}\n' > src/lib.rs && echo 'fn main(){}' 
     && rm -rf src
 
 # 실제 소스 복사 + 본 빌드
+# build.rs lives beside Cargo.toml, not under src/, so it needs its own COPY — without it the
+# binary compiles with no BORING_BUILT_FROM and `env!()` fails at compile time. It resolves the
+# stamp from the BUILD_SHA arg here, because this context has no .git to ask.
+COPY build.rs ./build.rs
 COPY src ./src
 # touch both entry points so cargo rebuilds the lib + bin after the dummy dependency layer.
 RUN touch src/main.rs src/lib.rs && cargo build --release
