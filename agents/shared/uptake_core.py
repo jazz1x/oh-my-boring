@@ -74,12 +74,28 @@ def phrases(snippet, size=PHRASE_WORDS, limit=MAX_PHRASES):
 LEDGER_MAX_AGE_DAYS = 3
 
 
-def injection_record(session_id, prompt, hits, max_results):
+def _fingerprints(hits, limit):
+    out = []
+    for hit in (hits or [])[:limit]:
+        src = (hit.get("source_path") or "").rsplit("/", 1)[-1]
+        snippet = " ".join((hit.get("snippet") or "").split())[:280]
+        if not (src and snippet):
+            continue
+        out.append({"src": src, "phrases": phrases(snippet)})
+    return out
+
+
+def injection_record(session_id, prompt, hits, max_results, controls=None):
     """The row the recall hook appends when it injects.
 
     Stores the source basename and the snippet fingerprints — never the snippet itself, so the
     ledger cannot become a second copy of the vault. `prompt_words` is kept so a later match can
     be discounted when the user had already said the same thing.
+
+    `controls` are hits the search returned but the hook did NOT inject. Scoring them the same way
+    yields the chance rate: how often a note on this topic gets echoed anyway. An uptake number
+    without that floor cannot distinguish "the memory was used" from "any note about this subject
+    would have shared words with the answer", which is the mistake that produced 0.514.
     """
     # No session id means SessionEnd can never attribute this row to a transcript, so it could
     # only ever inflate the denominator. Dropping it here also stops any test that drives the
@@ -87,13 +103,7 @@ def injection_record(session_id, prompt, hits, max_results):
     # the convention "remember to redirect the ledger in your test" already failed twice.
     if not session_id:
         return None
-    injected = []
-    for hit in (hits or [])[:max_results]:
-        src = (hit.get("source_path") or "").rsplit("/", 1)[-1]
-        snippet = " ".join((hit.get("snippet") or "").split())[:280]
-        if not (src and snippet):
-            continue
-        injected.append({"src": src, "phrases": phrases(snippet)})
+    injected = _fingerprints(hits, max_results)
     if not injected:
         return None
     return {
@@ -101,6 +111,7 @@ def injection_record(session_id, prompt, hits, max_results):
         "ts": time.time(),
         "prompt_words": _words(prompt)[:400],
         "hits": injected,
+        "controls": _fingerprints(controls, len(controls or [])),
     }
 
 
@@ -153,6 +164,19 @@ def assistant_text(transcript_text):
     return "\n".join(kept)
 
 
+def _contains(blob, needle):
+    """Substring match with word boundaries.
+
+    Both sides are space-joined token streams, so padding each with a space turns a substring
+    search into a token-sequence search. Without it `pool.md` matches inside `connection-pool.md`
+    and the phrase `a b c` matches inside `xa b c` — ledger sources are arbitrary basenames, not
+    only collision-safe `wiki-NNNN.md`.
+    """
+    if not needle:
+        return False
+    return f" {needle} " in f" {blob} "
+
+
 def hit_was_used(hit, assistant_words_text, prompt_words):
     """True if the assistant echoed this hit's source name or one of its phrases.
 
@@ -165,32 +189,42 @@ def hit_was_used(hit, assistant_words_text, prompt_words):
     # thing for a user to type: "wiki-1292.md 다시 봐" would have counted as the agent using a
     # memory it was told to look at. Every path into this function has to survive the question
     # "would the agent have said this anyway".
-    if src and src in assistant_words_text and src not in prompt_blob:
+    if _contains(assistant_words_text, src) and not _contains(prompt_blob, src):
         return True
     for phrase in hit.get("phrases") or []:
-        if phrase and phrase in assistant_words_text and phrase not in prompt_blob:
+        if _contains(assistant_words_text, phrase) and not _contains(prompt_blob, phrase):
             return True
     return False
 
 
 def session_uptake(records, transcript_text):
-    """(used_hits, total_hits, used_prompts, total_prompts) for one session.
+    """Treatment and control counts for one session.
 
-    Two rates, because they answer different questions: per-hit uptake says how much of what we
-    push gets used, per-prompt uptake says how often an injection mattered at all.
+    Returns (used_hits, total_hits, used_prompts, total_prompts, used_controls, total_controls).
+    The control counts are scored identically over hits the search returned but the hook never
+    injected: the agent could not have used them, so whatever rate they show is the chance rate
+    that the treatment number has to beat. Reporting treatment alone is how a coincidence gets
+    read as an effect.
+
+    Two treatment rates, because they answer different questions: per-hit uptake says how much of
+    what we push gets used, per-prompt uptake says how often an injection mattered at all.
     """
     assistant_blob = " ".join(_words(assistant_text(transcript_text)))
     used_hits = total_hits = used_prompts = 0
+    used_controls = total_controls = 0
     records = records or []
     for record in records:
+        prompt_words = record.get("prompt_words") or []
         hits = record.get("hits") or []
         total_hits += len(hits)
-        prompt_words = record.get("prompt_words") or []
         used_here = sum(1 for h in hits if hit_was_used(h, assistant_blob, prompt_words))
         used_hits += used_here
         if used_here:
             used_prompts += 1
-    return used_hits, total_hits, used_prompts, len(records)
+        controls = record.get("controls") or []
+        total_controls += len(controls)
+        used_controls += sum(1 for c in controls if hit_was_used(c, assistant_blob, prompt_words))
+    return used_hits, total_hits, used_prompts, len(records), used_controls, total_controls
 
 
 def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_DAYS):
@@ -207,17 +241,32 @@ def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_D
     except OSError:
         return False
     cutoff = (now if now is not None else time.time()) - max_age_days * 86400
-    kept = []
+    # Age out whole sessions by their NEWEST row, never row by row. A session resumed across days
+    # is still live, and dropping its early rows would leave it measured against a denominator
+    # missing its own beginning — long sessions would be systematically under-counted while
+    # looking perfectly healthy.
+    newest = {}
+    parsed = []
     for line in lines:
         try:
             row = json.loads(line)
         except ValueError:
-            kept.append(line)  # keep what we cannot parse rather than silently deleting it
+            parsed.append((line, None, None))  # keep what we cannot parse rather than deleting it
             continue
-        if row.get("session_id") == session_id:
-            continue
+        sid = row.get("session_id")
         ts = row.get("ts")
-        if isinstance(ts, (int, float)) and ts < cutoff:
+        parsed.append((line, sid, ts))
+        if isinstance(ts, (int, float)):
+            newest[sid] = max(newest.get(sid, ts), ts)
+    kept = []
+    for line, sid, _ts in parsed:
+        if sid is None:
+            kept.append(line)
+            continue
+        if sid == session_id:
+            continue
+        last_seen = newest.get(sid)
+        if isinstance(last_seen, (int, float)) and last_seen < cutoff:
             continue
         kept.append(line)
     try:

@@ -28,7 +28,7 @@ def test_injection_is_not_its_own_uptake():
         f"[user] 📚 My past work experience\n- [wiki-0007.md] {SNIPPET}\nwhy did the pool die\n"
         "[assistant] Let me look at the pool configuration first.\n"
     )
-    used, total, used_prompts, prompts = uptake_core.session_uptake([record], transcript)
+    used, total, used_prompts, prompts, _uc, _tc = uptake_core.session_uptake([record], transcript)
     assert (used, total) == (0, 1), "the injected text quoting itself must not count"
     assert (used_prompts, prompts) == (0, 1)
 
@@ -39,7 +39,7 @@ def test_assistant_reusing_the_note_name_counts():
         f"[user] 📚 past experience\n- [wiki-0007.md] {SNIPPET}\nwhy did the pool die\n"
         "[assistant] Per wiki-0007.md this is the recycled-socket case again.\n"
     )
-    used, total, _, _ = uptake_core.session_uptake([record], transcript)
+    used, total, _, _, _, _ = uptake_core.session_uptake([record], transcript)
     assert (used, total) == (1, 1)
 
 
@@ -49,7 +49,7 @@ def test_assistant_reusing_a_phrase_counts():
         f"[user] 📚 past experience\n- [wiki-0007.md] {SNIPPET}\nwhy did the pool die\n"
         "[assistant] Looks like deadpool recycled a socket the server had already closed.\n"
     )
-    used, total, _, _ = uptake_core.session_uptake([record], transcript)
+    used, total, _, _, _, _ = uptake_core.session_uptake([record], transcript)
     assert (used, total) == (1, 1), "an assistant echoing the substance must count"
 
 
@@ -62,7 +62,7 @@ def test_a_phrase_the_user_already_said_is_not_evidence():
         f"[user] {prompt}\n"
         "[assistant] Right, deadpool recycled a socket the server had already closed.\n"
     )
-    used, total, _, _ = uptake_core.session_uptake([record], transcript)
+    used, total, _, _, _, _ = uptake_core.session_uptake([record], transcript)
     assert (used, total) == (0, 1)
 
 
@@ -73,8 +73,71 @@ def test_a_note_name_the_user_typed_is_not_evidence():
     prompt = "wiki-0007.md 다시 보고 pool 문제 정리해줘"
     record = uptake_core.injection_record("s1", prompt, [_hit()], 3)
     transcript = f"[user] {prompt}\n[assistant] wiki-0007.md 를 다시 읽어보겠습니다.\n"
-    used, total, _, _ = uptake_core.session_uptake([record], transcript)
+    used, total, _, _, _, _ = uptake_core.session_uptake([record], transcript)
     assert (used, total) == (0, 1)
+
+
+def test_a_source_name_must_match_on_word_boundaries():
+    # Both sides are space-joined token streams, so a bare substring search let "pool.md" match
+    # inside "connection-pool.md". Ledger sources are arbitrary basenames, not only wiki-NNNN.
+    record = uptake_core.injection_record("s1", "why did it die", [_hit(src="pool.md")], 3)
+    transcript = "[user] why did it die\n[assistant] see connection-pool.md for the details.\n"
+    used, total, _, _, _, _ = uptake_core.session_uptake([record], transcript)
+    assert (used, total) == (0, 1), "a longer name that merely contains ours is not our note"
+    hit_transcript = "[user] why did it die\n[assistant] see pool.md for the details.\n"
+    used, _, _, _, _, _ = uptake_core.session_uptake([record], hit_transcript)
+    assert used == 1, "the exact name must still count"
+
+
+def test_a_long_running_session_does_not_lose_its_early_rows():
+    # Sessions here get resumed across days. Row-by-row expiry would drop a live session's early
+    # injections while another session's SessionEnd ran the prune, leaving it measured against a
+    # denominator missing its own beginning.
+    import json as _json
+    import time as _time
+
+    with tempfile.TemporaryDirectory() as d:
+        path = str(Path(d) / "injections.jsonl")
+        now = _time.time()
+        early = uptake_core.injection_record("long", "p", [_hit()], 3)
+        early["ts"] = now - 5 * 86400            # older than the cutoff …
+        recent = uptake_core.injection_record("long", "p", [_hit()], 3)
+        recent["ts"] = now                        # … but the session is still alive
+        dead = uptake_core.injection_record("dead", "p", [_hit()], 3)
+        dead["ts"] = now - 5 * 86400
+        Path(path).write_text(
+            "\n".join(_json.dumps(r, ensure_ascii=False) for r in (early, recent, dead)) + "\n",
+            encoding="utf-8",
+        )
+        uptake_core.prune_session("unrelated", path, now=now)
+        assert len(uptake_core.load_records("long", path)) == 2, "a live session keeps its history"
+        assert uptake_core.load_records("dead", path) == [], "a session with no recent row ages out"
+
+
+def test_controls_are_scored_but_never_injected():
+    # Controls are hits the search returned and the hook did not inject. The agent cannot have
+    # used them, so their rate is the chance rate the treatment number must beat.
+    control = {"source_path": "/vault/wiki/wiki-0099.md", "snippet": SNIPPET.replace("pool", "queue")}
+    record = uptake_core.injection_record("s1", "why did it die", [_hit()], 3, controls=[control])
+    assert [h["src"] for h in record["hits"]] == ["wiki-0007.md"]
+    assert [c["src"] for c in record["controls"]] == ["wiki-0099.md"]
+
+    transcript = (
+        "[user] why did it die\n"
+        "[assistant] wiki-0099.md 를 보면 답이 있습니다.\n"   # echoes the CONTROL, not the hit
+    )
+    used, total, _, _, used_controls, total_controls = uptake_core.session_uptake(
+        [record], transcript
+    )
+    assert (used, total) == (0, 1), "the injected note was not echoed"
+    assert (used_controls, total_controls) == (1, 1), "the control was, and that is the floor"
+
+
+def test_a_record_with_no_controls_still_works():
+    record = uptake_core.injection_record("s1", "p", [_hit()], 3)
+    assert record["controls"] == []
+    *_, used_controls, total_controls = uptake_core.session_uptake([record], "[assistant] x\n")
+    assert (used_controls, total_controls) == (0, 0)
 
 
 def test_only_assistant_turns_are_scanned():
@@ -84,7 +147,7 @@ def test_only_assistant_turns_are_scanned():
         f"[user] deadpool recycled a socket the server had already closed\n"
         "[assistant] I have no idea.\n"
     )
-    used, _, _, _ = uptake_core.session_uptake([record], transcript)
+    used, _, _, _, _, _ = uptake_core.session_uptake([record], transcript)
     assert used == 0, "a later user turn is not the agent using the memory"
 
 

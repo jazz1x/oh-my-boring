@@ -29,6 +29,7 @@ from distill_core import (  # noqa: F401
     distill_and_remember,
     git_remote_url,
     log_skip_event,
+    log_uptake_event,
     repo_slug,
 )
 
@@ -184,6 +185,12 @@ def main() -> int:
     remote_url = git_remote_url(cwd)
     origin, _rule = boring_config.classify(cwd, remote_url or None)
     repo = repo_slug(cwd)
+    # Kimi's recall writes ledger rows through the shared run_recall, so without this its
+    # injections were recorded and never measured — they aged out silently and inflated the
+    # denominator of a rate computed from all adapters. Before the length gate, same as the
+    # Claude adapter: a session too short to distill still received injections.
+    if is_final:
+        log_uptake_event(session_id, repo, text, "kimi")
     if len(text) < 500:
         print("[omb-distill] transcript too short; skipping", file=sys.stderr)
         log_skip_event(session_id, origin, repo, _distill_resolution(), "too_short")

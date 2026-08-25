@@ -807,9 +807,14 @@ def log_uptake_event(session_id, repo, transcript_text, agent):
         records = uptake_core.load_records(session_id)
         if not records:
             return
-        used_hits, total_hits, used_prompts, prompts = uptake_core.session_uptake(
-            records, transcript_text
-        )
+        (
+            used_hits,
+            total_hits,
+            used_prompts,
+            prompts,
+            used_controls,
+            total_controls,
+        ) = uptake_core.session_uptake(records, transcript_text)
         event_log.try_append_event(
             "recall-uptake",
             "injection_uptake",
@@ -821,6 +826,11 @@ def log_uptake_event(session_id, repo, transcript_text, agent):
             total_hits=total_hits,
             used_prompts=used_prompts,
             total_prompts=prompts,
+            # The chance rate, recorded beside the treatment rate so no reader can quote one
+            # without the other. A verdict from treatment alone cannot tell an effect from a
+            # coincidence on the same topic.
+            used_controls=used_controls,
+            total_controls=total_controls,
         )
         uptake_core.prune_session(session_id)
     except Exception as e:  # noqa: BLE001 — a measurement must never cost a session its note

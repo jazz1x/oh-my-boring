@@ -17,6 +17,19 @@ import uptake_core  # noqa: E402
 from drudge_client import DrudgeClient  # noqa: E402
 
 MAX_RESULTS = int(os.environ.get("RECALL_MAX_RESULTS") or "3")
+
+#: How many extra hits to fetch purely as a control for the uptake measurement. They are NEVER
+#: injected — only fingerprinted — and they give the uptake rate the one thing it lacks: a chance
+#: rate. Without a floor, "5% of injected notes were echoed" cannot be told from "5% of any note
+#: on this topic would have been echoed", and the repo has already paid once for a threshold with
+#: no control (`RELEVANCE_MAX_DIST`, see the constant below).
+#:
+#: This is free, not a compromise: `retrieve.rs` sets `pool = (max_results * 4).max(20)`, so 3 and
+#: 5 draw the SAME candidate pool of 20, merge identically, and return the same top-3 in the same
+#: order with the same distances. `per_hit_cap` shrinks, but the hook truncates every snippet to
+#: 280 chars client-side anyway, so the injected bytes are identical by construction rather than
+#: by promise. 6 would move the pool to 24 and forfeit that proof — hence 2, not more.
+CONTROL_RESULTS = int(os.environ.get("RECALL_CONTROL_RESULTS") or "2")
 MAX_TOKENS = int(os.environ.get("RECALL_MAX_TOKENS") or "1500")
 TIMEOUT = float(os.environ.get("RECALL_TIMEOUT") or "5")
 RETRIES = int(os.environ.get("RECALL_RETRIES") or "1")
@@ -145,7 +158,12 @@ def run_recall(
 
     client = DrudgeClient(timeout=TIMEOUT, retries=RETRIES)
     try:
-        hits = client.search(prompt, max_results=MAX_RESULTS, max_tokens=MAX_TOKENS)
+        # One call for both: the first MAX_RESULTS are injected, the rest are controls.
+        hits = client.search(
+            prompt,
+            max_results=MAX_RESULTS + CONTROL_RESULTS,
+            max_tokens=MAX_TOKENS,
+        )
     except Exception as e:
         print(f"[omb-recall] search failed after {RETRIES} retries: {e}", file=sys.stderr)
         return  # engine down → no-op (graceful)
@@ -185,7 +203,11 @@ def run_recall(
     # cost the user a prompt (same contract as the search failure above).
     uptake_core.append_record(
         uptake_core.injection_record(
-            data.get("session_id") or "", prompt, hits[:MAX_RESULTS], MAX_RESULTS
+            data.get("session_id") or "",
+            prompt,
+            hits[:MAX_RESULTS],
+            MAX_RESULTS,
+            controls=hits[MAX_RESULTS:],
         )
     )
 
