@@ -6,6 +6,10 @@
 data/*
 !data/eval/
 data/eval/*.db
+# The schema snapshot is a contract artifact, not runtime data: the parity gate compares an
+# upgraded database against it, so CI must have it. It was ignored by `data/*` and the gate
+# shipped without its own baseline.
+!data/schema/
 
 # ── 임베디드 surreal(이제 서버모드) + Rust 빌드 ──────────
 drudge/target/

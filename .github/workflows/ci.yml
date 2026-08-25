@@ -170,6 +170,12 @@ jobs:
           docker compose --profile vector up -d --build boring-drudge boring-postgres
           for _ in $(seq 1 60); do curl -sf -m3 http://127.0.0.1:7700/health >/dev/null 2>&1 && break; sleep 3; done
           curl -sf -m3 http://127.0.0.1:7700/health
+      # A DB upgraded from the shipped schema must equal one built fresh. Every other DB suite
+      # starts from an empty container, so "the migration was never written" is invisible to
+      # them — and it already shipped once.
+      - name: schema parity (upgraded DB == fresh DB)
+        run: ./scripts/test_schema_parity.sh
+
       - name: behavioral gate (eval-gate.sh)
         env:
           BORING_URL: http://127.0.0.1:7700
