@@ -65,10 +65,17 @@ TEMPLATE_BLACKLIST = [
 ]
 SOURCE_LIMIT = 5
 PROJECT_LIMIT = 6
+#: How many items of a group each renderer shows. One number, not two: the text fallback and the
+#: Block Kit payload go into the same message, and Slack picks between them — so a reader whose
+#: client falls back was being shown a different set of items (5 vs 4) with a different "+N".
+#: A fallback that disagrees with the blocks is a second, quieter briefing.
 ITEM_LIMIT = 5
 DONE_ITEM_LIMIT = 3  # Done is historical context; keep it short.
+
+#: Blocked is never truncated. It is the reason this briefing exists — a "+N more" hiding a
+#: blocker is the one omission that can cost the reader their morning.
+NEVER_TRUNCATED = frozenset({"Blocked"})
 BLOCK_PROJECT_LIMIT = 5
-BLOCK_ITEM_LIMIT = 4
 
 LABEL_ALIASES = {
     "Done": "Done",
@@ -208,9 +215,9 @@ def render_body_mrkdwn(answer: str) -> str:
             continue
         emoji = SECTION_EMOJI[label]
         title = SECTION_TITLE[label]
-        counts.append(f"{emoji} {len(entries)}")
+        counts.append(f"{emoji} {title} {len(entries)}")
         lines.append(f"{emoji} *{title}*")
-        limit = DONE_ITEM_LIMIT if label == "Done" else ITEM_LIMIT
+        limit = group_limit(label, len(entries))
         for project_name, item in entries[:limit]:
             text = _slack_inline(item.text)
             lines.append(f"• {_slack_inline(project_name)} — {text}")
@@ -220,6 +227,43 @@ def render_body_mrkdwn(answer: str) -> str:
         lines.append("")
 
     return f"{' · '.join(counts)}\n\n" + "\n".join(lines).strip()
+
+
+#: Groups that answer "what do I do now", in the order a reader should meet them. Everything else
+#: is confirmation, and confirmation belongs below the fold.
+ACTIONABLE = ("Blocked", "Stalled", "Next")
+
+#: How many items the top-of-message shortlist carries. Three is what fits above the fold on a
+#: phone next to a header and a count line; a shortlist that needs scrolling is not a shortlist.
+TOP_PICKS = 3
+
+
+def top_picks(items_by_label, limit=TOP_PICKS):
+    """The first thing the reader should look at, drawn from the actionable groups in order.
+
+    A briefing that opens with a status ledger makes the reader do the triage the briefing was
+    supposed to do. Blocked first because it is the reason the message exists, then Stalled
+    (something has been sitting), then Next. Returns [] when nothing is actionable — a quiet day
+    should not manufacture a priority.
+    """
+    picks: list[tuple[str, str, Any]] = []
+    for label in ACTIONABLE:
+        for project_name, item in items_by_label.get(label, []):
+            picks.append((label, project_name, item))
+            if len(picks) >= limit:
+                return picks
+    return picks
+
+
+def group_limit(label: str, total: int) -> int:
+    """How many items of this group to show. The single source both renderers ask.
+
+    Blocked returns everything: an unseen blocker is the failure mode the priority order exists
+    to prevent, and a section can be split before a blocker is hidden behind "+N".
+    """
+    if label in NEVER_TRUNCATED:
+        return total
+    return DONE_ITEM_LIMIT if label == "Done" else ITEM_LIMIT
 
 
 def render_blocks_payload(
@@ -268,25 +312,54 @@ def render_blocks_payload(
     if not any(items_by_label.values()):
         blocks.append(_section(empty_message))
     else:
-        counts: list[str] = []
+        # The count line says the words, not just the emoji: a reader should not have to have
+        # memorised a legend to know that 🚨 2 means two things are blocking them.
+        counts = [
+            f"{SECTION_EMOJI[label]} {SECTION_TITLE[label]} {len(items_by_label[label])}"
+            for label in SECTION_ORDER
+            if items_by_label[label]
+        ]
+
+        # The shortlist goes above everything, because the question at 9am is "what first" and a
+        # status ledger makes the reader answer it themselves.
+        picks = top_picks(items_by_label)
+        if picks:
+            pick_lines = [
+                f"{n}. {SECTION_EMOJI[label]} {project_name} — {item.text}"
+                for n, (label, project_name, item) in enumerate(picks, 1)
+            ]
+            blocks.append(_section("*오늘의 1순위*\n" + "\n".join(pick_lines)))
+            blocks.append({"type": "divider"})
+
         for label in SECTION_ORDER:
             entries = items_by_label[label]
             if not entries:
                 continue
             emoji = SECTION_EMOJI[label]
             title_text = SECTION_TITLE[label]
-            counts.append(f"{emoji} {len(entries)}")
-            blocks.append({"type": "divider"})
-            blocks.append(_section(f"{emoji} *{title_text}*"))
-            item_lines: list[str] = []
-            block_limit = DONE_ITEM_LIMIT if label == "Done" else BLOCK_ITEM_LIMIT
-            for project_name, item in entries[:block_limit]:
-                item_lines.append(f"• {project_name} — {item.text}")
+            # Done is confirmation, not work. One context line at the bottom, no bullets: on a
+            # phone, ten finished items push the blockers off the first screen.
+            if label == "Done":
+                continue
+            block_limit = group_limit(label, len(entries))
+            item_lines = [
+                f"• {project_name} — {item.text}" for project_name, item in entries[:block_limit]
+            ]
             omitted = max(0, len(entries) - block_limit)
             if omitted:
                 item_lines.append(f"• _외 {omitted}개 항목_")
-            if item_lines:
-                blocks.append(_section("\n".join(item_lines)))
+            # Label and items share one section: a label-only section plus a divider cost two
+            # blocks each and bought nothing but scrolling.
+            blocks.append(
+                _section(f"{emoji} *{title_text}* ({len(entries)})\n" + "\n".join(item_lines))
+            )
+
+        done = items_by_label.get("Done") or []
+        if done:
+            blocks.append({"type": "divider"})
+            blocks.append(
+                _context(f"{SECTION_EMOJI['Done']} {SECTION_TITLE['Done']} {len(done)}건 — 상세는 위키")
+            )
         blocks.insert(2, _context(" · ".join(counts)))
 
     source_text = render_sources(sources)
@@ -436,7 +509,20 @@ def _plain_text(text: str, limit: int) -> str:
 
 
 def _mrkdwn_text(text: str, limit: int) -> str:
-    return _escape_mrkdwn(text)[:limit] or " "
+    """Escape and fit into Slack's per-field limit, saying so when something was dropped.
+
+    A bare slice cuts mid-sentence and mid-word with no sign it happened, which is how a reader
+    ends up trusting a sentence that was never finished. Cut at a line boundary when there is one
+    nearby, and always leave the ellipsis behind.
+    """
+    escaped = _escape_mrkdwn(text)
+    if len(escaped) <= limit:
+        return escaped or " "
+    head = escaped[: limit - 2]
+    cut = head.rfind("\n")
+    if cut > limit // 2:
+        head = head[:cut]
+    return head.rstrip() + "…"
 
 
 def _escape_mrkdwn(text: str) -> str:
