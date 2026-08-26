@@ -183,12 +183,12 @@ def test_install_hermes_briefing_backs_up_existing_scripts():
         fake_home = Path(d) / "home"
         source_dir = Path(d) / "omb" / "agents" / "hermes"
         source_dir.mkdir(parents=True)
-        for name in agent_wiring._HERMES_BRIEFING_SOURCE_NAMES:
+        for name in agent_wiring._HERMES_ENTRY_SCRIPT_NAMES:
             (source_dir / name).write_text(f"# new {name}\n", encoding="utf-8")
 
         installed_scripts = fake_home / ".hermes" / "scripts"
         installed_scripts.mkdir(parents=True)
-        for name in agent_wiring._HERMES_BRIEFING_SOURCE_NAMES:
+        for name in agent_wiring._HERMES_ENTRY_SCRIPT_NAMES:
             (installed_scripts / name).write_text(f"# old {name}\n", encoding="utf-8")
 
         def fake_expanduser(value):
@@ -200,12 +200,56 @@ def test_install_hermes_briefing_backs_up_existing_scripts():
         with mock.patch.object(agent_wiring.os.path, "expanduser", side_effect=fake_expanduser):
             agent_wiring._install_hermes_briefing(sources)
 
-        for name in agent_wiring._HERMES_BRIEFING_SOURCE_NAMES:
-            installed = installed_scripts / name
-            assert installed.read_text(encoding="utf-8") == f"# new {name}\n"
+        assert sources, "installer resolved nothing to copy"
+        for src in sources:
+            installed = installed_scripts / src.name
+            assert installed.read_text(encoding="utf-8") == f"# new {src.name}\n"
             assert Path(str(installed) + ".omb-bak").read_text(
                 encoding="utf-8"
-            ) == f"# old {name}\n"
+            ) == f"# old {src.name}\n"
+
+
+def test_real_hermes_entry_scripts_ship_every_module_they_import():
+    """The shipped scripts must not import a sibling the installer leaves behind.
+
+    Deliberately run against the repo's own files rather than stubs. The defect this guards
+    against was invisible to the stub fixtures: `weekly-briefing.py` imported `weekly_trend`,
+    the installer copied neither, and the fixture wrote `# stub` in place of the real file, so
+    the import that would have failed in production was never in the test's reach.
+    """
+    repo = HERE.parent.parent
+    src_dir = repo / "agents" / "hermes"
+    installed = {src.name for src in agent_wiring._hermes_briefing_sources(str(repo))}
+    installed |= set(agent_wiring._HERMES_SEPARATELY_INSTALLED)
+
+    for name in agent_wiring._HERMES_ENTRY_SCRIPT_NAMES:
+        for dep in agent_wiring._local_module_deps(src_dir / name):
+            assert f"{dep}.py" in installed, (
+                f"{name} imports {dep}, which the installer never copies to ~/.hermes/scripts"
+            )
+
+
+def test_local_deps_are_transitive_and_ignore_non_siblings():
+    """A dependency of a dependency ships too; stdlib does not; a vanished sibling raises."""
+    with tempfile.TemporaryDirectory() as d:
+        src_dir = Path(d)
+        (src_dir / "entry.py").write_text(
+            "import json\nfrom middle import thing\n", encoding="utf-8"
+        )
+        (src_dir / "middle.py").write_text("import leaf\nthing = leaf\n", encoding="utf-8")
+        (src_dir / "leaf.py").write_text("value = 1\n", encoding="utf-8")
+
+        deps = agent_wiring._local_module_deps(src_dir / "entry.py")
+
+        assert deps == {"middle", "leaf"}
+
+        (src_dir / "leaf.py").unlink()
+        try:
+            agent_wiring._local_module_deps(src_dir / "entry.py")
+        except FileNotFoundError as exc:
+            assert "leaf.py" in str(exc), exc
+        else:
+            raise AssertionError("a missing sibling module must abort the install")
 
 
 def test_wire_hermes_missing_slack_briefing_has_no_side_effects():
@@ -214,7 +258,10 @@ def test_wire_hermes_missing_slack_briefing_has_no_side_effects():
         fake_home = Path(d) / "home"
         source_dir = Path(d) / "omb" / "agents" / "hermes"
         source_dir.mkdir(parents=True)
-        (source_dir / "briefing.py").write_text("# briefing\n", encoding="utf-8")
+        # The entry points are all present; the module one of them imports is not.
+        (source_dir / "briefing.py").write_text("import slack_briefing\n", encoding="utf-8")
+        (source_dir / "weekly-briefing.py").write_text("# stub\n", encoding="utf-8")
+        (source_dir / "codex-collect-sessions.py").write_text("# stub\n", encoding="utf-8")
         cfg = Path(d) / "config.yaml"
         original = b"agent:\n  environment_hint: 'keep exactly'\n"
         cfg.write_bytes(original)
@@ -349,6 +396,8 @@ if __name__ == "__main__":
     test_wire_hermes_adds_hint_and_weekly()
     test_install_hermes_briefing_backs_up_existing_scripts()
     test_wire_hermes_missing_slack_briefing_has_no_side_effects()
+    test_real_hermes_entry_scripts_ship_every_module_they_import()
+    test_local_deps_are_transitive_and_ignore_non_siblings()
     test_install_hermes_skills_removes_legacy_nested_duplicate()
     test_install_codex_host_worker_macos_writes_launch_agent()
     test_next_cron_run_finds_next_monday()
