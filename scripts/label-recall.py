@@ -114,6 +114,46 @@ def load(client, scan):
     return entries, labels
 
 
+def audited_keys(labels):
+    """(query_log_id, hit_index) a person has already ruled on."""
+    return label_core.labeled_keys(labels, label_core.JUDGE_HUMAN)
+
+
+def audit_scan_depth(client, requested):
+    """How deep the query_log scan has to reach to still see the rows awaiting a human label.
+
+    Recency is the wrong selector for an audit. `--judge` labels the newest rows and search runs
+    far more often than the judge does -- measured 2026-08-26, 502 searches in a day against 24
+    labels -- so the newest-N window slides past the labelled rows about twenty times faster than
+    they accrue. At the default depth of 200 none of the 16 judged rows were still in view and
+    `--audit` reported "nothing to audit", which reads exactly like "you are done".
+
+    The rows that need a person are already known: they carry an LLM verdict and no human one.
+    Their ids say how far back the window must go, so the depth is derived rather than guessed.
+    Returns `requested` unchanged when nothing is outstanding or the ids cannot be read -- a
+    depth this function invented would be a number with no evidence behind it.
+    """
+    labels = (fetch(client, "/recall-labels", 5000) or {}).get("entries") or []
+    judged = {
+        (row.get("query_log_id"), row.get("hit_index"))
+        for row in labels
+        if row.get("judge") == label_core.JUDGE_LLM
+    }
+    audited = {
+        (row.get("query_log_id"), row.get("hit_index"))
+        for row in labels
+        if row.get("judge") == label_core.JUDGE_HUMAN
+    }
+    outstanding = [qid for qid, _ in (judged - audited) if isinstance(qid, int)]
+    if not outstanding:
+        return requested
+    newest = (fetch(client, "/query-log", 1) or {}).get("entries") or []
+    newest_id = newest[0].get("id") if newest else None
+    if not isinstance(newest_id, int):
+        return requested
+    return max(requested, newest_id - min(outstanding) + 1)
+
+
 def run_judge(client, args):
     entries, labels = load(client, args.scan)
     samples = label_core.select_samples(
@@ -153,25 +193,39 @@ def run_judge(client, args):
 
 
 def run_audit(client, args):
-    entries, labels = load(client, args.scan)
+    depth = audit_scan_depth(client, args.scan)
+    if depth > args.scan:
+        print(f"[label-recall] scanning {depth} rows to reach the oldest hit awaiting a person")
+    entries, labels = load(client, depth)
     llm_verdicts = {
         (row["query_log_id"], row["hit_index"]): row["verdict"]
         for row in labels
         if row.get("judge") == label_core.JUDGE_LLM
     }
+    # How far to walk comes from the contract, not from a habit: the audit exists to clear the
+    # comparison floor, so it walks at least as many queries as the floor still owes. A query
+    # yields at most a few band hits, so this is a lower bound on the work, never a promise --
+    # the count printed below says what was actually found.
+    owed = label_core.audit_backlog({"compared": len(audited_keys(labels))})
+    walk = max(args.queries, owed)
+    # Only hits the model already judged can be audited — the point is the disagreement rate —
+    # and that requirement belongs in the pick, not after it: filtering afterwards left the
+    # sampler counting newest-first queries the model had never reached.
     pending = label_core.select_samples(
         entries,
         labels,
         judge=label_core.JUDGE_HUMAN,
-        max_queries=args.queries,
+        max_queries=walk,
         max_hits=args.hits,
+        require_judged_by=label_core.JUDGE_LLM,
     )
-    # Only hits the model already judged can be audited — the point is the disagreement rate.
-    pending = [s for s in pending if (s["query_log_id"], s["hit_index"]) in llm_verdicts]
     candidates = label_core.audit_candidates(pending, llm_verdicts)
     if not candidates:
         print("[label-recall] nothing to audit (run --judge first, or no borderline hits)")
         return 0
+    # Say what this sitting can and cannot finish. "3 candidates" reads as done when the floor
+    # still wants 17, and a silent shortfall is how a window closes with no verdict in it.
+    print(f"[label-recall] 후보 {len(candidates)}건 · 하한까지 {owed}건 남음")
     for sample in candidates:
         excerpt = read_excerpt(sample["path"])
         if excerpt is None:

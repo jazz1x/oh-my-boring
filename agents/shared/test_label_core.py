@@ -122,6 +122,65 @@ def test_prompt_asks_whether_it_helped_not_whether_it_is_related():
         assert verdict in prompt
 
 
+def test_the_audit_pick_reaches_past_queries_the_model_has_not_judged():
+    """Requiring the model's verdict must happen during the pick, not after it.
+
+    The model labels the newest rows and search runs far more often than the judge does, so the
+    newest queries are exactly the ones with no verdict yet. Taking the newest `max_queries` and
+    then keeping only the judged ones therefore yields nothing — measured on the live ledger,
+    0 candidates while 24 hits sat waiting for a person.
+    """
+    # Newest first, as /query-log returns them. Only the oldest has been judged.
+    entries = [_entry(qid) for qid in (100, 99, 98, 97, 96, 95)]
+    labels = [
+        {"query_log_id": 95, "hit_index": 0, "judge": label_core.JUDGE_LLM, "verdict": "relevant"},
+        {"query_log_id": 95, "hit_index": 1, "judge": label_core.JUDGE_LLM, "verdict": "irrelevant"},
+    ]
+
+    filtered_after = [
+        s
+        for s in label_core.select_samples(
+            entries, labels, judge=label_core.JUDGE_HUMAN, max_queries=2
+        )
+        if (s["query_log_id"], s["hit_index"]) in {(95, 0), (95, 1)}
+    ]
+    assert filtered_after == [], "the old sample-then-filter order must still come up empty"
+
+    picked = label_core.select_samples(
+        entries,
+        labels,
+        judge=label_core.JUDGE_HUMAN,
+        max_queries=2,
+        require_judged_by=label_core.JUDGE_LLM,
+    )
+    assert [(s["query_log_id"], s["hit_index"]) for s in picked] == [(95, 0), (95, 1)], picked
+
+
+def test_a_hit_the_person_already_ruled_on_is_not_offered_again():
+    entries = [_entry(95)]
+    labels = [
+        {"query_log_id": 95, "hit_index": 0, "judge": label_core.JUDGE_LLM, "verdict": "relevant"},
+        {"query_log_id": 95, "hit_index": 1, "judge": label_core.JUDGE_LLM, "verdict": "relevant"},
+        {"query_log_id": 95, "hit_index": 0, "judge": label_core.JUDGE_HUMAN, "verdict": "relevant"},
+    ]
+    picked = label_core.select_samples(
+        entries,
+        labels,
+        judge=label_core.JUDGE_HUMAN,
+        max_queries=5,
+        require_judged_by=label_core.JUDGE_LLM,
+    )
+    assert [(s["query_log_id"], s["hit_index"]) for s in picked] == [(95, 1)], picked
+
+
+def test_audit_backlog_counts_down_to_the_floor_and_stops():
+    assert label_core.audit_backlog({"compared": 0}) == label_core.MIN_COMPARED
+    assert label_core.audit_backlog({"compared": 4}) == label_core.MIN_COMPARED - 4
+    assert label_core.audit_backlog({"compared": label_core.MIN_COMPARED}) == 0
+    # Past the floor is done, not negative work.
+    assert label_core.audit_backlog({"compared": label_core.MIN_COMPARED + 9}) == 0
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

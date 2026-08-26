@@ -75,14 +75,30 @@ def labeled_keys(labels, judge):
     }
 
 
-def select_samples(entries, labels, judge=JUDGE_LLM, max_queries=5, max_hits=3, endpoint="search"):
+def select_samples(
+    entries,
+    labels,
+    judge=JUDGE_LLM,
+    max_queries=5,
+    max_hits=3,
+    endpoint="search",
+    require_judged_by=None,
+):
     """Pick hits for `judge` to label: newest queries first, skipping what it already judged.
 
     Deterministic on purpose — no sampling randomness — so a rerun labels the next unlabelled
     hits instead of re-rolling the sample, and a resumed run cannot silently relabel.
     `max_hits` bounds work per query; the drop is reported by the caller, never hidden.
+
+    `require_judged_by` restricts the pick to hits another judge has already ruled on. The human
+    audit needs that, and needs it *here* rather than as a filter afterwards: the two selectors
+    pull opposite ways. The newest queries are the ones the model has not reached yet, so taking
+    the newest `max_queries` and then keeping only the model-judged ones yields nothing —
+    measured 2026-08-26, 0 candidates while 24 hits sat waiting. Applying the requirement during
+    the walk lets `max_queries` count the queries that can actually be audited.
     """
     seen = labeled_keys(labels, judge)
+    required = labeled_keys(labels, require_judged_by) if require_judged_by else None
     samples = []
     used_queries = 0
     for entry in entries:
@@ -98,6 +114,8 @@ def select_samples(entries, labels, judge=JUDGE_LLM, max_queries=5, max_hits=3, 
             if picked >= max_hits:
                 break
             if (entry.get("id"), index) in seen:
+                continue
+            if required is not None and (entry.get("id"), index) not in required:
                 continue
             samples.append(
                 {
