@@ -219,37 +219,49 @@ def test_real_hermes_entry_scripts_ship_every_module_they_import():
     """
     repo = HERE.parent.parent
     src_dir = repo / "agents" / "hermes"
+    shared_dir = repo / "agents" / "shared"
     installed = {src.name for src in agent_wiring._hermes_briefing_sources(str(repo))}
     installed |= set(agent_wiring._HERMES_SEPARATELY_INSTALLED)
 
     for name in agent_wiring._HERMES_ENTRY_SCRIPT_NAMES:
-        for dep in agent_wiring._local_module_deps(src_dir / name):
-            assert f"{dep}.py" in installed, (
-                f"{name} imports {dep}, which the installer never copies to ~/.hermes/scripts"
+        for dep in agent_wiring._local_module_deps(src_dir / name, (shared_dir,)):
+            assert dep.name in installed, (
+                f"{name} imports {dep.name}, which the installer never copies to"
+                " ~/.hermes/scripts"
             )
 
 
-def test_local_deps_are_transitive_and_ignore_non_siblings():
-    """A dependency of a dependency ships too; stdlib does not; a vanished sibling raises."""
+def test_local_deps_are_transitive_and_reach_the_shared_dir():
+    """Deps of deps ship; a shared-dir module ships; stdlib does not; a vanished one raises."""
     with tempfile.TemporaryDirectory() as d:
-        src_dir = Path(d)
+        src_dir = Path(d) / "hermes"
+        shared_dir = Path(d) / "shared"
+        src_dir.mkdir()
+        shared_dir.mkdir()
         (src_dir / "entry.py").write_text(
-            "import json\nfrom middle import thing\n", encoding="utf-8"
+            "import json\nfrom middle import thing\nimport floors\n", encoding="utf-8"
         )
         (src_dir / "middle.py").write_text("import leaf\nthing = leaf\n", encoding="utf-8")
         (src_dir / "leaf.py").write_text("value = 1\n", encoding="utf-8")
+        # Lives beside the host tooling, not the briefing -- a measurement floor must not be
+        # copied into the renderer just because the two sit in different folders.
+        (shared_dir / "floors.py").write_text("MIN_COMPARED = 20\n", encoding="utf-8")
 
-        deps = agent_wiring._local_module_deps(src_dir / "entry.py")
+        deps = agent_wiring._local_module_deps(src_dir / "entry.py", (shared_dir,))
 
-        assert deps == {"middle", "leaf"}
+        assert deps == {
+            src_dir / "middle.py",
+            src_dir / "leaf.py",
+            shared_dir / "floors.py",
+        }, deps
 
-        (src_dir / "leaf.py").unlink()
+        (shared_dir / "floors.py").unlink()
         try:
-            agent_wiring._local_module_deps(src_dir / "entry.py")
+            agent_wiring._local_module_deps(src_dir / "entry.py", (shared_dir,))
         except FileNotFoundError as exc:
-            assert "leaf.py" in str(exc), exc
+            assert "floors.py" in str(exc), exc
         else:
-            raise AssertionError("a missing sibling module must abort the install")
+            raise AssertionError("a missing module must abort the install")
 
 
 def test_wire_hermes_missing_slack_briefing_has_no_side_effects():
@@ -397,7 +409,7 @@ if __name__ == "__main__":
     test_install_hermes_briefing_backs_up_existing_scripts()
     test_wire_hermes_missing_slack_briefing_has_no_side_effects()
     test_real_hermes_entry_scripts_ship_every_module_they_import()
-    test_local_deps_are_transitive_and_ignore_non_siblings()
+    test_local_deps_are_transitive_and_reach_the_shared_dir()
     test_install_hermes_skills_removes_legacy_nested_duplicate()
     test_install_codex_host_worker_macos_writes_launch_agent()
     test_next_cron_run_finds_next_monday()

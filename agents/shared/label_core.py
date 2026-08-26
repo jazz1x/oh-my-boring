@@ -27,6 +27,18 @@ MIN_DECIDED = 30
 #: Same rule for llm/human agreement: an agreement rate over a handful of pairs cannot clear an
 #: LLM judge that shares the system's embedding family.
 MIN_COMPARED = 20
+
+
+def audit_backlog(stats) -> int:
+    """Human labels still owed before the agreement figure can be computed at all.
+
+    The LLM judge accrues on its own every night; the human side only moves when a person sits
+    down for a minute, and nothing in the system says so out loud. A precision number the
+    contract forbids anyone from using is worse than no number: it looks like an answer. This
+    turns the gap into something a daily surface can show, and returns 0 once the floor is met
+    so the surface can fall silent rather than nag forever.
+    """
+    return max(0, MIN_COMPARED - int((stats or {}).get("compared") or 0))
 #: An LLM judge whose agreement with the person falls below this is not usable as an instrument;
 #: the reporter says so and the human-only numbers are the ones that count.
 AGREEMENT_FLOOR = 0.80

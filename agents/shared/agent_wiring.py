@@ -416,8 +416,8 @@ _HERMES_ENTRY_SCRIPT_NAMES = ("briefing.py", "weekly-briefing.py", "codex-collec
 _HERMES_SEPARATELY_INSTALLED = frozenset({"weekly-briefing.py", "codex-collect-sessions.py"})
 
 
-def _local_module_deps(script: Path) -> set[str]:
-    """Module names `script` imports from its own directory, transitively.
+def _local_module_deps(script: Path, search_dirs: tuple[Path, ...] = ()) -> set[Path]:
+    """Files `script` imports from the repo, transitively.
 
     A hand-kept list of files to install is a list someone has to remember to extend, and the
     day they forget the installed entry point imports a module that is not there. That already
@@ -425,14 +425,19 @@ def _local_module_deps(script: Path) -> set[str]:
     it, so the shipped weekly briefing would have died on ImportError. Reading the imports out
     of the scripts makes the list a consequence of the code rather than a promise about it.
 
-    Only siblings count; resolution is by filename, which is also how Python will resolve them
-    at run time from `sys.path[0]`. These scripts are deliberately stdlib-only, so an import
-    that is neither a sibling file nor a stdlib module is a sibling that has gone missing --
-    raising here keeps the old guarantee that a broken checkout aborts before ~/.hermes is
-    touched, without a second hand-kept list of what "broken" means.
+    Resolution is by filename against the script's own directory first, then `search_dirs` --
+    `agents/shared/` holds modules the briefing shares with the host tooling, and a measurement
+    floor must not be copied into the renderer just because the two live in different folders.
+    Everything lands flat in ~/.hermes/scripts, which is how Python will resolve them at run
+    time from `sys.path[0]`.
+
+    These scripts are deliberately stdlib-only, so an import that resolves in none of those
+    directories and is not a stdlib module is a module that has gone missing -- raising here
+    keeps the old guarantee that a broken checkout aborts before ~/.hermes is touched, without
+    a second hand-kept list of what "broken" means.
     """
-    src_dir = script.parent
-    seen: set[str] = set()
+    dirs = (script.parent, *search_dirs)
+    seen: set[Path] = set()
     queue = [script]
     while queue:
         current = queue.pop()
@@ -450,18 +455,19 @@ def _local_module_deps(script: Path) -> set[str]:
             else:
                 continue
             for name in names:
-                if name in seen:
-                    continue
-                sibling = src_dir / f"{name}.py"
-                if not sibling.exists():
+                found = next((d / f"{name}.py" for d in dirs if (d / f"{name}.py").exists()), None)
+                if found is None:
                     if name not in sys.stdlib_module_names:
                         raise FileNotFoundError(
-                            f"briefing template not found: {sibling}"
-                            f" (imported by {current.name})"
+                            f"briefing template not found: {name}.py"
+                            f" (imported by {current.name}, searched"
+                            f" {', '.join(str(d) for d in dirs)})"
                         )
                     continue
-                seen.add(name)
-                queue.append(sibling)
+                if found in seen:
+                    continue
+                seen.add(found)
+                queue.append(found)
     return seen
 
 
@@ -470,20 +476,23 @@ def _hermes_briefing_sources(boring_home: str | None = None) -> tuple[Path, ...]
     home = boring_home if boring_home is not None else BORING_HOME
     src_dir = Path(home) / "agents" / "hermes"
 
+    shared_dir = Path(home) / "agents" / "shared"
+
     entries = [src_dir / name for name in _HERMES_ENTRY_SCRIPT_NAMES]
     for entry in entries:
         if not entry.exists():
             raise FileNotFoundError(f"briefing template not found: {entry}")
 
-    names: list[str] = [
-        name for name in _HERMES_ENTRY_SCRIPT_NAMES if name not in _HERMES_SEPARATELY_INSTALLED
+    sources: list[Path] = [
+        src_dir / name
+        for name in _HERMES_ENTRY_SCRIPT_NAMES
+        if name not in _HERMES_SEPARATELY_INSTALLED
     ]
     for entry in entries:
-        for dep in sorted(_local_module_deps(entry)):
-            filename = f"{dep}.py"
-            if filename not in names and filename not in _HERMES_SEPARATELY_INSTALLED:
-                names.append(filename)
-    return tuple(src_dir / name for name in names)
+        for dep in sorted(_local_module_deps(entry, (shared_dir,))):
+            if dep not in sources and dep.name not in _HERMES_SEPARATELY_INSTALLED:
+                sources.append(dep)
+    return tuple(sources)
 
 
 def _install_hermes_briefing(sources: tuple[Path, ...]) -> None:
