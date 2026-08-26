@@ -13,9 +13,12 @@ from datetime import datetime, timezone, timedelta
 
 from slack_briefing import (
     maybe_print_blocks_json,
+    parse_brief,
     render_body_mrkdwn,
     render_message_mrkdwn,
+    render_weekly_blocks,
 )
+from weekly_trend import collect_week, label_trend, needs_intervention, scoreboard
 
 HERMES_URL = os.environ.get("BORING_URL") or os.environ.get(
     "DRUDGE_URL", "http://boring-drudge:7700"
@@ -38,7 +41,77 @@ def slack_mrkdwn(answer: str) -> str:
     return render_body_mrkdwn(answer)
 
 
+#: Where the daily briefings land. The weekly reads them instead of asking the engine to
+#: re-summarise a week: a fresh synthesis produces new wording every time, so nothing can be
+#: tracked across days (measured — 252 items over a week, adjacent-day overlap 0,0,0,2,0,0).
+VAULT_WIKI = os.environ.get("BORING_VAULT_DIR") or os.path.join(
+    os.environ.get("BORING_HOME") or os.path.expanduser("~/oh-my-boring"), "vault"
+)
+WINDOW_DAYS = 7
+
+
+def read_week(today, span=WINDOW_DAYS, wiki_dir=None):
+    """Parsed daily briefs for the window, oldest first. Missing days are simply absent.
+
+    A missing day is not an error — the machine may have been off — but the count of days found
+    is reported, because "5/7일" means something different when only five briefs exist.
+    """
+    root = os.path.join(wiki_dir or VAULT_WIKI, "wiki")
+    out = []
+    for back in range(span - 1, -1, -1):
+        date = (today - timedelta(days=back)).strftime("%Y-%m-%d")
+        path = os.path.join(root, f"daily-brief-{date}.md")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read()
+        except OSError:
+            continue
+        body = raw.split("---", 2)[-1] if raw.startswith("---") else raw
+        out.append((date, parse_brief(body)))
+    return out
+
+
+def print_trend_blocks(days) -> bool:
+    """Emit the persistence/trend weekly. False when there is nothing to stand on."""
+    if len(days) < 2:
+        return False
+    projects = collect_week(days)
+    if not projects:
+        return False
+    span = len(days)
+    intervention = [(w, label, count, span) for w, label, count in needs_intervention(projects)]
+    board = [(w, span) for w in scoreboard(projects)]
+    blocks = render_weekly_blocks(
+        TITLE, f"{STAMP} · 스냅샷 {span}/{WINDOW_DAYS}일", projects, intervention, board,
+        label_trend(days), [],
+    )
+    fallback_lines = [f"*{TITLE}*", f"`{STAMP} · 스냅샷 {span}/{WINDOW_DAYS}일`", ""]
+    for week, label, count, _span in intervention:
+        fallback_lines.append(f"• {week.name} — {count}/{span}일 {label}")
+    if not intervention:
+        fallback_lines.append("주 내내 지속된 막힘/정체 없음.")
+    print(
+        json.dumps(
+            {
+                "text": "\n".join(fallback_lines),
+                "blocks": blocks,
+                "unfurl_links": False,
+                "unfurl_media": False,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return True
+
+
 def main() -> None:
+    # The weekly's own signal comes from the daily artifacts, not from a fresh synthesis. Fall
+    # through to the engine only when there are too few of them to say anything.
+    if os.environ.get("BORING_BRIEFING_FORMAT", "").strip().lower() == "blocks":
+        if print_trend_blocks(read_week(TODAY)):
+            return
+
     req = urllib.request.Request(
         f"{HERMES_URL}/weekly",
         data=b"{}",

@@ -147,6 +147,88 @@ def test_long_text_is_cut_at_a_boundary_and_says_so():
     assert short == "intact", "text that fits must not be touched"
 
 
+def _week(days_spec):
+    """[(date, brief_markdown)] -> [(date, BriefDocument)] using the real parser."""
+    slack_briefing = load_module("slack_briefing_week", ROOT / "slack_briefing.py")
+    return [(d, slack_briefing.parse_brief(text)) for d, text in days_spec]
+
+
+def test_weekly_reports_persistence_not_closure():
+    trend = load_module("weekly_trend_persist", ROOT / "weekly_trend.py")
+
+    # The same project blocked all week, worded differently every day — which is what actually
+    # happens, because each daily is re-synthesised by the model (measured: 252 items over a
+    # week, adjacent-day overlap 0,0,0,2,0,0).
+    days = _week(
+        [
+            (f"2026-08-2{i}", f"# kb-rag-bot\n- Blocked: corpus boundary issue variant {i}\n")
+            for i in range(4)
+        ]
+        # Blocked on exactly one day: a thing can be blocked overnight and cleared by lunch,
+        # and calling that persistent would fill the intervention list with noise. It must be a
+        # *blocked* project — a Done one is filtered by label anyway and would prove nothing.
+        + [("2026-08-24", "# overnight\n- Blocked: cleared by lunch\n")]
+    )
+    projects = trend.collect_week(days)
+    rows = trend.needs_intervention(projects)
+    assert [(w.name, label, n) for w, label, n in rows] == [("kb-rag-bot", "Blocked", 4)], rows
+
+    # A project seen once is not persistence.
+    assert all(w.name != "overnight" for w, _l, _n in rows), "one day is not persistence"
+
+
+def test_weekly_never_sums_label_counts_across_days():
+    trend = load_module("weekly_trend_sum", ROOT / "weekly_trend.py")
+
+    days = _week(
+        [
+            ("2026-08-20", "# p\n- Done: a\n- Done: b\n"),
+            ("2026-08-21", "# p\n- Done: c\n- Done: d\n"),
+            ("2026-08-22", "# p\n- Done: e\n"),
+        ]
+    )
+    got = trend.label_trend(days)
+    # Endpoints only. A sum would say "5 done this week" when each day is an independent
+    # re-observation of the same corpus and no key can tell a repeat from a new item.
+    assert got == {"Done": (2, 1)}, got
+
+
+def test_weekly_quotes_the_latest_daily_rather_than_resummarising():
+    trend = load_module("weekly_trend_quote", ROOT / "weekly_trend.py")
+
+    days = _week(
+        [
+            ("2026-08-20", "# p\n- Blocked: the old wording\n"),
+            ("2026-08-21", "# p\n- Blocked: the old wording again\n"),
+            ("2026-08-22", "# p\n- Blocked: today's exact wording\n"),
+        ]
+    )
+    projects = trend.collect_week(days)
+    assert projects["p"].latest_line == "today's exact wording"
+
+
+def test_weekly_blocks_carry_the_not_a_closure_rate_caveat():
+    slack_briefing = load_module("slack_briefing_caveat", ROOT / "slack_briefing.py")
+    trend = load_module("weekly_trend_caveat", ROOT / "weekly_trend.py")
+
+    days = _week([("2026-08-2%d" % i, "# p\n- Blocked: x%d\n" % i) for i in range(3)])
+    projects = trend.collect_week(days)
+    blocks = slack_briefing.render_weekly_blocks(
+        "T", "S", projects,
+        [(w, l, n, 3) for w, l, n in trend.needs_intervention(projects)],
+        [(w, 3) for w in trend.scoreboard(projects)],
+        trend.label_trend(days), [],
+    )
+    tail = "\n".join(
+        e["text"] for b in blocks if b.get("type") == "context" for e in b["elements"]
+    )
+    # A reader who adds "✅ 10→10" into "twenty done" has been lied to. The caveat is contract.
+    assert "마감률이 아니다" in tail
+    # No item bullets beyond the one quoted line per persistent project.
+    sections = [b for b in blocks if b.get("type") == "section" and "text" in b]
+    assert len(sections) == 1, "the weekly must not re-list items"
+
+
 def test_slack_mrkdwn_handles_adversarial_inputs():
     slack_briefing = load_module("slack_briefing_test2", ROOT / "slack_briefing.py")
 
@@ -258,6 +340,10 @@ if __name__ == "__main__":
     test_blocked_is_never_truncated_and_both_renderers_agree()
     test_done_does_not_push_blockers_off_the_first_screen()
     test_long_text_is_cut_at_a_boundary_and_says_so()
+    test_weekly_reports_persistence_not_closure()
+    test_weekly_never_sums_label_counts_across_days()
+    test_weekly_quotes_the_latest_daily_rather_than_resummarising()
+    test_weekly_blocks_carry_the_not_a_closure_rate_caveat()
     test_slack_mrkdwn_handles_adversarial_inputs()
     test_slack_mrkdwn_dedups_duplicate_bullets_across_project_sections()
     test_slack_mrkdwn_filters_placeholders_and_noise()

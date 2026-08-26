@@ -374,6 +374,58 @@ def render_blocks_payload(
     }
 
 
+def render_weekly_blocks(title, stamp, projects, intervention, board, trend, sources):
+    """Block Kit for the weekly: persistence and trend, never closure.
+
+    Item bullets are deliberately absent except one per persistent project, quoted from the most
+    recent daily rather than re-summarised. A weekly that re-lists items is the same information a
+    seventh time; what it uniquely knows is which projects held a state all week — something the
+    reader could only see by deduping seven messages in their head.
+    """
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": _plain_text(title, 150), "emoji": True},
+        },
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": _mrkdwn_text(stamp, 2000)}]},
+    ]
+
+    if intervention:
+        lines = []
+        for week, label, count, span in intervention:
+            head = f"• {week.name} — {count}/{span}일 {SECTION_EMOJI.get(label, '•')}"
+            lines.append(f"{head}\n  {week.latest_line}" if week.latest_line else head)
+        blocks.append(_section("*개입 필요 — 상태가 주 내내 지속*\n" + "\n".join(lines)))
+        blocks.append({"type": "divider"})
+
+    if board:
+        # Two columns are right here and wrong on the daily: these values are short. Slack caps
+        # a section at 10 fields, which is why the caller bounds the list before it arrives.
+        blocks.append(
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": _mrkdwn_text(f"*{w.name}*\n{len(w.days)}/{span}일", 2000)}
+                    for w, span in board
+                ][:10],
+            }
+        )
+
+    if trend:
+        parts = [
+            f"{SECTION_EMOJI.get(label, '•')} {SECTION_TITLE.get(label, label)} {first}→{last}"
+            for label, (first, last) in trend.items()
+        ]
+        # The caveat is part of the contract, not decoration: a reader who adds ✅ 10→10 into
+        # "twenty done" has been lied to, and every day here is an independent re-synthesis.
+        blocks.append(_context(" · ".join(parts) + " — 일자별 관측치이며 마감률이 아니다"))
+
+    source_text = render_sources(sources)
+    if source_text:
+        blocks.append(_context(source_text))
+    return blocks[:50]
+
+
 def render_sources(sources: list[object]) -> str:
     labels = [source_label(source) for source in sources[:SOURCE_LIMIT]]
     return "근거: " + " · ".join(labels) if labels else ""
