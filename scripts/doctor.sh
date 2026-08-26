@@ -498,6 +498,42 @@ if [ -n "$note" ] && [ "$note_max_s" -gt 0 ]; then
     fi
 fi
 
+# (d5b) The briefing scripts hermes actually runs. `make build` redeploys the engine image, but
+# the scripts hermes executes live in ~/.hermes/scripts and only the installer copies them there
+# — so merging a briefing change does not deliver it. Measured on 2026-08-26: the installed
+# copies were twelve days old, five merged PRs had never reached the 08:01 cron, and every other
+# gate was green the whole time. The installer owns the list of files it writes, so ask it
+# instead of keeping a second list here that can fall behind exactly the same way.
+hermes_scripts_dir="$HOME/.hermes/scripts"
+wiring="$BORING_HOME/agents/shared/agent_wiring.py"
+if [ -d "$hermes_scripts_dir" ] && [ -f "$wiring" ]; then
+    script_list="$(mktemp)"
+    if python3 "$wiring" --list-hermes-scripts --boring-home "$BORING_HOME" >"$script_list" 2>/dev/null; then
+        hermes_drift=0
+        hermes_total=0
+        while IFS= read -r src; do
+            [ -n "$src" ] || continue
+            hermes_total=$((hermes_total + 1))
+            installed="$hermes_scripts_dir/$(basename "$src")"
+            if [ ! -f "$installed" ]; then
+                bad "hermes never received $(basename "$src") — the cron briefing imports it and dies on ImportError"
+                hermes_drift=$((hermes_drift + 1))
+            elif ! cmp -s "$src" "$installed"; then
+                bad "DEPLOY DRIFT — $installed differs from the checkout. Merging is not deploying; the cron briefing still runs the old copy."
+                hermes_drift=$((hermes_drift + 1))
+            fi
+        done <"$script_list"
+        if [ "$hermes_drift" -eq 0 ]; then
+            ok "hermes briefing scripts match the checkout ($hermes_total files)"
+        else
+            failed_hooks=1
+        fi
+    else
+        warn "cannot resolve the hermes script list — '$wiring --list-hermes-scripts' failed, so deploy drift is not checked"
+    fi
+    rm -f "$script_list"
+fi
+
 if [ "$FIX" -eq 1 ]; then
     echo
     echo "Applying fixes..."
