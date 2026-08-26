@@ -361,6 +361,24 @@ def test_singular_labels_are_not_dumped_into_the_unlabelled_bucket():
     assert "기타" not in body, "a labelled item must never land in the unlabelled bucket"
 
 
+def test_the_engines_default_claim_kind_is_a_category_not_a_leftover():
+    slack_briefing = load_module("slack_briefing_fact", ROOT / "slack_briefing.py")
+
+    # `fact` is what a claim is unless it says otherwise, so it is the biggest thing the
+    # distiller emits -- and it was landing in the unlabelled bucket, the same defect the
+    # singular aliases above fixed, on a much larger share of the day's items.
+    answer = "# p\n- Fact: 재배포 없이는 배달되지 않는다\n- Decision: B 단독\n"
+    body = slack_briefing.render_body_mrkdwn(answer)
+    assert "📌 사실 1" in body, body
+    assert "기타" not in body, "the engine's default claim kind is not an unlabelled leftover"
+    # It belongs with what the reader consults, not with what the reader must act on. Assert
+    # positively: "absent from 행동" also holds when the item was dropped altogether, which is
+    # the louder bug of the two.
+    action_zone, _, reference_zone = body.partition("*참고*")
+    assert "재배포 없이는" in reference_zone, body
+    assert "재배포 없이는" not in action_zone, body
+
+
 def test_the_text_fallback_carries_the_shortlist_too():
     slack_briefing = load_module("slack_briefing_fb", ROOT / "slack_briefing.py")
 
@@ -483,6 +501,7 @@ if __name__ == "__main__":
     test_slack_mrkdwn_filters_placeholders_and_noise()
     test_done_is_counted_in_the_text_renderer_too()
     test_singular_labels_are_not_dumped_into_the_unlabelled_bucket()
+    test_the_engines_default_claim_kind_is_a_category_not_a_leftover()
     test_the_text_fallback_carries_the_shortlist_too()
     test_zones_replace_status_headings_but_keep_the_status()
     test_each_zone_names_the_call_that_digs_into_it()

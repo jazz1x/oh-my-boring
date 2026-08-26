@@ -93,6 +93,12 @@ LABEL_ALIASES = {
     "Risks": "Risks",
     "Risk": "Risks",
     "리스크": "Risks",
+    # `fact` is the engine's DEFAULT claim kind, not a rare one -- measured 2026-08-13 the ledger
+    # held 4936 facts against 1250 decisions -- and the alias table never had it, so the single
+    # largest category the distiller produces was arriving every morning as "기타".
+    "Facts": "Facts",
+    "Fact": "Facts",
+    "사실": "Facts",
     "Stalled": "Stalled",
     "Stall": "Stalled",
     "정체": "Stalled",
@@ -104,13 +110,14 @@ LABELS = set(LABEL_ALIASES)
 # Briefing is read, not searched. Group by status priority so the reader
 # sees "what blocks me" first, "what to do next" second, and "what finished"
 # last. Keep sections short; mobile Slack rewards vertical scannability.
-SECTION_ORDER = ["Blocked", "Next", "Stalled", "Risks", "Decisions", "Done", ""]
+SECTION_ORDER = ["Blocked", "Next", "Stalled", "Risks", "Decisions", "Facts", "Done", ""]
 SECTION_EMOJI = {
     "Blocked": "🚨",
     "Next": "▶️",
     "Stalled": "⏸️",
     "Risks": "⚠️",
     "Decisions": "💡",
+    "Facts": "📌",
     "Done": "✅",
     "": "•",
 }
@@ -120,6 +127,7 @@ SECTION_TITLE = {
     "Stalled": "정체 중",
     "Risks": "리스크",
     "Decisions": "결정",
+    "Facts": "사실",
     "Done": "완료",
     "": "기타",
 }
@@ -269,7 +277,7 @@ ACTIONABLE = ("Blocked", "Stalled", "Next")
 #: the briefing quietly lossy — which is worse than the ugly "기타" heading it replaces.
 ZONES = (
     ("행동", ("Blocked", "Stalled", "Next")),
-    ("참고", ("Risks", "Decisions", "")),
+    ("참고", ("Risks", "Decisions", "Facts", "")),
 )
 
 #: What to ask next, per zone. The briefing is a summary of notes the reader cannot open from
