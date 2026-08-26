@@ -379,6 +379,45 @@ def test_the_engines_default_claim_kind_is_a_category_not_a_leftover():
     assert "재배포 없이는" not in action_zone, body
 
 
+def test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met():
+    slack_briefing = load_module("slack_briefing_audit", ROOT / "slack_briefing.py")
+
+    # The LLM judge accrues 24 a night on its own; the human side only moves when a person
+    # sits down, and until it does the agreement figure -- the one the verdict contract
+    # actually reads -- cannot be computed at all. Silence about that is how a two-week
+    # window ends in "판단 보류".
+    answer = "# p\n- Next: 뭔가 한다\n"
+    behind = {"judges": [{"judge": "llm", "relevant": 18, "irrelevant": 30}], "compared": 4}
+
+    body = slack_briefing.render_message_mrkdwn("*T*", "S", answer, [], "empty", behind)
+    payload = slack_briefing.render_blocks_payload("T", "S", answer, [], "empty", behind)
+    def all_text(blocks):
+        # context blocks carry their text in `elements`, sections in `text` -- read both, or
+        # the assertion passes for the wrong reason on whichever shape it forgot.
+        out = []
+        for b in blocks:
+            if isinstance(b.get("text"), dict):
+                out.append(b["text"].get("text", ""))
+            for el in b.get("elements") or []:
+                if isinstance(el, dict) and el.get("text"):
+                    out.append(el["text"])
+        return "\n".join(out)
+
+    blocks_text = all_text(payload["blocks"])
+    owed = str(slack_briefing.label_core.MIN_COMPARED - 4)
+    # Slack picks between the two renderings; a line in only one of them is a second, quieter
+    # briefing -- the defect this whole contract exists to prevent.
+    assert owed in body and "--audit" in body, body
+    assert owed in blocks_text and "--audit" in blocks_text, blocks_text
+
+    met = {"judges": [], "compared": slack_briefing.label_core.MIN_COMPARED}
+    assert slack_briefing.audit_notice(met) == "", "a met floor must stop asking"
+
+    # Unknown is not the same as outstanding: an unreachable endpoint would otherwise print the
+    # full floor as backlog, a number nobody can act on.
+    assert slack_briefing.audit_notice(None) == "", "unknown counts must not be reported as owed"
+
+
 def test_the_text_fallback_carries_the_shortlist_too():
     slack_briefing = load_module("slack_briefing_fb", ROOT / "slack_briefing.py")
 
@@ -502,6 +541,7 @@ if __name__ == "__main__":
     test_done_is_counted_in_the_text_renderer_too()
     test_singular_labels_are_not_dumped_into_the_unlabelled_bucket()
     test_the_engines_default_claim_kind_is_a_category_not_a_leftover()
+    test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met()
     test_the_text_fallback_carries_the_shortlist_too()
     test_zones_replace_status_headings_but_keep_the_status()
     test_each_zone_names_the_call_that_digs_into_it()

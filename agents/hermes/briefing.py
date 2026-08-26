@@ -33,6 +33,20 @@ def header(body: str) -> str:
     return f"*{TITLE}*\n`{DATE}`\n\n{body}"
 
 
+def label_stats() -> dict | None:
+    """Label counts for the audit nudge, or None when the engine will not say.
+
+    Secondary to the briefing: a reader whose morning summary died because a side metric was
+    unreachable lost the thing they came for. None omits the line -- which is not the same as
+    printing a zero backlog, and the renderer treats it as "unknown", never as "done".
+    """
+    try:
+        with urllib.request.urlopen(f"{HERMES_URL}/recall-label-stats", timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return None
+
+
 def slack_mrkdwn(answer: str) -> str:
     return render_body_mrkdwn(answer)
 
@@ -59,9 +73,10 @@ def main() -> None:
     if not answer:
         print(header(EMPTY_MESSAGE))
         return
-    if maybe_print_blocks_json(TITLE, DATE, answer, sources, EMPTY_MESSAGE):
+    stats = label_stats()
+    if maybe_print_blocks_json(TITLE, DATE, answer, sources, EMPTY_MESSAGE, stats):
         return
-    print(render_message_mrkdwn(f"*{TITLE}*", DATE, answer, sources, EMPTY_MESSAGE))
+    print(render_message_mrkdwn(f"*{TITLE}*", DATE, answer, sources, EMPTY_MESSAGE, stats))
 
 
 if __name__ == "__main__":

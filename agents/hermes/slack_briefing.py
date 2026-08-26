@@ -10,9 +10,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# `label_core` lives in agents/shared/ because the sample floors are the measurement contract,
+# shared with the host labelling tool -- copying a floor in here to save an import is how the two
+# copies start disagreeing. The installer lands both files flat in ~/.hermes/scripts, where the
+# plain import resolves; running from the repo they are siblings, so add that directory first.
+_SHARED_DIR = Path(__file__).resolve().parent.parent / "shared"
+if _SHARED_DIR.is_dir() and str(_SHARED_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_DIR))
+
+import label_core  # noqa: E402
 
 
 EMPTY_VALUES = {
@@ -172,17 +183,42 @@ def source_label(source: object) -> str:
     return name
 
 
+def audit_notice(label_stats) -> str:
+    """One line asking for the human labels the verdict is waiting on, or "" when it is not.
+
+    The measurement window closes whether or not anyone audits, and the LLM judge accruing 24 a
+    night makes the ledger *look* healthy while the figure that decides anything stays
+    uncomputable. Naming the shortfall where the reader already looks every morning is the
+    cheapest way to keep a two-week window from ending in "판단 보류".
+
+    Silent once the floor is met: a standing nag is a line readers learn to skip, and the next
+    thing they skip is a real one. Silent too when the caller could not read the counts at all --
+    an unreachable endpoint is not evidence that the whole floor is outstanding, and printing the
+    maximum backlog because we know nothing would be a number the reader cannot act on.
+    """
+    if label_stats is None:
+        return ""
+    owed = label_core.audit_backlog(label_stats)
+    if not owed:
+        return ""
+    return f"📋 판정 대기 — 사람 라벨 {owed}건 더 필요 · `label-recall.py --audit`"
+
+
 def render_message_mrkdwn(
     title: str,
     stamp: str,
     answer: str,
     sources: list[object],
     empty_message: str,
+    label_stats=None,
 ) -> str:
     body = render_body_mrkdwn(answer)
     if not body:
         body = empty_message
     out = f"{title}\n`{stamp}`\n\n{body}"
+    notice = audit_notice(label_stats)
+    if notice:
+        out += f"\n\n{notice}"
     source_text = render_sources(sources)
     if source_text:
         out += f"\n\n_{source_text}_"
@@ -488,6 +524,7 @@ def render_blocks_payload(
     answer: str,
     sources: list[object],
     empty_message: str,
+    label_stats=None,
 ) -> dict[str, Any]:
     """Block Kit version of the priority-first briefing.
 
@@ -495,7 +532,7 @@ def render_blocks_payload(
     group is a clear visual chunk on mobile.
     """
     doc = parse_brief(answer)
-    fallback = render_message_mrkdwn(title, stamp, answer, sources, empty_message)
+    fallback = render_message_mrkdwn(title, stamp, answer, sources, empty_message, label_stats)
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
@@ -574,6 +611,10 @@ def render_blocks_payload(
         blocks.insert(2, _context(" · ".join(counts)))
 
     source_text = render_sources(sources)
+    notice = audit_notice(label_stats)
+    if notice:
+        blocks.append({"type": "divider"})
+        blocks.append(_context(notice))
     if source_text:
         blocks.append({"type": "divider"})
         blocks.append(_context(source_text))
@@ -727,10 +768,11 @@ def maybe_print_blocks_json(
     answer: str,
     sources: list[object],
     empty_message: str,
+    label_stats=None,
 ) -> bool:
     if os.environ.get("BORING_BRIEFING_FORMAT", "").strip().lower() != "blocks":
         return False
-    payload = render_blocks_payload(title, stamp, answer, sources, empty_message)
+    payload = render_blocks_payload(title, stamp, answer, sources, empty_message, label_stats)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return True
 
