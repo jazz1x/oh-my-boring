@@ -7,6 +7,7 @@ configures each agent's settings file. Backups are created as `.omb-bak`.
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
 import json
 import os
@@ -405,18 +406,84 @@ def _upsert_mcp_block(lines: list[str], mcp_idx: int, server_name: str, url: str
     return lines[:mcp_idx] + new_block + lines[end_idx:], True
 
 
-_HERMES_BRIEFING_SOURCE_NAMES = ("briefing.py", "slack_briefing.py")
+#: Scripts hermes *runs* out of ~/.hermes/scripts. Each is an entry point, so whatever it
+#: imports from its own directory has to land there beside it.
+_HERMES_ENTRY_SCRIPT_NAMES = ("briefing.py", "weekly-briefing.py", "codex-collect-sessions.py")
+
+#: Entries with an installer of their own further down. Copying them here as well would run
+#: `_backup` twice, and the second backup would overwrite the saved original with the copy the
+#: first pass had already written.
+_HERMES_SEPARATELY_INSTALLED = frozenset({"weekly-briefing.py", "codex-collect-sessions.py"})
+
+
+def _local_module_deps(script: Path) -> set[str]:
+    """Module names `script` imports from its own directory, transitively.
+
+    A hand-kept list of files to install is a list someone has to remember to extend, and the
+    day they forget the installed entry point imports a module that is not there. That already
+    happened: `weekly-briefing.py` grew a `weekly_trend` import and the list did not grow with
+    it, so the shipped weekly briefing would have died on ImportError. Reading the imports out
+    of the scripts makes the list a consequence of the code rather than a promise about it.
+
+    Only siblings count; resolution is by filename, which is also how Python will resolve them
+    at run time from `sys.path[0]`. These scripts are deliberately stdlib-only, so an import
+    that is neither a sibling file nor a stdlib module is a sibling that has gone missing --
+    raising here keeps the old guarantee that a broken checkout aborts before ~/.hermes is
+    touched, without a second hand-kept list of what "broken" means.
+    """
+    src_dir = script.parent
+    seen: set[str] = set()
+    queue = [script]
+    while queue:
+        current = queue.pop()
+        try:
+            tree = ast.parse(current.read_text(encoding="utf-8"), filename=str(current))
+        except (OSError, SyntaxError) as exc:
+            raise FileNotFoundError(f"unreadable hermes script: {current} ({exc})") from exc
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                # `from . import x` has no module name; these scripts are flat, so level>0
+                # cannot appear and a missing module means there is nothing to resolve.
+                names = [node.module.split(".")[0]] if node.module and not node.level else []
+            else:
+                continue
+            for name in names:
+                if name in seen:
+                    continue
+                sibling = src_dir / f"{name}.py"
+                if not sibling.exists():
+                    if name not in sys.stdlib_module_names:
+                        raise FileNotFoundError(
+                            f"briefing template not found: {sibling}"
+                            f" (imported by {current.name})"
+                        )
+                    continue
+                seen.add(name)
+                queue.append(sibling)
+    return seen
 
 
 def _hermes_briefing_sources(boring_home: str | None = None) -> tuple[Path, ...]:
-    """Resolve and validate the canonical Hermes briefing sources."""
+    """Every file that has to be copied into ~/.hermes/scripts, entries plus their imports."""
     home = boring_home if boring_home is not None else BORING_HOME
     src_dir = Path(home) / "agents" / "hermes"
-    sources = tuple(src_dir / name for name in _HERMES_BRIEFING_SOURCE_NAMES)
-    for src in sources:
-        if not src.exists():
-            raise FileNotFoundError(f"briefing template not found: {src}")
-    return sources
+
+    entries = [src_dir / name for name in _HERMES_ENTRY_SCRIPT_NAMES]
+    for entry in entries:
+        if not entry.exists():
+            raise FileNotFoundError(f"briefing template not found: {entry}")
+
+    names: list[str] = [
+        name for name in _HERMES_ENTRY_SCRIPT_NAMES if name not in _HERMES_SEPARATELY_INSTALLED
+    ]
+    for entry in entries:
+        for dep in sorted(_local_module_deps(entry)):
+            filename = f"{dep}.py"
+            if filename not in names and filename not in _HERMES_SEPARATELY_INSTALLED:
+                names.append(filename)
+    return tuple(src_dir / name for name in names)
 
 
 def _install_hermes_briefing(sources: tuple[Path, ...]) -> None:
