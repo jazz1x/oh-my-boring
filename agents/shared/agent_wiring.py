@@ -986,6 +986,11 @@ def main():
     parser.add_argument(
         "--install", action="store_true", help="Install/update settings for enabled agents"
     )
+    parser.add_argument(
+        "--list-hermes-scripts",
+        action="store_true",
+        help="Print every file this installer copies into ~/.hermes/scripts, one path per line",
+    )
     parser.add_argument("--server-name", default="ohmyboring")
     parser.add_argument("--server-url", default="http://localhost:7700/mcp")
     parser.add_argument("--boring-home", default=BORING_HOME)
@@ -993,6 +998,21 @@ def main():
 
     BORING_HOME = args.boring_home
     os.environ["BORING_HOME"] = BORING_HOME
+
+    # Answered before the config is read: `doctor` asks this to compare the installed copies
+    # against the checkout, and that comparison has to work on a machine whose config or engine
+    # is broken -- those are exactly the machines where a stale script goes unnoticed.
+    if args.list_hermes_scripts:
+        src_dir = Path(BORING_HOME) / "agents" / "hermes"
+        paths = list(_hermes_briefing_sources(BORING_HOME))
+        paths += [
+            src_dir / name
+            for name in _HERMES_ENTRY_SCRIPT_NAMES
+            if name in _HERMES_SEPARATELY_INSTALLED
+        ]
+        for path in paths:
+            print(path)
+        return 0
 
     cfg = boring_config.load()
     enabled = [a["id"] for a in cfg.get("agents", []) if a.get("enabled", True)]

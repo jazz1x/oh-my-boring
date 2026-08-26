@@ -71,6 +71,18 @@ SH
     cat >"$fakebin/python3" <<'SH'
 #!/bin/sh
 case "${1:-}" in
+  */agent_wiring.py)
+    # doctor asks the installer which files it writes, rather than keeping its own list.
+    # Invocation is: agent_wiring.py --list-hermes-scripts --boring-home <BORING_HOME>
+    if [ "${2:-}" = --list-hermes-scripts ]; then
+        for n in briefing.py slack_briefing.py; do
+            echo "${4:-}/agents/hermes/$n"
+        done
+        exit 0
+    fi
+    echo "fake python3: unmodelled agent_wiring call: $*" >&2
+    exit 7
+    ;;
   */event_log.py)
     if [ "${2:-}" = --record ]; then
         if [ -n "${DOCTOR_EVENT_CALLS:-}" ]; then
@@ -108,6 +120,21 @@ make_case() {
     mkdir -p "$home/.claude" "$home/.cache/boring-distill" "$boring/vault/wiki" "$boring/agents/codex" "$boring/agents/shared" "$boring/scripts"
     touch "$boring/agents/codex/collect-sessions.py"
     touch "$boring/agents/shared/event_log.py"
+    touch "$boring/agents/shared/agent_wiring.py"
+
+    # The scripts hermes runs are a separate artifact from the checkout: merging a briefing
+    # change does not copy it to ~/.hermes/scripts. Default the fixture to the deployed state
+    # so the healthy path is exercised by every existing case.
+    mkdir -p "$boring/agents/hermes" "$home/.hermes/scripts"
+    for n in briefing.py slack_briefing.py; do
+        printf 'current %s\n' "$n" >"$boring/agents/hermes/$n"
+        case "${DOCTOR_HERMES_STATE:-match}" in
+            drift) printf 'shipped twelve days ago %s\n' "$n" >"$home/.hermes/scripts/$n" ;;
+            missing) rm -f "$home/.hermes/scripts/$n" ;;
+            *) printf 'current %s\n' "$n" >"$home/.hermes/scripts/$n" ;;
+        esac
+    done
+    [ "${DOCTOR_HERMES_STATE:-match}" = none ] && rm -rf "$home/.hermes"
     touch "$home/.cache/boring-distill/session.ts"
     [ "$with_note" = yes ] && touch "$boring/vault/wiki/wiki-0001.md"
     printf 'DRUDGE_TOKEN=local\n' >"$boring/.env"
@@ -467,5 +494,58 @@ case "$(cat "$TMP/stale-gates.out")" in
     exit 1
     ;;
 esac
+
+# (d5b) The scripts hermes runs are a separate artifact from the checkout. On 2026-08-26 the
+# installed copies were twelve days behind main, five merged PRs had never reached the 08:01
+# cron, and every other doctor check was green — so "merged" has to stop reading as "delivered".
+( DOCTOR_HERMES_STATE=match make_case "$TMP/hermes-match" yes
+  if ! run_strict "$TMP/hermes-match" "$TMP/hermes-match.out"; then
+      cat "$TMP/hermes-match.out"
+      echo "FAIL: installed scripts identical to the checkout must pass" >&2
+      exit 1
+  fi
+  grep -q "hermes briefing scripts match the checkout" "$TMP/hermes-match.out" || {
+      cat "$TMP/hermes-match.out"
+      echo "FAIL: the healthy case must say the scripts match" >&2
+      exit 1
+  } ) || exit 1
+
+( DOCTOR_HERMES_STATE=drift make_case "$TMP/hermes-drift" yes
+  if run_strict "$TMP/hermes-drift" "$TMP/hermes-drift.out"; then
+      cat "$TMP/hermes-drift.out"
+      echo "FAIL: an installed script older than the checkout must fail strict" >&2
+      exit 1
+  fi
+  grep -q "DEPLOY DRIFT" "$TMP/hermes-drift.out" || {
+      cat "$TMP/hermes-drift.out"
+      echo "FAIL: drift must be named, not just counted" >&2
+      exit 1
+  } ) || exit 1
+
+( DOCTOR_HERMES_STATE=missing make_case "$TMP/hermes-missing" yes
+  if run_strict "$TMP/hermes-missing" "$TMP/hermes-missing.out"; then
+      cat "$TMP/hermes-missing.out"
+      echo "FAIL: a script hermes imports but never received must fail strict" >&2
+      exit 1
+  fi
+  grep -q "never received" "$TMP/hermes-missing.out" || {
+      cat "$TMP/hermes-missing.out"
+      echo "FAIL: a missing script must be reported as missing" >&2
+      exit 1
+  } ) || exit 1
+
+# A machine with no hermes-agent has nothing to drift from; the check must stay quiet rather
+# than invent a failure for an integration the user never enabled.
+( DOCTOR_HERMES_STATE=none make_case "$TMP/hermes-none" yes
+  if ! run_strict "$TMP/hermes-none" "$TMP/hermes-none.out"; then
+      cat "$TMP/hermes-none.out"
+      echo "FAIL: an install without hermes must not fail on hermes script drift" >&2
+      exit 1
+  fi
+  if grep -q "hermes briefing scripts" "$TMP/hermes-none.out"; then
+      cat "$TMP/hermes-none.out"
+      echo "FAIL: no hermes install means no hermes verdict" >&2
+      exit 1
+  fi ) || exit 1
 
 echo "doctor strict gate tests passed"
