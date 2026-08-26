@@ -45,16 +45,20 @@ Blocked:
 ▶️ *다음 행동*
 • oh-my-boring — add ops status JSON
 
-✅ *완료*
-• oh-my-boring — fixed *DB* primary event logging"""
+✅ 완료 1건 — 상세는 위키"""
 
     assert briefing.slack_mrkdwn(answer) == expected
     assert weekly.slack_mrkdwn(answer) == expected
 
+    # The shortlist half of this test needs a briefing big enough to warrant one: below the
+    # threshold the whole message fits on a screen and a summary would only restate it.
+    busy = "# oh-my-boring\n" + "\n".join(
+        [f"- Next: action {i}" for i in range(6)] + ["- 막힘： LM Studio embedding model is not loaded"]
+    )
     payload = slack_briefing.render_blocks_payload(
         "☀️ 아침 브리핑",
         "2026-07-01 Wed",
-        answer,
+        busy,
         ["/vault/wiki/wiki-0001.md"],
         "비어 있음",
     )
@@ -294,8 +298,9 @@ def test_slack_mrkdwn_dedups_duplicate_bullets_across_project_sections():
 - Blocked: 토큰 문제
 """
     body = slack_briefing.render_body_mrkdwn(answer)
-    # README 최신화는 exact duplicate → 1회만.
-    assert body.count("README 최신화") == 1
+    # Done is a count line now, so its items never reach the body at all — the dedup that
+    # matters here is on the labels that do print.
+    assert body.count("README 최신화") == 0
     # Blocked from the second kb-rag-bot section is preserved.
     assert body.count("토큰 문제") == 1
     # Summary counts reflect dedup.
@@ -319,20 +324,68 @@ def test_slack_mrkdwn_filters_placeholders_and_noise():
     assert "Blocked: -" not in body
     assert "없음" not in body
     # Real bullets preserved.
-    assert "게이트 4단계 구현" in body
+    # A Done item survives parsing but not the body: it is counted, not bulleted.
+    assert "게이트 4단계 구현" not in body
+    assert "✅ 완료" in body
     assert "출처 강등 처리" in body
 
 
-def test_slack_mrkdwn_caps_done_items():
+def test_done_is_counted_in_the_text_renderer_too():
     slack_briefing = load_module("slack_briefing_test5", ROOT / "slack_briefing.py")
 
-    answer = "## kb-rag-bot\n" + "\n".join(
-        f"- Done: task {i}" for i in range(10)
+    answer = "## kb-rag-bot\n" + "\n".join(f"- Done: task {i}" for i in range(10))
+    body = slack_briefing.render_body_mrkdwn(answer)
+    # Done used to be capped at three bullets here and demoted to a count in the blocks — the
+    # two renderings disagreeing is the defect this whole contract exists to prevent.
+    assert body.count("task") == 0
+    assert "✅ 완료 10건" in body
+
+
+def test_singular_labels_are_not_dumped_into_the_unlabelled_bucket():
+    slack_briefing = load_module("slack_briefing_alias", ROOT / "slack_briefing.py")
+
+    # The engine writes these in the singular. The alias table only had the plurals, so eight
+    # labelled items a day were reported as "기타" — the category was not missing, the alias was.
+    answer = "# p\n- Decision: B 단독\n- Risk: 역방향 감사 누락\n- Blocker: 외부 차단\n"
+    body = slack_briefing.render_body_mrkdwn(answer)
+    assert "💡 결정 1" in body, body
+    assert "⚠️ 리스크 1" in body, body
+    assert "🚨 막힘 1" in body, body
+    assert "기타" not in body, "a labelled item must never land in the unlabelled bucket"
+
+
+def test_the_text_fallback_carries_the_shortlist_too():
+    slack_briefing = load_module("slack_briefing_fb", ROOT / "slack_briefing.py")
+
+    answer = "# p\n- Blocked: the blocker\n" + "\n".join(
+        f"- Next: action {i}" for i in range(6)
     )
     body = slack_briefing.render_body_mrkdwn(answer)
-    # Only first 3 Done items shown; rest collapsed.
-    assert body.count("task") == 3
-    assert "외 7개 항목" in body
+    payload = slack_briefing.render_blocks_payload("T", "S", answer, [], "empty")
+    blocks_text = "\n".join(
+        b["text"]["text"] for b in payload["blocks"] if b.get("type") == "section" and "text" in b
+    )
+    # Slack picks between the two renderings. A fallback missing the one thing the message exists
+    # to answer is a second, quieter briefing — the defect this contract was written for.
+    assert "*오늘의 1순위*" in body, body
+    assert "*오늘의 1순위*" in blocks_text
+    shortlist_at = body.index("*오늘의 1순위*")
+    group_at = body.index("🚨 *막힘*")
+    assert shortlist_at < group_at, "the shortlist comes before the groups"
+    assert "the blocker" in body[shortlist_at:group_at], "the blocker must lead the shortlist"
+
+
+def test_repeated_project_names_are_written_once():
+    slack_briefing = load_module("slack_briefing_group", ROOT / "slack_briefing.py")
+
+    answer = "# omcr\n" + "\n".join(f"- Next: action {i}" for i in range(4))
+    body = slack_briefing.render_body_mrkdwn(answer)
+    # Five lines that all begin with the same project name spend the first twenty characters of
+    # every line saying nothing new, which on a phone is most of the line.
+    assert body.count("omcr") == 1, body
+    for i in range(4):
+        assert f"action {i}" in body
+    assert "◦" in body, "items must nest under the project name"
 
 
 if __name__ == "__main__":
@@ -347,5 +400,8 @@ if __name__ == "__main__":
     test_slack_mrkdwn_handles_adversarial_inputs()
     test_slack_mrkdwn_dedups_duplicate_bullets_across_project_sections()
     test_slack_mrkdwn_filters_placeholders_and_noise()
-    test_slack_mrkdwn_caps_done_items()
+    test_done_is_counted_in_the_text_renderer_too()
+    test_singular_labels_are_not_dumped_into_the_unlabelled_bucket()
+    test_the_text_fallback_carries_the_shortlist_too()
+    test_repeated_project_names_are_written_once()
     print("ok - hermes briefing Slack formatting")

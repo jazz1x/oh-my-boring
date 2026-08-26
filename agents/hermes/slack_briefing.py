@@ -85,11 +85,19 @@ LABEL_ALIASES = {
     "Blocked": "Blocked",
     "막힘": "Blocked",
     "Decisions": "Decisions",
+    # The engine writes these in the singular ("Decision: …", "Risk: …") and the table only had
+    # the plurals, so eight labelled items a day fell into the unlabelled bucket and were
+    # reported as "기타". The category was not missing; the alias was.
+    "Decision": "Decisions",
     "결정": "Decisions",
     "Risks": "Risks",
+    "Risk": "Risks",
     "리스크": "Risks",
     "Stalled": "Stalled",
+    "Stall": "Stalled",
     "정체": "Stalled",
+    "Block": "Blocked",
+    "Blocker": "Blocked",
 }
 LABELS = set(LABEL_ALIASES)
 
@@ -209,6 +217,21 @@ def render_body_mrkdwn(answer: str) -> str:
 
     counts: list[str] = []
     lines: list[str] = []
+
+    # The same shortlist the blocks lead with. Slack picks between the two renderings, so a
+    # reader who falls back must not lose the one thing the message exists to answer.
+    # The shortlist earns its place by saving a scroll. When the message is short enough that
+    # every pick is already visible in the groups below without scrolling, it only repeats
+    # itself — a summary of a screenful is not a summary.
+    picks = top_picks(items_by_label)
+    if picks and _shortlist_earns_its_place(items_by_label):
+        lines.append("*오늘의 1순위*")
+        lines.extend(
+            f"{n}. {SECTION_EMOJI[label]} {_slack_inline(project_name)} — {_slack_inline(item.text)}"
+            for n, (label, project_name, item) in enumerate(picks, 1)
+        )
+        lines.append("")
+
     for label in SECTION_ORDER:
         entries = items_by_label[label]
         if not entries:
@@ -216,16 +239,17 @@ def render_body_mrkdwn(answer: str) -> str:
         emoji = SECTION_EMOJI[label]
         title = SECTION_TITLE[label]
         counts.append(f"{emoji} {title} {len(entries)}")
+        # Done is confirmation, not work — a count, not bullets, in both renderings.
+        if label == "Done":
+            continue
         lines.append(f"{emoji} *{title}*")
         limit = group_limit(label, len(entries))
-        for project_name, item in entries[:limit]:
-            text = _slack_inline(item.text)
-            lines.append(f"• {_slack_inline(project_name)} — {text}")
-        omitted = max(0, len(entries) - limit)
-        if omitted:
-            lines.append(f"• _외 {omitted}개 항목_")
+        lines.extend(render_group_lines(entries, limit))
         lines.append("")
 
+    done = items_by_label.get("Done") or []
+    if done:
+        lines.append(f"{SECTION_EMOJI['Done']} {SECTION_TITLE['Done']} {len(done)}건 — 상세는 위키")
     return f"{' · '.join(counts)}\n\n" + "\n".join(lines).strip()
 
 
@@ -253,6 +277,62 @@ def top_picks(items_by_label, limit=TOP_PICKS):
             if len(picks) >= limit:
                 return picks
     return picks
+
+
+#: Below this many actionable items the whole message fits on one screen, so a shortlist would
+#: only restate what is already visible. Measured against real briefings, which carry 20-30.
+SHORTLIST_MIN_ITEMS = 6
+
+
+def _shortlist_earns_its_place(items_by_label) -> bool:
+    """True when there is enough to triage that naming the top three saves the reader a scroll."""
+    actionable = sum(len(items_by_label.get(label, ())) for label in ACTIONABLE)
+    return actionable >= SHORTLIST_MIN_ITEMS
+
+
+def group_by_project(entries):
+    """[(project, item)] -> [(project, [items])], first-seen order.
+
+    Five consecutive lines that all begin with the same project name spend the first twenty
+    characters of every line saying nothing new, and on a phone that is most of the line. The
+    name is written once and its items nest under it.
+    """
+    grouped: list[tuple[str, list]] = []
+    index: dict[str, int] = {}
+    for project_name, item in entries:
+        pos = index.get(project_name)
+        if pos is None:
+            index[project_name] = len(grouped)
+            grouped.append((project_name, [item]))
+        else:
+            grouped[pos][1].append(item)
+    return grouped
+
+
+def render_group_lines(entries, limit, bullet="•", sub="   ◦"):
+    """Lines for one status group, nested under project names and honouring the item limit.
+
+    Shared by both renderers so a reader who falls back to text sees the same items in the same
+    shape — the limits already agree, and the layout has to as well.
+    """
+    lines: list[str] = []
+    shown = 0
+    for project_name, items in group_by_project(entries):
+        if shown >= limit:
+            break
+        room = limit - shown
+        take = items[:room]
+        shown += len(take)
+        name = _slack_inline(project_name)
+        if len(take) == 1:
+            lines.append(f"{bullet} {name} — {_slack_inline(take[0].text)}")
+        else:
+            lines.append(f"{bullet} {name}")
+            lines.extend(f"{sub} {_slack_inline(i.text)}" for i in take)
+    omitted = sum(len(items) for _n, items in group_by_project(entries)) - shown
+    if omitted > 0:
+        lines.append(f"{bullet} _외 {omitted}개 항목_")
+    return lines
 
 
 def group_limit(label: str, total: int) -> int:
@@ -323,7 +403,7 @@ def render_blocks_payload(
         # The shortlist goes above everything, because the question at 9am is "what first" and a
         # status ledger makes the reader answer it themselves.
         picks = top_picks(items_by_label)
-        if picks:
+        if picks and _shortlist_earns_its_place(items_by_label):
             pick_lines = [
                 f"{n}. {SECTION_EMOJI[label]} {project_name} — {item.text}"
                 for n, (label, project_name, item) in enumerate(picks, 1)
@@ -342,12 +422,7 @@ def render_blocks_payload(
             if label == "Done":
                 continue
             block_limit = group_limit(label, len(entries))
-            item_lines = [
-                f"• {project_name} — {item.text}" for project_name, item in entries[:block_limit]
-            ]
-            omitted = max(0, len(entries) - block_limit)
-            if omitted:
-                item_lines.append(f"• _외 {omitted}개 항목_")
+            item_lines = render_group_lines(entries, block_limit)
             # Label and items share one section: a label-only section plus a divider cost two
             # blocks each and bought nothing but scrolling.
             blocks.append(
