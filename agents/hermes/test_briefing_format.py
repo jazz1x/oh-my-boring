@@ -39,11 +39,10 @@ Blocked:
 
     expected = """🚨 막힘 1 · ▶️ 다음 행동 1 · ✅ 완료 1
 
-🚨 *막힘*
-• oh-my-boring — LM Studio embedding model is not loaded
-
-▶️ *다음 행동*
-• oh-my-boring — add ops status JSON
+*행동* (2)
+• oh-my-boring
+   ◦ 🚨 LM Studio embedding model is not loaded
+   ◦ ▶️ add ops status JSON
 
 ✅ 완료 1건 — 상세는 위키"""
 
@@ -74,10 +73,11 @@ Blocked:
     assert shortlist.startswith("*오늘의 1순위*")
     assert "LM Studio" in shortlist, "the blocker must be the first thing the reader sees"
     assert payload["blocks"][4]["type"] == "divider"
-    # Label and items share one section — a label-only section plus a divider cost two blocks
-    # each and bought nothing but scrolling.
+    # Six status headings were more precision than the classifier behind them delivers, so they
+    # collapse into 행동/참고 and the status rides on each item as an emoji instead.
     group = payload["blocks"][5]["text"]["text"]
-    assert group.startswith("🚨 *막힘* (1)")
+    assert group.startswith("*행동* ("), group
+    assert "🚨" in group, "the status must survive on the item"
     assert "LM Studio" in group
     assert "Blocked: -" not in payload["text"]
     assert payload["blocks"][-1]["type"] == "context"
@@ -88,9 +88,11 @@ def test_blocked_is_never_truncated_and_both_renderers_agree():
     slack_briefing = load_module("slack_briefing_limits", ROOT / "slack_briefing.py")
 
     # Eight blockers and eight next-actions: more than any per-group limit.
+    # The zone limit is the sum of its labels' limits, so Next has to exceed that sum before
+    # truncation happens at all — a fixture below it would assert on a cap that never fires.
     lines = ["# proj"]
     lines += [f"- Blocked: blocker {i}" for i in range(8)]
-    lines += [f"- Next: action {i}" for i in range(8)]
+    lines += [f"- Next: action {i}" for i in range(20)]
     answer = "\n".join(lines)
 
     body = slack_briefing.render_body_mrkdwn(answer)
@@ -106,10 +108,10 @@ def test_blocked_is_never_truncated_and_both_renderers_agree():
 
     # Next is truncated — and both renderers must truncate it to the SAME set, because Slack
     # picks between them and a fallback that disagrees is a second, quieter briefing.
-    shown_text = {i for i in range(8) if f"action {i}" in body}
-    shown_blocks = {i for i in range(8) if f"action {i}" in blocks_text}
+    shown_text = {i for i in range(20) if f"action {i}" in body}
+    shown_blocks = {i for i in range(20) if f"action {i}" in blocks_text}
     assert shown_text == shown_blocks, f"fallback and blocks disagree: {shown_text} vs {shown_blocks}"
-    assert len(shown_text) < 8, "Next must actually be capped, or this test proves nothing"
+    assert len(shown_text) < 20, "Next must actually be capped, or this test proves nothing"
 
 
 def test_done_does_not_push_blockers_off_the_first_screen():
@@ -252,20 +254,24 @@ Blocked:
 - 없음
 """
     body = slack_briefing.render_body_mrkdwn(multi)
-    assert "🚨 *막힘*" in body
+    assert "*행동*" in body, "blocked items live in the action zone now"
+    assert body.count("🚨") >= 2, "each blocked item keeps its status emoji"
     assert body.count("first blocker") == 1
     assert body.count("second blocker") == 1
     assert "없음" not in body  # EMPTY_VALUES should be dropped
     assert "기타" not in body  # both bullets inherited the Blocked label
 
-    # Unknown labels and label-free bullets land in "기타".
+    # An item the distiller failed to label is still an item. There is no "기타" heading any
+    # more — it rides in 참고 — but it must never vanish, or the briefing is quietly lossy.
     misc = """# p
 
 - UnknownLabel: something odd
 - plain bullet without a label
 """
     body = slack_briefing.render_body_mrkdwn(misc)
-    assert "• *기타*" in body
+    assert "*참고*" in body
+    assert "something odd" in body, "an unknown label must not silently drop the item"
+    assert "plain bullet without a label" in body
     assert "something odd" in body
     assert "plain bullet without a label" in body
 
@@ -370,9 +376,61 @@ def test_the_text_fallback_carries_the_shortlist_too():
     assert "*오늘의 1순위*" in body, body
     assert "*오늘의 1순위*" in blocks_text
     shortlist_at = body.index("*오늘의 1순위*")
-    group_at = body.index("🚨 *막힘*")
+    group_at = body.index("*행동*")
     assert shortlist_at < group_at, "the shortlist comes before the groups"
     assert "the blocker" in body[shortlist_at:group_at], "the blocker must lead the shortlist"
+
+
+def test_zones_replace_status_headings_but_keep_the_status():
+    slack_briefing = load_module("slack_briefing_zone", ROOT / "slack_briefing.py")
+
+    answer = "# p\n- Blocked: cannot start\n- Stalled: sitting a week\n- Next: do the thing\n- Risk: might break\n"
+    body = slack_briefing.render_body_mrkdwn(answer)
+
+    # Six headings were more precision than the classifier delivers — the distiller's own labels
+    # wander, and a six-way surface amplifies that instead of absorbing it.
+    for gone in ("*막힘*", "*정체 중*", "*다음 행동*", "*리스크*"):
+        assert gone not in body, f"{gone} should have collapsed into a zone"
+    assert "*행동* (3)" in body
+    assert "*참고* (1)" in body
+    # The status survives on the item, so a reader still sees blocked-vs-next without the
+    # briefing having to be right about which of six boxes the item belongs in.
+    for emoji in ("🚨", "⏸️", "▶️", "⚠️"):
+        assert emoji in body, f"{emoji} must ride on its item"
+
+    # Two rendering paths carry the emoji — one project with several items nests them under the
+    # name, one project with a single item writes it inline. A mutation in either must be caught.
+    single = slack_briefing.render_body_mrkdwn(
+        "# alpha\n- Blocked: only item\n## beta\n- Next: also only item\n"
+    )
+    assert "🚨 alpha — only item" in single, single
+    assert "▶️ beta — also only item" in single
+
+
+def test_endings_are_shaved_not_truncated():
+    slack_briefing = load_module("slack_briefing_shave", ROOT / "slack_briefing.py")
+
+    # Korean puts the verb last, so cutting from the front deletes the action and leaves the
+    # object. The tail is shaved instead and the verb stem stays.
+    answer = "# p\n- Next: 재현 스크립트를 확보하여 근거를 보강해야 합니다.\n- Next: 코퍼스 경계 검증이 필요합니다.\n"
+    body = slack_briefing.render_body_mrkdwn(answer)
+    assert "근거를 보강" in body, body
+    assert "해야 합니다" not in body
+    assert "코퍼스 경계 검증 필요" in body
+    # A line matching no pattern is left exactly as written.
+    assert slack_briefing.shave_ending("no korean tail here") == "no korean tail here"
+
+
+def test_sources_are_one_line_not_five_titles():
+    slack_briefing = load_module("slack_briefing_src", ROOT / "slack_briefing.py")
+
+    sources = [f"/vault/wiki/wiki-{i:04d}.md" for i in range(5)]
+    line = slack_briefing.render_sources(sources)
+    # Slack cannot open a vault file, so five titles were 277 characters the reader could do
+    # nothing with. What survives is the trust signal.
+    assert len(line) <= 40, line
+    assert "위키 5건" in line
+    assert slack_briefing.render_sources([]) == ""
 
 
 def test_repeated_project_names_are_written_once():
@@ -403,5 +461,8 @@ if __name__ == "__main__":
     test_done_is_counted_in_the_text_renderer_too()
     test_singular_labels_are_not_dumped_into_the_unlabelled_bucket()
     test_the_text_fallback_carries_the_shortlist_too()
+    test_zones_replace_status_headings_but_keep_the_status()
+    test_endings_are_shaved_not_truncated()
+    test_sources_are_one_line_not_five_titles()
     test_repeated_project_names_are_written_once()
     print("ok - hermes briefing Slack formatting")
