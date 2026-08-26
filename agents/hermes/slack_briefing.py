@@ -234,17 +234,16 @@ def render_body_mrkdwn(answer: str) -> str:
 
     for label in SECTION_ORDER:
         entries = items_by_label[label]
+        if entries:
+            counts.append(f"{SECTION_EMOJI[label]} {SECTION_TITLE[label]} {len(entries)}")
+
+    for zone_title, labels in ZONES:
+        entries = zone_entries(items_by_label, labels)
         if not entries:
             continue
-        emoji = SECTION_EMOJI[label]
-        title = SECTION_TITLE[label]
-        counts.append(f"{emoji} {title} {len(entries)}")
-        # Done is confirmation, not work — a count, not bullets, in both renderings.
-        if label == "Done":
-            continue
-        lines.append(f"{emoji} *{title}*")
-        limit = group_limit(label, len(entries))
-        lines.extend(render_group_lines(entries, limit))
+        limit = sum(group_limit(label, len(items_by_label.get(label, ()))) for label in labels)
+        lines.append(f"*{zone_title}* ({len(entries)})")
+        lines.extend(render_zone_lines(entries, limit))
         lines.append("")
 
     done = items_by_label.get("Done") or []
@@ -256,6 +255,19 @@ def render_body_mrkdwn(answer: str) -> str:
 #: Groups that answer "what do I do now", in the order a reader should meet them. Everything else
 #: is confirmation, and confirmation belongs below the fold.
 ACTIONABLE = ("Blocked", "Stalled", "Next")
+
+#: Six status headings were more precision than the classifier behind them can deliver: the
+#: distiller's own labels wander (a "Blocked" row that is really a task — see the 2026-08-26
+#: artifact), and a six-way surface amplifies that instead of absorbing it. The reader's question
+#: is not "which status is this" but "do I have to move" — so the headings collapse to that, and
+#: the status survives as a per-item emoji rather than a box the item might be in wrongly.
+#: The unlabelled bucket rides in 참고 rather than getting a zone of its own. It must ride
+#: somewhere: an item the distiller failed to label is still an item, and dropping it would make
+#: the briefing quietly lossy — which is worse than the ugly "기타" heading it replaces.
+ZONES = (
+    ("행동", ("Blocked", "Stalled", "Next")),
+    ("참고", ("Risks", "Decisions", "")),
+)
 
 #: How many items the top-of-message shortlist carries. Three is what fits above the fold on a
 #: phone next to a header and a count line; a shortlist that needs scrolling is not a shortlist.
@@ -307,6 +319,89 @@ def group_by_project(entries):
         else:
             grouped[pos][1].append(item)
     return grouped
+
+
+#: Endings the distiller pads every line with. Korean puts the verb last, so truncating from the
+#: front deletes the action and leaves the object — which is why these are shaved rather than the
+#: line being cut. Each pattern keeps the verb stem and drops only the politeness tail, and a line
+#: that matches nothing is left exactly as written.
+_ENDING_TRIMS = (
+    ("해야 합니다.", ""),
+    ("해야 한다.", ""),
+    ("이 필요합니다.", " 필요"),
+    ("가 필요합니다.", " 필요"),
+    ("이 필요함.", " 필요"),
+    ("가 필요함.", " 필요"),
+    ("하였습니다.", "함"),
+    ("했습니다.", "함"),
+    ("합니다.", "함"),
+    ("됩니다.", "됨"),
+    ("입니다.", ""),
+    ("되었습니다.", "됨"),
+    ("있습니다.", "있음"),
+)
+
+
+def shave_ending(text: str) -> str:
+    """Drop the politeness tail, keep the verb.
+
+    "…근거를 보강해야 합니다" -> "…근거를 보강". Purely a rendering concern: the wording comes from
+    the distillation prompt, and changing that would change the notes the injection channel is
+    being measured on, which is frozen until the window closes (docs/PRD.md §5-R3).
+    """
+    stripped = text.rstrip()
+    for tail, replacement in _ENDING_TRIMS:
+        if stripped.endswith(tail):
+            return (stripped[: -len(tail)] + replacement).rstrip()
+    return text
+
+
+def zone_entries(items_by_label, labels):
+    """[(label, project, item)] for one zone, in the labels' priority order."""
+    out = []
+    for label in labels:
+        out.extend((label, project_name, item) for project_name, item in items_by_label.get(label, []))
+    return out
+
+
+def render_zone_lines(entries, limit, sub="   ◦"):
+    """Lines for one zone: status rides on the item, the project name is written once.
+
+    The status heading is gone, so each line carries its own emoji — a reader still sees that
+    something is blocked rather than merely next, without the briefing having to be right about
+    which of six boxes it belongs in.
+    """
+    lines: list[str] = []
+    shown = 0
+    grouped: list[tuple[str, list[tuple[str, object]]]] = []
+    index: dict[str, int] = {}
+    for label, project_name, item in entries:
+        pos = index.get(project_name)
+        if pos is None:
+            index[project_name] = len(grouped)
+            grouped.append((project_name, [(label, item)]))
+        else:
+            grouped[pos][1].append((label, item))
+
+    for project_name, rows in grouped:
+        if shown >= limit:
+            break
+        take = rows[: limit - shown]
+        shown += len(take)
+        name = _slack_inline(project_name)
+        if len(take) == 1:
+            label, item = take[0]
+            lines.append(f"{SECTION_EMOJI[label]} {name} — {_slack_inline(item.text)}")
+        else:
+            # Mixed statuses under one project keep their own emoji on each row.
+            lines.append(f"• {name}")
+            lines.extend(
+                f"{sub} {SECTION_EMOJI[label]} {_slack_inline(item.text)}" for label, item in take
+            )
+    omitted = len(entries) - shown
+    if omitted > 0:
+        lines.append(f"• _외 {omitted}개 항목_")
+    return lines
 
 
 def render_group_lines(entries, limit, bullet="•", sub="   ◦"):
@@ -411,22 +506,18 @@ def render_blocks_payload(
             blocks.append(_section("*오늘의 1순위*\n" + "\n".join(pick_lines)))
             blocks.append({"type": "divider"})
 
-        for label in SECTION_ORDER:
-            entries = items_by_label[label]
+        for zone_title, labels in ZONES:
+            entries = zone_entries(items_by_label, labels)
             if not entries:
                 continue
-            emoji = SECTION_EMOJI[label]
-            title_text = SECTION_TITLE[label]
-            # Done is confirmation, not work. One context line at the bottom, no bullets: on a
-            # phone, ten finished items push the blockers off the first screen.
-            if label == "Done":
-                continue
-            block_limit = group_limit(label, len(entries))
-            item_lines = render_group_lines(entries, block_limit)
-            # Label and items share one section: a label-only section plus a divider cost two
-            # blocks each and bought nothing but scrolling.
+            # Done stays out of the zones entirely: it is confirmation, not work, and on a phone
+            # sixteen finished items push the blockers off the first screen.
+            zone_limit = sum(
+                group_limit(label, len(items_by_label.get(label, ()))) for label in labels
+            )
+            item_lines = render_zone_lines(entries, zone_limit)
             blocks.append(
-                _section(f"{emoji} *{title_text}* ({len(entries)})\n" + "\n".join(item_lines))
+                _section(f"*{zone_title}* ({len(entries)})\n" + "\n".join(item_lines))
             )
 
         done = items_by_label.get("Done") or []
@@ -502,8 +593,18 @@ def render_weekly_blocks(title, stamp, projects, intervention, board, trend, sou
 
 
 def render_sources(sources: list[object]) -> str:
+    """One line naming the corpus, not five titles.
+
+    The full list ran to 277 characters of wiki filenames and titles that the item lines had
+    already said. Slack cannot open a vault file — there is no URL — so the reader can do nothing
+    with them; what survives is the trust signal that an answer came from the corpus at all.
+    """
     labels = [source_label(source) for source in sources[:SOURCE_LIMIT]]
-    return "근거: " + " · ".join(labels) if labels else ""
+    if not labels:
+        return ""
+    first = labels[0].split(" (")[-1].rstrip(")") if " (" in labels[0] else labels[0]
+    rest = len(labels) - 1
+    return f"근거: 위키 {len(labels)}건 ({first}" + (f" 외 {rest})" if rest else ")")
 
 
 def parse_brief(answer: str) -> BriefDocument:
@@ -603,7 +704,7 @@ def _plain_label(line: str) -> str:
 
 
 def _slack_inline(text: str) -> str:
-    return text.replace("**", "*").strip()
+    return shave_ending(text.replace("**", "*").strip())
 
 
 def _compact_text(text: str) -> str:
