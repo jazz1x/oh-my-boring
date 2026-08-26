@@ -43,6 +43,7 @@ Blocked:
 • oh-my-boring
    ◦ 🚨 LM Studio embedding model is not loaded
    ◦ ▶️ add ops status JSON
+_→ `recall("…", "oh-my-boring")` · 느림 `next_actions("oh-my-boring")`_
 
 ✅ 완료 1건 — 상세는 위키"""
 
@@ -407,6 +408,25 @@ def test_zones_replace_status_headings_but_keep_the_status():
     assert "▶️ beta — also only item" in single
 
 
+def test_each_zone_names_the_call_that_digs_into_it():
+    slack_briefing = load_module("slack_briefing_follow", ROOT / "slack_briefing.py")
+
+    answer = "# kb-rag-bot\n- Blocked: a\n- Next: b\n- Risk: c\n## other\n- Next: d\n"
+    body = slack_briefing.render_body_mrkdwn(answer)
+
+    # Naming the sources bought nothing — Slack cannot open a vault file. Naming the call does:
+    # the reader is already in front of an agent that can run it.
+    assert "recall(" in body and "claims(" in body, body
+    # The project is filled in, not left as a placeholder for the reader to supply.
+    assert '"kb-rag-bot"' in body
+    assert "project)" not in body, "the briefing knows the name; do not make the reader type it"
+    # Deterministic tools lead. next_actions was measured at over 30s with no response, so a
+    # suggestion that leaves the reader waiting half a minute must at least say so.
+    action_line = next(ln for ln in body.split("\n") if ln.startswith("_→") and "recall(" in ln)
+    assert action_line.index("recall(") < action_line.index("next_actions("), action_line
+    assert "느림" in action_line
+
+
 def test_endings_are_shaved_not_truncated():
     slack_briefing = load_module("slack_briefing_shave", ROOT / "slack_briefing.py")
 
@@ -440,7 +460,10 @@ def test_repeated_project_names_are_written_once():
     body = slack_briefing.render_body_mrkdwn(answer)
     # Five lines that all begin with the same project name spend the first twenty characters of
     # every line saying nothing new, which on a phone is most of the line.
-    assert body.count("omcr") == 1, body
+    # Item lines only: the follow-up line names the project too, and that repetition is the
+    # point there — it is the argument the reader would otherwise have to type.
+    item_lines = [ln for ln in body.split("\n") if ln.startswith(("•", "   ◦"))]
+    assert sum(ln.count("omcr") for ln in item_lines) == 1, item_lines
     for i in range(4):
         assert f"action {i}" in body
     assert "◦" in body, "items must nest under the project name"
@@ -462,6 +485,7 @@ if __name__ == "__main__":
     test_singular_labels_are_not_dumped_into_the_unlabelled_bucket()
     test_the_text_fallback_carries_the_shortlist_too()
     test_zones_replace_status_headings_but_keep_the_status()
+    test_each_zone_names_the_call_that_digs_into_it()
     test_endings_are_shaved_not_truncated()
     test_sources_are_one_line_not_five_titles()
     test_repeated_project_names_are_written_once()

@@ -244,6 +244,9 @@ def render_body_mrkdwn(answer: str) -> str:
         limit = sum(group_limit(label, len(items_by_label.get(label, ()))) for label in labels)
         lines.append(f"*{zone_title}* ({len(entries)})")
         lines.extend(render_zone_lines(entries, limit))
+        followup = zone_followup(zone_title, entries)
+        if followup:
+            lines.append(f"_→ {followup}_")
         lines.append("")
 
     done = items_by_label.get("Done") or []
@@ -268,6 +271,36 @@ ZONES = (
     ("행동", ("Blocked", "Stalled", "Next")),
     ("참고", ("Risks", "Decisions", "")),
 )
+
+#: What to ask next, per zone. The briefing is a summary of notes the reader cannot open from
+#: Slack — there is no URL for a vault file — so naming the sources bought nothing actionable.
+#: Naming the MCP call does: the reader is already sitting in front of an agent that can run it,
+#: and these are the tools that actually answer each zone (verified against tools/list).
+#: The MCP call that digs into a zone. Naming the sources bought nothing — Slack cannot open a
+#: vault file — but naming the call does: the reader is already sitting in front of an agent that
+#: can run it. `{p}` is filled with a project the zone actually contains rather than left as a
+#: placeholder, because the briefing already knows the name.
+#:
+#: Deterministic tools lead. `recall` and `claims` embed and return; `next_actions`, `stalled`,
+#: `decisions`, `risks` and `ask` all run the local LLM, and `next_actions` was measured at over
+#: 30s with no response. Suggesting a call that leaves the reader waiting half a minute is worse
+#: than suggesting nothing, so the slow ones are named second and marked.
+ZONE_FOLLOWUP = {
+    "행동": '`recall("…", "{p}")` · 느림 `next_actions("{p}")`',
+    "참고": '`claims("{p}")` · 느림 `decisions("{p}")`',
+}
+
+
+def zone_followup(zone_title: str, entries) -> str:
+    """The MCP call that digs into this zone, aimed at the project carrying the most of it."""
+    template = ZONE_FOLLOWUP.get(zone_title)
+    if not template or not entries:
+        return ""
+    counts: dict[str, int] = {}
+    for _label, project_name, _item in entries:
+        counts[project_name] = counts.get(project_name, 0) + 1
+    busiest = max(counts, key=lambda name: (counts[name], name))
+    return template.format(p=_slack_inline(busiest))
 
 #: How many items the top-of-message shortlist carries. Three is what fits above the fold on a
 #: phone next to a header and a count line; a shortlist that needs scrolling is not a shortlist.
@@ -519,6 +552,10 @@ def render_blocks_payload(
             blocks.append(
                 _section(f"*{zone_title}* ({len(entries)})\n" + "\n".join(item_lines))
             )
+            followup = zone_followup(zone_title, entries)
+            if followup:
+                # A context block: present when wanted, visually quiet when not.
+                blocks.append(_context(f"→ {followup}"))
 
         done = items_by_label.get("Done") or []
         if done:
