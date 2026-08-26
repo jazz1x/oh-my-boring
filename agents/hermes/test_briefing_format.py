@@ -37,7 +37,7 @@ Blocked:
 - 막힘： LM Studio embedding model is not loaded
 """
 
-    expected = """🚨 1 · ▶️ 1 · ✅ 1
+    expected = """🚨 막힘 1 · ▶️ 다음 행동 1 · ✅ 완료 1
 
 🚨 *막힘*
 • oh-my-boring — LM Studio embedding model is not loaded
@@ -62,15 +62,89 @@ Blocked:
     assert payload["blocks"][0]["type"] == "header"
     assert payload["blocks"][1]["type"] == "context"
     assert payload["blocks"][2]["type"] == "context"
-    assert "🚨 1" in payload["blocks"][2]["elements"][0]["text"]
-    assert payload["blocks"][3]["type"] == "divider"
-    assert payload["blocks"][4]["type"] == "section"
-    assert "막힘" in payload["blocks"][4]["text"]["text"]
-    assert payload["blocks"][5]["type"] == "section"
-    assert "LM Studio" in payload["blocks"][5]["text"]["text"]
+    assert "🚨 막힘 1" in payload["blocks"][2]["elements"][0]["text"]
+    # The shortlist is the third block on purpose: the question at 9am is "what first", and a
+    # reader who has to scroll past a status ledger to find it is doing the triage themselves.
+    assert payload["blocks"][3]["type"] == "section"
+    shortlist = payload["blocks"][3]["text"]["text"]
+    assert shortlist.startswith("*오늘의 1순위*")
+    assert "LM Studio" in shortlist, "the blocker must be the first thing the reader sees"
+    assert payload["blocks"][4]["type"] == "divider"
+    # Label and items share one section — a label-only section plus a divider cost two blocks
+    # each and bought nothing but scrolling.
+    group = payload["blocks"][5]["text"]["text"]
+    assert group.startswith("🚨 *막힘* (1)")
+    assert "LM Studio" in group
     assert "Blocked: -" not in payload["text"]
     assert payload["blocks"][-1]["type"] == "context"
     assert "wiki-0001.md" in payload["blocks"][-1]["elements"][0]["text"]
+
+
+def test_blocked_is_never_truncated_and_both_renderers_agree():
+    slack_briefing = load_module("slack_briefing_limits", ROOT / "slack_briefing.py")
+
+    # Eight blockers and eight next-actions: more than any per-group limit.
+    lines = ["# proj"]
+    lines += [f"- Blocked: blocker {i}" for i in range(8)]
+    lines += [f"- Next: action {i}" for i in range(8)]
+    answer = "\n".join(lines)
+
+    body = slack_briefing.render_body_mrkdwn(answer)
+    payload = slack_briefing.render_blocks_payload("T", "S", answer, [], "empty")
+    blocks_text = "\n".join(
+        b["text"]["text"] for b in payload["blocks"] if b.get("type") == "section"
+    )
+
+    # A "+N more" hiding a blocker is the one omission that can cost the reader their morning.
+    for i in range(8):
+        assert f"blocker {i}" in body, f"text renderer dropped blocker {i}"
+        assert f"blocker {i}" in blocks_text, f"block renderer dropped blocker {i}"
+
+    # Next is truncated — and both renderers must truncate it to the SAME set, because Slack
+    # picks between them and a fallback that disagrees is a second, quieter briefing.
+    shown_text = {i for i in range(8) if f"action {i}" in body}
+    shown_blocks = {i for i in range(8) if f"action {i}" in blocks_text}
+    assert shown_text == shown_blocks, f"fallback and blocks disagree: {shown_text} vs {shown_blocks}"
+    assert len(shown_text) < 8, "Next must actually be capped, or this test proves nothing"
+
+
+def test_done_does_not_push_blockers_off_the_first_screen():
+    slack_briefing = load_module("slack_briefing_done", ROOT / "slack_briefing.py")
+
+    answer = "\n".join(
+        ["# proj", "- Blocked: the one blocker"]
+        + [f"- Done: finished {i}" for i in range(10)]
+    )
+    payload = slack_briefing.render_blocks_payload("T", "S", answer, [], "empty")
+    sections = [b for b in payload["blocks"] if b.get("type") == "section"]
+    section_text = "\n".join(b["text"]["text"] for b in sections)
+
+    # Done is confirmation, not work: it gets a count line at the bottom, never bullets.
+    for i in range(10):
+        assert f"finished {i}" not in section_text, "Done items must not occupy sections"
+    tail = "\n".join(
+        e["text"]
+        for b in payload["blocks"]
+        if b.get("type") == "context"
+        for e in b["elements"]
+    )
+    assert "완료 10" in tail
+    assert "the one blocker" in sections[0]["text"]["text"], "the blocker leads the message"
+
+
+def test_long_text_is_cut_at_a_boundary_and_says_so():
+    slack_briefing = load_module("slack_briefing_trim", ROOT / "slack_briefing.py")
+
+    # A bare slice cuts mid-sentence with no sign it happened, which is how a reader ends up
+    # trusting a sentence that was never finished.
+    text = "\n".join(f"line {i} with some words" for i in range(400))
+    out = slack_briefing._mrkdwn_text(text, 300)
+    assert len(out) <= 300
+    assert out.endswith("…"), "a truncated field must admit it"
+    assert not out.rstrip("…").endswith("wor"), "cut should land on a line boundary"
+
+    short = slack_briefing._mrkdwn_text("intact", 300)
+    assert short == "intact", "text that fits must not be touched"
 
 
 def test_slack_mrkdwn_handles_adversarial_inputs():
@@ -143,8 +217,8 @@ def test_slack_mrkdwn_dedups_duplicate_bullets_across_project_sections():
     # Blocked from the second kb-rag-bot section is preserved.
     assert body.count("토큰 문제") == 1
     # Summary counts reflect dedup.
-    assert "✅ 2" in body  # README 최신화 + PoC 일정 전환
-    assert "🚨 1" in body
+    assert "✅ 완료 2" in body  # README 최신화 + PoC 일정 전환
+    assert "🚨 막힘 1" in body
 
 
 def test_slack_mrkdwn_filters_placeholders_and_noise():
@@ -181,6 +255,9 @@ def test_slack_mrkdwn_caps_done_items():
 
 if __name__ == "__main__":
     test_slack_mrkdwn_uses_flat_readable_bullets()
+    test_blocked_is_never_truncated_and_both_renderers_agree()
+    test_done_does_not_push_blockers_off_the_first_screen()
+    test_long_text_is_cut_at_a_boundary_and_says_so()
     test_slack_mrkdwn_handles_adversarial_inputs()
     test_slack_mrkdwn_dedups_duplicate_bullets_across_project_sections()
     test_slack_mrkdwn_filters_placeholders_and_noise()
