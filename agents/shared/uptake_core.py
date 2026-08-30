@@ -20,6 +20,7 @@ import json
 import os
 import re
 import time
+from typing import NamedTuple
 
 def ledger_path():
     """Where the recall hook leaves its record — resolved per call, never cached at import.
@@ -197,10 +198,26 @@ def hit_was_used(hit, assistant_words_text, prompt_words):
     return False
 
 
+class Uptake(NamedTuple):
+    """One session's treatment and control counts.
+
+    Named rather than positional because the verdict reads specific pairs out of this and a
+    seven-wide tuple of ints is a transposition waiting to happen — the two control fields sit
+    next to each other and mean opposite denominators.
+    """
+
+    used_hits: int
+    total_hits: int
+    used_prompts: int
+    total_prompts: int
+    used_controls: int
+    total_controls: int
+    used_control_prompts: int
+
+
 def session_uptake(records, transcript_text):
     """Treatment and control counts for one session.
 
-    Returns (used_hits, total_hits, used_prompts, total_prompts, used_controls, total_controls).
     The control counts are scored identically over hits the search returned but the hook never
     injected: the agent could not have used them, so whatever rate they show is the chance rate
     that the treatment number has to beat. Reporting treatment alone is how a coincidence gets
@@ -208,10 +225,16 @@ def session_uptake(records, transcript_text):
 
     Two treatment rates, because they answer different questions: per-hit uptake says how much of
     what we push gets used, per-prompt uptake says how often an injection mattered at all.
+
+    The control side carries both denominators for the same reason. The pre-registered metric is
+    per-prompt treatment against per-prompt control (docs/PRD.md §2), and only the per-hit control
+    was ever counted -- so the contract named a quantity the instrument did not produce, and the
+    window would have closed with a comparison that could not be made. A per-hit control against a
+    per-prompt treatment is not a smaller version of the right answer; it is a different ratio.
     """
     assistant_blob = " ".join(_words(assistant_text(transcript_text)))
     used_hits = total_hits = used_prompts = 0
-    used_controls = total_controls = 0
+    used_controls = total_controls = used_control_prompts = 0
     records = records or []
     for record in records:
         prompt_words = record.get("prompt_words") or []
@@ -223,8 +246,21 @@ def session_uptake(records, transcript_text):
             used_prompts += 1
         controls = record.get("controls") or []
         total_controls += len(controls)
-        used_controls += sum(1 for c in controls if hit_was_used(c, assistant_blob, prompt_words))
-    return used_hits, total_hits, used_prompts, len(records), used_controls, total_controls
+        used_control_here = sum(
+            1 for c in controls if hit_was_used(c, assistant_blob, prompt_words)
+        )
+        used_controls += used_control_here
+        if used_control_here:
+            used_control_prompts += 1
+    return Uptake(
+        used_hits,
+        total_hits,
+        used_prompts,
+        len(records),
+        used_controls,
+        total_controls,
+        used_control_prompts,
+    )
 
 
 def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_DAYS):
