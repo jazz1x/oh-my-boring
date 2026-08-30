@@ -120,6 +120,86 @@ def test_wire_claude_code_adds_session_start():
         assert any("session-start-recall.py" in c for c in commands)
 
 
+def test_the_same_script_under_a_different_path_spelling_is_not_wired_twice():
+    """Recall ran twice on every prompt because two spellings looked like two hooks.
+
+    `/opt/homebrew/bin/python3 ~/oh-my-boring/hooks/recall.py` and
+    `python3 <repo>/hooks/recall.py` are the same file: one goes through a symlinked install
+    directory and names the interpreter by absolute path. The old substring comparison saw two
+    different strings and registered both, so every prompt wrote two identical ledger rows and
+    `total_prompts` -- a pre-registered sample floor -- counted double.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "oh-my-boring"
+        (repo / "hooks").mkdir(parents=True)
+        (repo / "hooks" / "recall.py").write_text("# recall\n", encoding="utf-8")
+        link = Path(d) / "linked"
+        link.symlink_to(repo)
+
+        settings = {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"/opt/homebrew/bin/python3 {link}/hooks/recall.py",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+        assert agent_wiring._already_wired(settings, f"python3 {repo}/hooks/recall.py")
+        # A different script of ours must still be seen as missing.
+        assert not agent_wiring._already_wired(settings, f"python3 {repo}/hooks/distill-session.py")
+
+
+def test_existing_duplicate_registrations_are_collapsed():
+    """Stopping new duplicates is not enough — the machines that already have them keep them."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "oh-my-boring"
+        (repo / "hooks").mkdir(parents=True)
+        (repo / "hooks" / "recall.py").write_text("# recall\n", encoding="utf-8")
+        link = Path(d) / "linked"
+        link.symlink_to(repo)
+        ours = f"python3 {repo}/hooks/recall.py"
+
+        # The foreign hook is registered twice on purpose. Somebody else's duplicate is their
+        # business; an installer that tidies the whole file would silently delete a hook it was
+        # never asked about, and this is the user's live settings.json.
+        settings = {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {"matcher": "", "hooks": [
+                        {"type": "command", "command": f"python3 {link}/hooks/recall.py"},
+                        {"type": "command", "command": "/other/unrelated-hook.sh"},
+                    ]},
+                    {"matcher": "", "hooks": [
+                        {"type": "command", "command": ours},
+                        {"type": "command", "command": "/other/unrelated-hook.sh"},
+                    ]},
+                ]
+            }
+        }
+
+        removed = agent_wiring._drop_duplicate_hooks(settings, (ours,))
+
+        assert removed == 1, removed
+        commands = [
+            h["command"]
+            for g in settings["hooks"]["UserPromptSubmit"]
+            for h in g["hooks"]
+        ]
+        assert commands.count(f"python3 {link}/hooks/recall.py") == 1, commands
+        assert ours not in commands, "the first registration wins; the later copy goes"
+        assert commands.count("/other/unrelated-hook.sh") == 2, (
+            "a hook we do not own keeps both registrations, duplicate or not"
+        )
+
+
 def test_wire_hermes_adds_hint_and_weekly():
     """Fresh Hermes wiring installs importable briefing scripts and config."""
     with tempfile.TemporaryDirectory() as d, mock.patch.object(
@@ -405,6 +485,8 @@ if __name__ == "__main__":
     test_settings_path_override()
     test_default_path_when_no_override()
     test_wire_claude_code_adds_session_start()
+    test_the_same_script_under_a_different_path_spelling_is_not_wired_twice()
+    test_existing_duplicate_registrations_are_collapsed()
     test_wire_hermes_adds_hint_and_weekly()
     test_install_hermes_briefing_backs_up_existing_scripts()
     test_wire_hermes_missing_slack_briefing_has_no_side_effects()

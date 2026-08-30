@@ -12,6 +12,7 @@ import datetime
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -107,7 +108,37 @@ def _backup(path: Path) -> Path:
     return bak
 
 
+_SCRIPT_TOKEN = re.compile(r"\S+\.(?:py|sh|mjs|js)\b")
+
+
+def _hook_scripts(command: str) -> set:
+    """The real files a hook command runs, resolved through `~` and symlinks.
+
+    Comparing whole command strings cannot see that
+    `/opt/homebrew/bin/python3 ~/oh-my-boring/hooks/recall.py` and
+    `python3 /Users/me/Development/mine/oh-my-boring/hooks/recall.py` are the same hook: one
+    spells the interpreter differently and reaches the file through a symlinked home directory.
+    Both were registered, so recall ran twice on every prompt and wrote two identical ledger
+    rows -- which does not move the rate (numerator and denominator both double) but doubles
+    `total_prompts`, and that is a pre-registered sample floor (docs/PRD.md §2). A floor met at
+    half the evidence it names is not the floor that was registered.
+    """
+    out = set()
+    for token in _SCRIPT_TOKEN.findall(command or ""):
+        try:
+            out.add(Path(token).expanduser().resolve())
+        except OSError:
+            continue
+    return out
+
+
 def _already_wired(settings: dict, command: str) -> bool:
+    """True when some registered hook already runs the same script this command runs.
+
+    Falls back to the old substring comparison for commands that name no script file, so hooks
+    that are pure shell keep the behaviour they had.
+    """
+    wanted = _hook_scripts(command)
     for group in settings.get("hooks", {}).values():
         if not isinstance(group, list):
             continue
@@ -115,9 +146,50 @@ def _already_wired(settings: dict, command: str) -> bool:
             if not isinstance(entry, dict):
                 continue
             for h in entry.get("hooks", []):
-                if isinstance(h, dict) and command in (h.get("command") or ""):
+                if not isinstance(h, dict):
+                    continue
+                existing = h.get("command") or ""
+                if wanted and (wanted & _hook_scripts(existing)):
+                    return True
+                if not wanted and command in existing:
                     return True
     return False
+
+
+def _drop_duplicate_hooks(settings: dict, commands) -> int:
+    """Keep one registration per script we own; report how many were removed.
+
+    The installer created these before it could see past path spellings, and they stay until
+    something takes them out -- an install that only stops adding duplicates leaves every
+    machine that already ran it injecting twice.
+    """
+    ours = set()
+    for command in commands:
+        ours |= _hook_scripts(command)
+    if not ours:
+        return 0
+    seen = set()
+    removed = 0
+    for groups in settings.get("hooks", {}).values():
+        if not isinstance(groups, list):
+            continue
+        for entry in groups:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                continue
+            kept = []
+            for h in entry["hooks"]:
+                scripts = _hook_scripts(h.get("command") or "") & ours if isinstance(h, dict) else set()
+                if scripts and scripts & seen:
+                    removed += 1
+                    continue
+                seen |= scripts
+                kept.append(h)
+            entry["hooks"] = kept
+    for key, groups in list(settings.get("hooks", {}).items()):
+        settings["hooks"][key] = [
+            g for g in groups if not (isinstance(g, dict) and g.get("hooks") == [])
+        ]
+    return removed
 
 
 def wire_claude_code(path: Path | None = None) -> dict:
@@ -133,6 +205,11 @@ def wire_claude_code(path: Path | None = None) -> dict:
     start_recall = f"python3 {BORING_HOME}/agents/claude-code/session-start-recall.py"
 
     changed = False
+    dropped = _drop_duplicate_hooks(settings, (distill, recall, start_recall))
+    if dropped:
+        print(f"[omb-wire] removed {dropped} duplicate hook registration(s)")
+        changed = True
+
     if not _already_wired(settings, distill):
         settings["hooks"].setdefault("SessionEnd", []).append(
             {
