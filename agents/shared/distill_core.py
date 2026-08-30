@@ -807,14 +807,7 @@ def log_uptake_event(session_id, repo, transcript_text, agent):
         records = uptake_core.load_records(session_id)
         if not records:
             return
-        (
-            used_hits,
-            total_hits,
-            used_prompts,
-            prompts,
-            used_controls,
-            total_controls,
-        ) = uptake_core.session_uptake(records, transcript_text)
+        uptake = uptake_core.session_uptake(records, transcript_text)
         event_log.try_append_event(
             "recall-uptake",
             "injection_uptake",
@@ -822,15 +815,20 @@ def log_uptake_event(session_id, repo, transcript_text, agent):
             session_id=session_id,
             repo=repo,
             agent=agent,
-            used_hits=used_hits,
-            total_hits=total_hits,
-            used_prompts=used_prompts,
-            total_prompts=prompts,
+            used_hits=uptake.used_hits,
+            total_hits=uptake.total_hits,
+            used_prompts=uptake.used_prompts,
+            total_prompts=uptake.total_prompts,
             # The chance rate, recorded beside the treatment rate so no reader can quote one
             # without the other. A verdict from treatment alone cannot tell an effect from a
             # coincidence on the same topic.
-            used_controls=used_controls,
-            total_controls=total_controls,
+            used_controls=uptake.used_controls,
+            total_controls=uptake.total_controls,
+            # The pre-registered metric is per-prompt on both sides (docs/PRD.md §2). Only the
+            # per-hit control was ever emitted, so the recorded series could not answer the
+            # question the contract asks. Same denominator as the treatment rate, which is what
+            # makes the two comparable as a difference in percentage points.
+            used_control_prompts=uptake.used_control_prompts,
         )
         uptake_core.prune_session(session_id)
     except Exception as e:  # noqa: BLE001 — a measurement must never cost a session its note
