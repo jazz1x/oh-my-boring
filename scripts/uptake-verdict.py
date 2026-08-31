@@ -25,7 +25,7 @@ import urllib.request
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents", "shared"))
 
 import verdict_core  # noqa: E402
-from verdict_core import collect  # noqa: E402
+from verdict_core import collect, unreported  # noqa: E402
 
 DEFAULT_URL = os.environ.get("BORING_URL") or "http://127.0.0.1:7700"
 
@@ -73,6 +73,13 @@ def main(argv=None):
             return 1
         print("[uptake-verdict] 집계할 injection_uptake 이벤트가 없다 — 계측 조사 대상(PRD §2)")
         return 1
+
+    lost_sessions, lost_rows = unreported(rows)
+    if lost_sessions:
+        print(
+            f"[uptake-verdict] 측정 안 된 주입: 세션 {lost_sessions} · 프롬프트 {lost_rows}"
+            " — 종료되지 않고 사라진 세션. 판정에 합산하지 않는다(결과가 없으므로)"
+        )
 
     for who, c in sorted(per_agent.items()):
         v = verdict_core.verdict(

@@ -270,13 +270,20 @@ def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_D
     Never raises. Rows older than `max_age_days` go regardless of session: without that the
     ledger grows without bound, because the only thing that prunes a session is the SessionEnd
     that also measures it — and a killed session has neither.
+
+    Returns `(ok, aged_sessions, aged_rows)`. Those two counts are the only trace a killed
+    session ever leaves: its injections happened, were never scored, and are about to be
+    deleted. Without them the verdict can report a rate but not what share of the channel it
+    saw, and "2.3% of what we measured" reads exactly like "2.3% of what we sent". The caller
+    records them; deleting the evidence of a blind spot silently is how a biased sample gets
+    quoted as a population.
     """
     target = path or ledger_path()
     try:
         with open(target, encoding="utf-8") as handle:
             lines = handle.readlines()
     except OSError:
-        return False
+        return False, 0, 0
     cutoff = (now if now is not None else time.time()) - max_age_days * 86400
     # Age out whole sessions by their NEWEST row, never row by row. A session resumed across days
     # is still live, and dropping its early rows would leave it measured against a denominator
@@ -296,6 +303,8 @@ def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_D
         if isinstance(ts, (int, float)):
             newest[sid] = max(newest.get(sid, ts), ts)
     kept = []
+    aged_sessions = set()
+    aged_rows = 0
     for line, sid, _ts in parsed:
         if sid is None:
             kept.append(line)
@@ -304,14 +313,17 @@ def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_D
             continue
         last_seen = newest.get(sid)
         if isinstance(last_seen, (int, float)) and last_seen < cutoff:
+            # This session never ended, so it was never scored. Count it before it is gone.
+            aged_sessions.add(sid)
+            aged_rows += 1
             continue
         kept.append(line)
     try:
         with open(target, "w", encoding="utf-8") as handle:
             handle.writelines(kept)
-        return True
+        return True, len(aged_sessions), aged_rows
     except OSError:
-        return False
+        return False, 0, 0
 
 
 #: Two ledger rows for one prompt this far apart or closer are one UserPromptSubmit that ran the
