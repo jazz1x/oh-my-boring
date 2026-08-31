@@ -512,6 +512,9 @@ case "$(cat "$TMP/stale-gates.out")" in
     ;;
 esac
 
+# Assertions below grep the severity marker (✓ / ✗), not just the wording. `bad` prints ✗ and
+# `warn` prints ⚠ with the same text, so a check quietly downgraded to a warning keeps every
+# text-only assertion green — a mutant that survived here four times before this was written.
 # (d5b) The scripts hermes runs are a separate artifact from the checkout. On 2026-08-26 the
 # installed copies were twelve days behind main, five merged PRs had never reached the 08:01
 # cron, and every other doctor check was green — so "merged" has to stop reading as "delivered".
@@ -521,7 +524,7 @@ esac
       echo "FAIL: installed scripts identical to the checkout must pass" >&2
       exit 1
   fi
-  grep -q "hermes briefing scripts match the checkout" "$TMP/hermes-match.out" || {
+  grep -q "✓ hermes briefing scripts match the checkout" "$TMP/hermes-match.out" || {
       cat "$TMP/hermes-match.out"
       echo "FAIL: the healthy case must say the scripts match" >&2
       exit 1
@@ -533,7 +536,7 @@ esac
       echo "FAIL: an installed script older than the checkout must fail strict" >&2
       exit 1
   fi
-  grep -q "DEPLOY DRIFT" "$TMP/hermes-drift.out" || {
+  grep -q "✗ DEPLOY DRIFT" "$TMP/hermes-drift.out" || {
       cat "$TMP/hermes-drift.out"
       echo "FAIL: drift must be named, not just counted" >&2
       exit 1
@@ -545,7 +548,7 @@ esac
       echo "FAIL: a script hermes imports but never received must fail strict" >&2
       exit 1
   fi
-  grep -q "never received" "$TMP/hermes-missing.out" || {
+  grep -q "✗ hermes never received" "$TMP/hermes-missing.out" || {
       cat "$TMP/hermes-missing.out"
       echo "FAIL: a missing script must be reported as missing" >&2
       exit 1
@@ -574,7 +577,7 @@ esac
       echo "FAIL: a ledger with no double-recorded prompts must pass" >&2
       exit 1
   fi
-  grep -q "no double-recorded prompts" "$TMP/ledger-clean.out" || {
+  grep -q "✓ injection ledger has no double-recorded prompts" "$TMP/ledger-clean.out" || {
       cat "$TMP/ledger-clean.out"
       echo "FAIL: the healthy case must say the ledger is clean" >&2
       exit 1
