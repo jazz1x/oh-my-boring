@@ -24,6 +24,7 @@ if _SHARED_DIR.is_dir() and str(_SHARED_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_DIR))
 
 import label_core  # noqa: E402
+import verdict_core  # noqa: E402
 
 
 EMPTY_VALUES = {
@@ -204,6 +205,29 @@ def audit_notice(label_stats) -> str:
     return f"📋 판정 대기 — 사람 라벨 {owed}건 더 필요 · `label-recall.py --audit`"
 
 
+def window_notice(uptake_stats) -> str:
+    """How far the injection-channel sample has come, or "" when there is nothing to say.
+
+    The verdict runs on counts that only move when sessions *end*, and sessions here run for
+    days — so the floor can sit still for a week while the ledger looks busy, and nobody would
+    know until the window closed on a refusal. Reported daily, a floor that stops tracking is
+    visible while there is still time to do something about it.
+
+    Silent once both floors are met: at that point the number to look at is the verdict, not the
+    sample, and `scripts/uptake-verdict.py` prints that.
+    """
+    if not uptake_stats:
+        return ""
+    sessions = int(uptake_stats.get("sessions") or 0)
+    prompts = int(uptake_stats.get("total_prompts") or 0)
+    if sessions >= verdict_core.MIN_SESSIONS and prompts >= verdict_core.MIN_INJECTED_PROMPTS:
+        return ""
+    return (
+        f"📐 주입 채널 판정 표본 — 세션 {sessions}/{verdict_core.MIN_SESSIONS} · "
+        f"프롬프트 {prompts}/{verdict_core.MIN_INJECTED_PROMPTS} · `uptake-verdict.py`"
+    )
+
+
 def render_message_mrkdwn(
     title: str,
     stamp: str,
@@ -211,14 +235,15 @@ def render_message_mrkdwn(
     sources: list[object],
     empty_message: str,
     label_stats=None,
+    uptake_stats=None,
 ) -> str:
     body = render_body_mrkdwn(answer)
     if not body:
         body = empty_message
     out = f"{title}\n`{stamp}`\n\n{body}"
-    notice = audit_notice(label_stats)
-    if notice:
-        out += f"\n\n{notice}"
+    for notice in (window_notice(uptake_stats), audit_notice(label_stats)):
+        if notice:
+            out += f"\n\n{notice}"
     source_text = render_sources(sources)
     if source_text:
         out += f"\n\n_{source_text}_"
@@ -525,6 +550,7 @@ def render_blocks_payload(
     sources: list[object],
     empty_message: str,
     label_stats=None,
+    uptake_stats=None,
 ) -> dict[str, Any]:
     """Block Kit version of the priority-first briefing.
 
@@ -532,7 +558,9 @@ def render_blocks_payload(
     group is a clear visual chunk on mobile.
     """
     doc = parse_brief(answer)
-    fallback = render_message_mrkdwn(title, stamp, answer, sources, empty_message, label_stats)
+    fallback = render_message_mrkdwn(
+        title, stamp, answer, sources, empty_message, label_stats, uptake_stats
+    )
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
@@ -611,10 +639,10 @@ def render_blocks_payload(
         blocks.insert(2, _context(" · ".join(counts)))
 
     source_text = render_sources(sources)
-    notice = audit_notice(label_stats)
-    if notice:
-        blocks.append({"type": "divider"})
-        blocks.append(_context(notice))
+    for notice in (window_notice(uptake_stats), audit_notice(label_stats)):
+        if notice:
+            blocks.append({"type": "divider"})
+            blocks.append(_context(notice))
     if source_text:
         blocks.append({"type": "divider"})
         blocks.append(_context(source_text))
@@ -769,10 +797,13 @@ def maybe_print_blocks_json(
     sources: list[object],
     empty_message: str,
     label_stats=None,
+    uptake_stats=None,
 ) -> bool:
     if os.environ.get("BORING_BRIEFING_FORMAT", "").strip().lower() != "blocks":
         return False
-    payload = render_blocks_payload(title, stamp, answer, sources, empty_message, label_stats)
+    payload = render_blocks_payload(
+        title, stamp, answer, sources, empty_message, label_stats, uptake_stats
+    )
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return True
 
