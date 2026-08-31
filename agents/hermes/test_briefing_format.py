@@ -379,6 +379,44 @@ def test_the_engines_default_claim_kind_is_a_category_not_a_leftover():
     assert "재배포 없이는" not in action_zone, body
 
 
+def test_the_window_sample_is_named_in_both_renderings_and_falls_silent_when_met():
+    slack_briefing = load_module("slack_briefing_window", ROOT / "slack_briefing.py")
+    V = slack_briefing.verdict_core
+
+    # The verdict's counts only move when a session *ends*, and sessions here run for days. The
+    # ledger can look busy for a week while the floor sits still, and without this line nobody
+    # finds out until the window closes on a refusal.
+    answer = "# p\n- Next: 뭔가 한다\n"
+    behind = {"sessions": 3, "total_prompts": 120}
+
+    body = slack_briefing.render_message_mrkdwn("*T*", "S", answer, [], "empty", None, behind)
+    payload = slack_briefing.render_blocks_payload("T", "S", answer, [], "empty", None, behind)
+
+    def all_text(blocks):
+        out = []
+        for b in blocks:
+            if isinstance(b.get("text"), dict):
+                out.append(b["text"].get("text", ""))
+            for el in b.get("elements") or []:
+                if isinstance(el, dict) and el.get("text"):
+                    out.append(el["text"])
+        return "\n".join(out)
+
+    for where, text in (("fallback", body), ("blocks", all_text(payload["blocks"]))):
+        assert f"3/{V.MIN_SESSIONS}" in text, (where, text)
+        assert f"120/{V.MIN_INJECTED_PROMPTS}" in text, (where, text)
+
+    met = {"sessions": V.MIN_SESSIONS, "total_prompts": V.MIN_INJECTED_PROMPTS}
+    assert slack_briefing.window_notice(met) == "", "a met floor stops reporting the sample"
+
+    # One floor met is not both — the line has to keep reporting until the verdict is computable.
+    assert slack_briefing.window_notice(
+        {"sessions": V.MIN_SESSIONS, "total_prompts": 1}
+    ) != ""
+
+    assert slack_briefing.window_notice(None) == "", "an unreachable engine is not a zero sample"
+
+
 def test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met():
     slack_briefing = load_module("slack_briefing_audit", ROOT / "slack_briefing.py")
 
@@ -541,6 +579,7 @@ if __name__ == "__main__":
     test_done_is_counted_in_the_text_renderer_too()
     test_singular_labels_are_not_dumped_into_the_unlabelled_bucket()
     test_the_engines_default_claim_kind_is_a_category_not_a_leftover()
+    test_the_window_sample_is_named_in_both_renderings_and_falls_silent_when_met()
     test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met()
     test_the_text_fallback_carries_the_shortlist_too()
     test_zones_replace_status_headings_but_keep_the_status()

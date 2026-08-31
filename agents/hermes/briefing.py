@@ -18,6 +18,10 @@ from slack_briefing import (
     render_message_mrkdwn,
 )
 
+# After slack_briefing on purpose: in ~/.hermes/scripts every module sits flat and the order is
+# irrelevant, but running from the repo it is slack_briefing that puts agents/shared on the path.
+import verdict_core  # noqa: E402
+
 # BORING_URL is the canonical env var used throughout oh-my-boring.
 # DRUDGE_URL is kept as a fallback for legacy scripts only.
 HERMES_URL = os.environ.get("BORING_URL") or os.environ.get(
@@ -51,6 +55,28 @@ def slack_mrkdwn(answer: str) -> str:
     return render_body_mrkdwn(answer)
 
 
+def uptake_stats() -> dict | None:
+    """Sample size for the injection-channel window, or None when the engine will not say.
+
+    Folded here rather than in the renderer so the renderer stays pure. None omits the line,
+    which is not the same as reporting a sample of zero — an unreachable engine says nothing
+    about how far the window has come.
+    """
+    try:
+        with urllib.request.urlopen(f"{HERMES_URL}/events?limit=5000", timeout=20) as resp:
+            rows = json.loads(resp.read().decode("utf-8")).get("entries") or []
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return None
+    per_agent, _skipped = verdict_core.collect(rows)
+    if not per_agent:
+        return {"sessions": 0, "total_prompts": 0}
+    totals = {"sessions": 0, "total_prompts": 0}
+    for counts in per_agent.values():
+        totals["sessions"] += counts["sessions"]
+        totals["total_prompts"] += counts["total_prompts"]
+    return totals
+
+
 def main() -> None:
     req = urllib.request.Request(
         f"{HERMES_URL}/brief",
@@ -74,9 +100,12 @@ def main() -> None:
         print(header(EMPTY_MESSAGE))
         return
     stats = label_stats()
-    if maybe_print_blocks_json(TITLE, DATE, answer, sources, EMPTY_MESSAGE, stats):
+    window = uptake_stats()
+    if maybe_print_blocks_json(TITLE, DATE, answer, sources, EMPTY_MESSAGE, stats, window):
         return
-    print(render_message_mrkdwn(f"*{TITLE}*", DATE, answer, sources, EMPTY_MESSAGE, stats))
+    print(
+        render_message_mrkdwn(f"*{TITLE}*", DATE, answer, sources, EMPTY_MESSAGE, stats, window)
+    )
 
 
 if __name__ == "__main__":
