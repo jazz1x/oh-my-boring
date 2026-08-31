@@ -16,6 +16,7 @@ Both rates are per-prompt over the same denominator. A per-hit control against a
 treatment is a different ratio, not a rougher one — see `uptake_core.session_uptake`.
 """
 
+from collections import defaultdict
 from typing import NamedTuple
 
 #: Sessions the window needs before any number is reported. Below this the rates are noise from
@@ -114,3 +115,50 @@ def format_verdict(v):
         f"격차 {v.gap_pp:.2f}pp · 비 {ratio}",
         f"판정: {v.label} — {v.reason}",
     ]
+
+
+#: Counters an `injection_uptake` event carries that the verdict adds up.
+COUNTERS = ("used_prompts", "total_prompts", "used_control_prompts")
+
+def field(row, key):
+    """Counters live at the top level or inside `attributes` depending on the writer."""
+    value = row.get(key)
+    if value is None:
+        value = (row.get("attributes") or {}).get(key)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def collect(rows, since=None, agent=None):
+    """Fold uptake events into per-agent totals, skipping rows the instrument predates.
+
+    A session logged before `used_control_prompts` existed reports 0 for it, which would read as
+    a zero chance rate rather than as a missing measurement — so those rows are dropped, and the
+    count of what was dropped is returned rather than hidden.
+    """
+    per_agent = defaultdict(lambda: defaultdict(int))
+    skipped_old = 0
+    for row in rows:
+        if row.get("event") != "injection_uptake":
+            continue
+        observed = row.get("observed_at") or ""
+        if since and observed[:10] < since:
+            continue
+        who = row.get("agent") or (row.get("attributes") or {}).get("agent") or "unknown"
+        if agent and who != agent:
+            continue
+        has_control_prompts = row.get("used_control_prompts") is not None or (
+            "used_control_prompts" in (row.get("attributes") or {})
+        )
+        if not has_control_prompts:
+            skipped_old += 1
+            continue
+        bucket = per_agent[who]
+        bucket["sessions"] += 1
+        for key in COUNTERS:
+            bucket[key] += field(row, key)
+    return per_agent, skipped_old
+
+

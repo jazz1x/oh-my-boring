@@ -21,14 +21,13 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents", "shared"))
 
 import verdict_core  # noqa: E402
+from verdict_core import collect  # noqa: E402
 
 DEFAULT_URL = os.environ.get("BORING_URL") or "http://127.0.0.1:7700"
-COUNTERS = ("used_prompts", "total_prompts", "used_control_prompts")
 
 
 def fetch_events(base_url, limit):
@@ -39,48 +38,6 @@ def fetch_events(base_url, limit):
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         print(f"[uptake-verdict] engine unreachable at {url}: {exc}", file=sys.stderr)
         return None
-
-
-def field(row, key):
-    """Counters live at the top level or inside `attributes` depending on the writer."""
-    value = row.get(key)
-    if value is None:
-        value = (row.get("attributes") or {}).get(key)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def collect(rows, since=None, agent=None):
-    """Fold uptake events into per-agent totals, skipping rows the instrument predates.
-
-    A session logged before `used_control_prompts` existed reports 0 for it, which would read as
-    a zero chance rate rather than as a missing measurement — so those rows are dropped, and the
-    count of what was dropped is returned rather than hidden.
-    """
-    per_agent = defaultdict(lambda: defaultdict(int))
-    skipped_old = 0
-    for row in rows:
-        if row.get("event") != "injection_uptake":
-            continue
-        observed = row.get("observed_at") or ""
-        if since and observed[:10] < since:
-            continue
-        who = row.get("agent") or (row.get("attributes") or {}).get("agent") or "unknown"
-        if agent and who != agent:
-            continue
-        has_control_prompts = row.get("used_control_prompts") is not None or (
-            "used_control_prompts" in (row.get("attributes") or {})
-        )
-        if not has_control_prompts:
-            skipped_old += 1
-            continue
-        bucket = per_agent[who]
-        bucket["sessions"] += 1
-        for key in COUNTERS:
-            bucket[key] += field(row, key)
-    return per_agent, skipped_old
 
 
 def main(argv=None):
@@ -102,6 +59,18 @@ def main(argv=None):
             " (0 으로 세면 우연율이 0 인 것처럼 읽힌다)"
         )
     if not per_agent:
+        # §2 turns "0 events" into an instrumentation investigation, but the clause it registers
+        # is "세션 종료가 있는데 ... 0건" — sessions ended and nothing was recorded. Rows that were
+        # skipped for predating `used_control_prompts` are proof the instrument fires; what is
+        # young is the counter, not the measurement. Calling that a fault sends someone to debug
+        # a hook that works, and worse, teaches them to distrust the clause when it is real.
+        if skipped_old:
+            print(
+                f"[uptake-verdict] 아직 판정할 이벤트가 없다 — 계측은 돌고 있고"
+                f"(옛 형식 {skipped_old}건) per-prompt 대조 카운터가 그보다 어리다."
+                " 계측 결함이 아니라 표본이 쌓이는 중"
+            )
+            return 1
         print("[uptake-verdict] 집계할 injection_uptake 이벤트가 없다 — 계측 조사 대상(PRD §2)")
         return 1
 
