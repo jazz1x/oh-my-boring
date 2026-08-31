@@ -706,6 +706,43 @@ def render_weekly_blocks(title, stamp, projects, intervention, board, trend, sou
     return blocks[:50]
 
 
+def render_weekly_mrkdwn(title, stamp, intervention, board, trend, sources) -> str:
+    """The weekly as text, carrying what the blocks carry.
+
+    Without this the persistence weekly could only be emitted as a Block Kit payload, so it sat
+    behind `BORING_BRIEFING_FORMAT=blocks` — unset in production, because cron delivery is
+    text-only (`_standalone_send` posts `text`). The feature was merged, tested, and structurally
+    unreachable: every Monday sent a re-synthesised `/weekly` instead, which is the one thing the
+    persistence weekly exists to replace.
+
+    Same content as `render_weekly_blocks`, including the caveat. A text rendering that quietly
+    drops "일자별 관측치이며 마감률이 아니다" would let a reader add ✅ 10→10 into "twenty done".
+    """
+    out = [f"*{title}*", f"`{stamp}`"]
+    if intervention:
+        out.append("")
+        out.append("*개입 필요 — 상태가 주 내내 지속*")
+        for week, label, count, span in intervention:
+            head = f"• {week.name} — {count}/{span}일 {SECTION_EMOJI.get(label, '•')}"
+            out.append(f"{head}\n   {week.latest_line}" if week.latest_line else head)
+    if board:
+        out.append("")
+        out.append("*주간 점유*")
+        out.append(" · ".join(f"{w.name} {len(w.days)}/{span}일" for w, span in board))
+    if trend:
+        parts = [
+            f"{SECTION_EMOJI.get(label, '•')} {SECTION_TITLE.get(label, label)} {first}→{last}"
+            for label, (first, last) in trend.items()
+        ]
+        out.append("")
+        out.append("_" + " · ".join(parts) + " — 일자별 관측치이며 마감률이 아니다_")
+    source_text = render_sources(sources)
+    if source_text:
+        out.append("")
+        out.append(f"_{source_text}_")
+    return "\n".join(out)
+
+
 def render_sources(sources: list[object]) -> str:
     """One line naming the corpus, not five titles.
 

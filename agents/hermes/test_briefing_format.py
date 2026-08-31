@@ -214,6 +214,36 @@ def test_weekly_quotes_the_latest_daily_rather_than_resummarising():
     assert projects["p"].latest_line == "today's exact wording"
 
 
+def test_the_weekly_text_carries_what_the_blocks_carry():
+    """The persistence weekly could only be emitted as JSON, so it never shipped.
+
+    Cron delivery is text-only, and the trend path sat behind `BORING_BRIEFING_FORMAT=blocks`
+    which production does not set — so every Monday sent a re-synthesised `/weekly` instead,
+    the exact thing this weekly exists to replace.
+    """
+    slack_briefing = load_module("slack_briefing_wtext", ROOT / "slack_briefing.py")
+    weekly_trend = load_module("weekly_trend_wtext", ROOT / "weekly_trend.py")
+
+    week = weekly_trend.ProjectWeek(name="kb-rag-bot")
+    week.days = {"2026-08-25", "2026-08-26", "2026-08-27"}
+    week.latest_line = "컨플루언스 상태 확인 불가"
+    intervention = [(week, "Stalled", 3, 7)]
+    board = [(week, 7)]
+    trend = {"Done": (8, 5)}
+
+    text = slack_briefing.render_weekly_mrkdwn("주간", "W36", intervention, board, trend, [])
+
+    assert "kb-rag-bot — 3/7일" in text, text
+    assert "컨플루언스 상태 확인 불가" in text, "the quoted line is the weekly's only item detail"
+    # The scoreboard writes "name N/M일"; the intervention line writes "name — N/M일". Asserting
+    # the bare count matches either, so removing the scoreboard entirely still passed.
+    assert "주간 점유" in text and "kb-rag-bot 3/7일" in text, text
+    assert "8→5" in text, text
+    # Dropping the caveat lets a reader add ✅ 10→10 into "twenty done"; every day is an
+    # independent re-synthesis, so the two numbers are observations, not a rate.
+    assert "일자별 관측치이며 마감률이 아니다" in text, text
+
+
 def test_weekly_blocks_carry_the_not_a_closure_rate_caveat():
     slack_briefing = load_module("slack_briefing_caveat", ROOT / "slack_briefing.py")
     trend = load_module("weekly_trend_caveat", ROOT / "weekly_trend.py")
@@ -572,6 +602,7 @@ if __name__ == "__main__":
     test_weekly_reports_persistence_not_closure()
     test_weekly_never_sums_label_counts_across_days()
     test_weekly_quotes_the_latest_daily_rather_than_resummarising()
+    test_the_weekly_text_carries_what_the_blocks_carry()
     test_weekly_blocks_carry_the_not_a_closure_rate_caveat()
     test_slack_mrkdwn_handles_adversarial_inputs()
     test_slack_mrkdwn_dedups_duplicate_bullets_across_project_sections()
