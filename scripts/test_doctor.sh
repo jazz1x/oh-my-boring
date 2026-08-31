@@ -71,6 +71,20 @@ SH
     cat >"$fakebin/python3" <<'SH'
 #!/bin/sh
 case "${1:-}" in
+  */uptake_core.py)
+    # doctor asks the ledger whether one prompt was recorded twice — a hook that fires twice
+    # leaves the uptake rate unchanged and doubles a pre-registered sample floor.
+    if [ "${2:-}" = --duplicate-injections ]; then
+        if [ "${DOCTOR_LEDGER_DUPES:-0}" = 1 ]; then
+            echo "injection_ledger duplicate_rows=42 total_rows=100 sessions=3"
+            exit 1
+        fi
+        echo "injection_ledger duplicate_rows=0 total_rows=100 sessions=0"
+        exit 0
+    fi
+    echo "fake python3: unmodelled uptake_core call: $*" >&2
+    exit 7
+    ;;
   */agent_wiring.py)
     # doctor asks the installer which files it writes, rather than keeping its own list.
     # Invocation is: agent_wiring.py --list-hermes-scripts --boring-home <BORING_HOME>
@@ -121,6 +135,9 @@ make_case() {
     touch "$boring/agents/codex/collect-sessions.py"
     touch "$boring/agents/shared/event_log.py"
     touch "$boring/agents/shared/agent_wiring.py"
+    # Without this file doctor skips the ledger probe entirely, and a check no fixture can reach
+    # is a check that can be deleted without a single test going red.
+    touch "$boring/agents/shared/uptake_core.py"
 
     # The scripts hermes runs are a separate artifact from the checkout: merging a briefing
     # change does not copy it to ~/.hermes/scripts. Default the fixture to the deployed state
@@ -547,5 +564,35 @@ esac
       echo "FAIL: no hermes install means no hermes verdict" >&2
       exit 1
   fi ) || exit 1
+
+# (d5c) One prompt recorded twice means the recall hook fired twice. The uptake rate cannot see
+# it — both halves of the fraction double — so the ledger is the only place it shows, and it
+# quietly halves the evidence behind a pre-registered sample floor (docs/PRD.md §2).
+( make_case "$TMP/ledger-clean" yes
+  if ! run_strict "$TMP/ledger-clean" "$TMP/ledger-clean.out"; then
+      cat "$TMP/ledger-clean.out"
+      echo "FAIL: a ledger with no double-recorded prompts must pass" >&2
+      exit 1
+  fi
+  grep -q "no double-recorded prompts" "$TMP/ledger-clean.out" || {
+      cat "$TMP/ledger-clean.out"
+      echo "FAIL: the healthy case must say the ledger is clean" >&2
+      exit 1
+  } ) || exit 1
+
+( make_case "$TMP/ledger-dupes" yes
+  if DOCTOR_LEDGER_DUPES=1 run_strict "$TMP/ledger-dupes" "$TMP/ledger-dupes.out"; then
+      cat "$TMP/ledger-dupes.out"
+      echo "FAIL: double-recorded injections must fail strict" >&2
+      exit 1
+  fi
+  # Grep the failure marker, not just the words. `bad` prints ✗ and `warn` prints ⚠, and a
+  # downgrade to warn while the failure flag stays set reads as green in non-strict mode while
+  # every strict assertion still passes — the mutant that survives when only the text is checked.
+  grep -q "✗ DOUBLE-RECORDED INJECTIONS" "$TMP/ledger-dupes.out" || {
+      cat "$TMP/ledger-dupes.out"
+      echo "FAIL: the duplicate must be reported as a failure, not a warning" >&2
+      exit 1
+  } ) || exit 1
 
 echo "doctor strict gate tests passed"

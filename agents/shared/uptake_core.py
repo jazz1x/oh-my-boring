@@ -19,6 +19,7 @@ No I/O beyond a JSONL append the caller hands a path to; the hooks own the rest.
 import json
 import os
 import re
+import sys
 import time
 from typing import NamedTuple
 
@@ -311,3 +312,70 @@ def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_D
         return True
     except OSError:
         return False
+
+
+#: Two ledger rows for one prompt this far apart or closer are one UserPromptSubmit that ran the
+#: recall hook twice, not a person asking the same thing again. The window is what the data
+#: chose, not a number picked to be safe: when the hook was registered under two path spellings
+#: (#245) all 455 duplicate pairs landed within 0.14s, and there was not a single pair anywhere
+#: between that and the next observation. A real repeat cannot arrive inside it.
+DUPLICATE_WINDOW_S = 1.0
+
+
+def duplicate_injections(path=None, window=DUPLICATE_WINDOW_S):
+    """Rows that are a second recording of one prompt: (extra_rows, total_rows, sessions).
+
+    Double-firing does not move the uptake rate — numerator and denominator both double — so
+    nothing in the numbers looks wrong. What it moves is `total_prompts`, and that is a
+    pre-registered sample floor (docs/PRD.md §2). A floor met at half the evidence it names is
+    not the floor that was registered, and the only trace is here.
+    """
+    target = path or ledger_path()
+    seen = {}
+    extra = total = 0
+    sessions = set()
+    try:
+        with open(target, encoding="utf-8") as handle:
+            rows = []
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return 0, 0, 0
+    for row in sorted(rows, key=lambda r: (r.get("session_id") or "", r.get("ts") or 0)):
+        total += 1
+        key = (row.get("session_id"), tuple(row.get("prompt_words") or []))
+        ts = row.get("ts") or 0
+        previous = seen.get(key)
+        if previous is not None and (ts - previous) <= window:
+            extra += 1
+            sessions.add(row.get("session_id"))
+            continue
+        seen[key] = ts
+    return extra, total, len(sessions)
+
+
+def _main(argv):
+    if "--duplicate-injections" not in argv:
+        print("usage: uptake_core.py --duplicate-injections [ledger-path]", file=sys.stderr)
+        return 2
+    rest = [a for a in argv if not a.startswith("--")]
+    extra, total, sessions = duplicate_injections(rest[0] if rest else None)
+    print(f"injection_ledger duplicate_rows={extra} total_rows={total} sessions={sessions}")
+    if extra:
+        print(
+            "  a prompt recorded twice means the recall hook fired twice; the uptake rate looks"
+            " unchanged while the sample floor counts double",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

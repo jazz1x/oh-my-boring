@@ -284,6 +284,47 @@ def test_snippet_text_is_not_stored_in_the_ledger():
     assert "wiki-0007.md" in blob
 
 
+def test_a_prompt_recorded_twice_in_the_same_instant_is_one_prompt():
+    """The shape #245 left behind: one UserPromptSubmit, two hook registrations, two rows.
+
+    Nothing in the rate looks wrong when this happens — both halves of the fraction double — so
+    the only place it can be caught is here, before it inflates a pre-registered sample floor.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = str(Path(d) / "injections.jsonl")
+        first = uptake_core.injection_record("s1", "why did it die", [_hit()], 3)
+        twin = dict(first, ts=first["ts"] + 0.0001)     # the second hook, same instant
+        later = dict(first, ts=first["ts"] + 900)       # the person genuinely asking again
+        other = uptake_core.injection_record("s1", "unrelated", [_hit()], 3)
+        Path(path).write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in (first, twin, later, other))
+            + "\n",
+            encoding="utf-8",
+        )
+
+        extra, total, sessions = uptake_core.duplicate_injections(path)
+
+        assert (extra, total, sessions) == (1, 4, 1), (extra, total, sessions)
+
+
+def test_a_repeat_outside_the_window_is_a_real_repeat():
+    """Fifteen minutes later is a person, not a second hook — counting it would erase evidence."""
+    with tempfile.TemporaryDirectory() as d:
+        path = str(Path(d) / "injections.jsonl")
+        first = uptake_core.injection_record("s1", "same question", [_hit()], 3)
+        later = dict(first, ts=first["ts"] + 900)
+        Path(path).write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in (first, later)) + "\n",
+            encoding="utf-8",
+        )
+
+        assert uptake_core.duplicate_injections(path)[0] == 0
+
+
+def test_a_missing_ledger_is_not_a_duplicate_report():
+    assert uptake_core.duplicate_injections("/nonexistent/injections.jsonl") == (0, 0, 0)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
