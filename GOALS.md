@@ -1,4 +1,4 @@
-<!-- derived-from: PRD v1 -->
+<!-- derived-from: PRD v2 -->
 # GOALS
 
 Derived from `docs/PRD.md`. The PRD says what the product is; this file says which of its
@@ -13,7 +13,7 @@ The write door stays gated, deterministic, and observable; the read door stays f
 
 ## Current Slice
 
-**Injection-channel demand verdict** (2026-08-26 → 09-09). Derived from **[R1]** and the PRD's
+**Injection-channel demand verdict** (2026-08-31 → 09-14 — the first window was reset for an instrumentation fault, PRD §8 D1; no threshold changed). Derived from **[R1]** and the PRD's
 §2 contract. The instrumentation shipped; this slice spends the window collecting, and ships no
 change to the channel being measured.
 
@@ -29,7 +29,7 @@ Out of scope for this slice — and why:
 - **Any change to injection frequency, budget, position, or ranking.** The window's sample is
   defined on the current channel; changing it mid-window voids the contract **[R1]**.
 - **Distillation changes**, including R3's derived work. They change the notes the channel will
-  inject, so they are not orthogonal to the measurement. Starts after 09-09 **[R3]**.
+  inject, so they are not orthogonal to the measurement. Starts after 09-14 **[R3]**.
 - Bulk vault mutation, renumbering, DB reset **[R4]**.
 
 Work that is orthogonal to the channel — gate hardening, schema parity, doc corrections — stays
