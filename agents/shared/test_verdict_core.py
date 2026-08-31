@@ -144,6 +144,30 @@ def test_counters_are_read_from_attributes_when_that_is_where_they_are():
     assert per_agent["claude-code"]["used_prompts"] == 5
 
 
+def test_unmeasured_injections_are_reported_but_never_folded_into_the_rate():
+    """A rate says what share of what it saw was used — not what share it saw.
+
+    Sessions killed rather than exited never fire SessionEnd, so they are never scored. Folding
+    them in either direction invents an outcome they do not have; leaving them out silently lets
+    a biased sample be quoted as the population.
+    """
+    rows = [
+        {"event": "injection_unreported", "aged_sessions": 2, "aged_rows": 40},
+        {"event": "injection_unreported", "attributes": {"aged_sessions": 1, "aged_rows": 5}},
+        # Carries the same keys under a different event name. Without the name filter this would
+        # be summed in — and the coverage figure the verdict prints beside itself would count
+        # something that is not an unmeasured injection at all.
+        {"event": "ledger_maintenance", "aged_sessions": 99, "aged_rows": 999},
+        _event(control=1, used_prompts=2, total_prompts=100),
+    ]
+
+    assert V.unreported(rows) == (3, 45)
+
+    # The measured side is untouched by them.
+    per_agent, _ = V.collect(rows)
+    assert per_agent["claude-code"]["total_prompts"] == 100
+
+
 def test_the_thresholds_still_match_the_registered_contract():
     """The numbers here are a transcription of docs/PRD.md §2, and transcriptions drift.
 

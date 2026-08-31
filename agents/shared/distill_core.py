@@ -830,7 +830,22 @@ def log_uptake_event(session_id, repo, transcript_text, agent):
             # makes the two comparable as a difference in percentage points.
             used_control_prompts=uptake.used_control_prompts,
         )
-        uptake_core.prune_session(session_id)
+        _ok, aged_sessions, aged_rows = uptake_core.prune_session(session_id)
+        if aged_sessions:
+            # Sessions that were injected into and never ended — killed terminals, torn-down
+            # workers. Their rows are being deleted right now and this is the only record that
+            # they existed. On the verdict day the difference between "2.3% of what we measured"
+            # and "2.3% of what we sent" is exactly this number.
+            event_log.try_append_event(
+                "recall-uptake",
+                "injection_unreported",
+                "ok",
+                session_id=session_id,
+                repo=repo,
+                agent=agent,
+                aged_sessions=aged_sessions,
+                aged_rows=aged_rows,
+            )
     except Exception as e:  # noqa: BLE001 — a measurement must never cost a session its note
         print(f"[distill-session] uptake measurement failed: {e}", file=sys.stderr)
 

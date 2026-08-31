@@ -115,7 +115,11 @@ def test_a_long_running_session_does_not_lose_its_early_rows():
             "\n".join(_json.dumps(r, ensure_ascii=False) for r in (early, recent, dead)) + "\n",
             encoding="utf-8",
         )
-        uptake_core.prune_session("unrelated", path, now=now)
+        ok, aged_sessions, aged_rows = uptake_core.prune_session("unrelated", path, now=now)
+        assert ok is True
+        # The dead session leaves a count behind: its injections happened and were
+        # never scored, and this is the only trace before the rows are deleted.
+        assert (aged_sessions, aged_rows) == (1, 1), (aged_sessions, aged_rows)
         assert len(uptake_core.load_records("long", path)) == 2, "a live session keeps its history"
         assert uptake_core.load_records("dead", path) == [], "a session with no recent row ages out"
 

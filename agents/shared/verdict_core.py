@@ -120,6 +120,25 @@ def format_verdict(v):
 #: Counters an `injection_uptake` event carries that the verdict adds up.
 COUNTERS = ("used_prompts", "total_prompts", "used_control_prompts")
 
+def unreported(rows):
+    """(sessions, rows) that were injected into and never scored, from `injection_unreported`.
+
+    A rate says what share of the injections it saw were used. It cannot say what share of the
+    injections it saw at all. Sessions that are killed rather than exited never fire SessionEnd,
+    so they are never scored and their ledger rows age out — this is what is left of them.
+
+    Reported beside the verdict, never folded into it: these injections have no outcome, so
+    counting them either way would invent one.
+    """
+    sessions = total = 0
+    for row in rows or []:
+        if row.get("event") != "injection_unreported":
+            continue
+        sessions += field(row, "aged_sessions")
+        total += field(row, "aged_rows")
+    return sessions, total
+
+
 def field(row, key):
     """Counters live at the top level or inside `attributes` depending on the writer."""
     value = row.get(key)
