@@ -73,6 +73,77 @@ def test_a_zero_control_is_not_an_infinite_effect():
     assert thin.label == V.BROKEN, "0.5pp over a zero floor is within the broken margin"
 
 
+def _event(agent="claude-code", when="2026-09-01", control=1, **counts):
+    row = {
+        "event": "injection_uptake",
+        "observed_at": f"{when}T00:00:00+00:00",
+        "agent": agent,
+        "used_prompts": counts.get("used_prompts", 2),
+        "total_prompts": counts.get("total_prompts", 100),
+    }
+    if control is not None:
+        row["used_control_prompts"] = control
+    return row
+
+
+def test_events_predating_the_control_counter_are_excluded_not_zeroed():
+    """A missing measurement is not a chance rate of zero.
+
+    Folding those rows in with `used_control_prompts = 0` would drag the control rate towards
+    zero, which is the direction that makes the channel look effective — the single most
+    flattering way to be wrong here.
+    """
+    rows = [_event(control=None), _event(control=None), _event(control=3)]
+
+    per_agent, skipped = V.collect(rows)
+
+    assert skipped == 2, skipped
+    assert per_agent["claude-code"]["sessions"] == 1
+    assert per_agent["claude-code"]["used_control_prompts"] == 3
+
+
+def test_rows_are_not_pooled_across_adapters():
+    """Claude Code injects every prompt; Kimi throttles to once a session. One rate answers
+    neither, so the two never share a denominator."""
+    rows = [_event(agent="claude-code"), _event(agent="kimi"), _event(agent="kimi")]
+
+    per_agent, _ = V.collect(rows)
+
+    assert set(per_agent) == {"claude-code", "kimi"}
+    assert per_agent["kimi"]["sessions"] == 2
+
+
+def test_since_and_agent_narrow_the_window():
+    rows = [_event(when="2026-08-20"), _event(when="2026-09-02"), _event(agent="kimi")]
+
+    recent, _ = V.collect(rows, since="2026-09-01")
+    assert recent["claude-code"]["sessions"] == 1
+
+    only, _ = V.collect(rows, agent="kimi")
+    assert set(only) == {"kimi"}
+
+
+def test_counters_are_read_from_attributes_when_that_is_where_they_are():
+    """The store returns the numbers nested under `attributes`; a top-level-only read counts 0
+    and a zero denominator refuses every verdict for a reason that is not true."""
+    row = {
+        "event": "injection_uptake",
+        "observed_at": "2026-09-01T00:00:00+00:00",
+        "attributes": {
+            "agent": "claude-code",
+            "used_prompts": 5,
+            "total_prompts": 200,
+            "used_control_prompts": 1,
+        },
+    }
+
+    per_agent, skipped = V.collect([row])
+
+    assert skipped == 0
+    assert per_agent["claude-code"]["total_prompts"] == 200
+    assert per_agent["claude-code"]["used_prompts"] == 5
+
+
 def test_the_thresholds_still_match_the_registered_contract():
     """The numbers here are a transcription of docs/PRD.md §2, and transcriptions drift.
 
