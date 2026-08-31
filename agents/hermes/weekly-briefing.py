@@ -17,6 +17,7 @@ from slack_briefing import (
     render_body_mrkdwn,
     render_message_mrkdwn,
     render_weekly_blocks,
+    render_weekly_mrkdwn,
 )
 from weekly_trend import collect_week, label_trend, needs_intervention, scoreboard
 
@@ -85,32 +86,35 @@ def print_trend_blocks(days) -> bool:
         TITLE, f"{STAMP} · 스냅샷 {span}/{WINDOW_DAYS}일", projects, intervention, board,
         label_trend(days), [],
     )
-    fallback_lines = [f"*{TITLE}*", f"`{STAMP} · 스냅샷 {span}/{WINDOW_DAYS}일`", ""]
-    for week, label, count, _span in intervention:
-        fallback_lines.append(f"• {week.name} — {count}/{span}일 {label}")
-    if not intervention:
-        fallback_lines.append("주 내내 지속된 막힘/정체 없음.")
-    print(
-        json.dumps(
-            {
-                "text": "\n".join(fallback_lines),
-                "blocks": blocks,
-                "unfurl_links": False,
-                "unfurl_media": False,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+    text = render_weekly_mrkdwn(
+        TITLE, f"{STAMP} · 스냅샷 {span}/{WINDOW_DAYS}일", intervention, board,
+        label_trend(days), [],
     )
+    # Cron delivery is text-only, so text is the default and the JSON payload is the opt-in.
+    # It was the other way round, which put this whole weekly behind an env var nothing sets.
+    if os.environ.get("BORING_BRIEFING_FORMAT", "").strip().lower() == "blocks":
+        print(
+            json.dumps(
+                {
+                    "text": text,
+                    "blocks": blocks,
+                    "unfurl_links": False,
+                    "unfurl_media": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(text)
     return True
 
 
 def main() -> None:
     # The weekly's own signal comes from the daily artifacts, not from a fresh synthesis. Fall
     # through to the engine only when there are too few of them to say anything.
-    if os.environ.get("BORING_BRIEFING_FORMAT", "").strip().lower() == "blocks":
-        if print_trend_blocks(read_week(TODAY)):
-            return
+    if print_trend_blocks(read_week(TODAY)):
+        return
 
     req = urllib.request.Request(
         f"{HERMES_URL}/weekly",
