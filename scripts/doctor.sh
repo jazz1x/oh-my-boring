@@ -498,6 +498,22 @@ if [ -n "$note" ] && [ "$note_max_s" -gt 0 ]; then
     fi
 fi
 
+# (d5c) Double-recorded injections. The recall hook was registered twice under two spellings of
+# the same path, so every prompt wrote two ledger rows (#245). The uptake rate is blind to that —
+# numerator and denominator both double — but `total_prompts` is a pre-registered sample floor
+# (docs/PRD.md §2), and a floor met at half the evidence it names is not the floor registered.
+# Any future double-fire (another adapter, a hand-added hook) lands the same way and is invisible
+# everywhere else.
+ledger_probe="$BORING_HOME/agents/shared/uptake_core.py"
+if [ -f "$ledger_probe" ] && [ "${BORING_SKIP_LEDGER_PROBE:-0}" != 1 ]; then
+    if dup_out="$(python3 "$ledger_probe" --duplicate-injections 2>/dev/null)"; then
+        ok "injection ledger has no double-recorded prompts (${dup_out##*total_rows=})"
+    else
+        bad "DOUBLE-RECORDED INJECTIONS — $dup_out. One prompt logged twice means the recall hook fired twice; the uptake rate hides it while the sample floor counts double."
+        failed_hooks=1
+    fi
+fi
+
 # (d5b) The briefing scripts hermes actually runs. `make build` redeploys the engine image, but
 # the scripts hermes executes live in ~/.hermes/scripts and only the installer copies them there
 # — so merging a briefing change does not deliver it. Measured on 2026-08-26: the installed
