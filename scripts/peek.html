@@ -8,6 +8,8 @@
   /* Every colour is defined here, on bare :root, and only re-valued in the dark block.
      Nothing gets its first definition inside a media query. */
   :root {
+    /* 8px rhythm: 8 / 16 / 24. The page gutter is the largest of them. */
+    --gut: 24px;
     color-scheme: light dark;
     --bg:            #fbfbfa;
     --bg-raised:     #ffffff;
@@ -53,11 +55,25 @@
   }
   .num, time, .mono { font-variant-numeric: tabular-nums; font-family: var(--mono); }
   .r { text-align: right; }
-  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px 56px; }
+  /* One gutter for everything. Linear aligns every left edge to the same rail; a full-bleed
+     header over constrained content reads as two pages stacked. */
+  .gut, .wrap { max-width: 1120px; margin: 0 auto; padding: 0 var(--gut); }
+  .wrap { padding-bottom: 64px; }
+
+  /* The bar stays. Everything above it is an explainer you read once and scroll past. */
+  #scrollaway { padding-top: 16px; }
+  #bar {
+    position: sticky; top: 0; z-index: 20;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line-strong);
+  }
+  @supports (backdrop-filter: blur(8px)) {
+    #bar { background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); }
+  }
 
   /* ── 1. verdict strip ───────────────────────────────────────────────── */
   #verdict {
-    height: 28px;
+    height: 40px;
     display: flex; align-items: center; gap: 12px;
     border-bottom: 1px solid var(--line-strong);
     padding: 0 16px;
@@ -71,13 +87,12 @@
   #verdict .label {
     color: var(--accent); font-weight: 600; letter-spacing: .01em;
   }
-  #verdict .floors { margin-left: auto; color: var(--fg-dim); padding-left: 16px; }
+  #verdict .floors { margin-left: auto; color: var(--fg-dim); padding-left: 24px; }
 
   /* ── meta strip: engine + window bounds ─────────────────────────────── */
   #meta {
     display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center;
-    min-height: 28px; padding: 4px 0;
-    border-bottom: 1px solid var(--line);
+    min-height: 32px; padding: 0 0 8px;
     font-size: 11px; color: var(--fg-dim);
   }
   #meta b { font-weight: 600; color: var(--fg); font-family: var(--mono); }
@@ -88,6 +103,7 @@
 
   /* ── 2. instrument fault row ────────────────────────────────────────── */
   #fault {
+    margin: 8px 0 0;
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
     min-height: 28px; padding: 5px 0;
     border-bottom: 1px solid var(--line);
@@ -110,8 +126,10 @@
 
   /* ── section headers ────────────────────────────────────────────────── */
   .sec {
-    display: flex; align-items: center; gap: 10px;
-    height: 28px; margin-top: 18px;
+    position: sticky; top: 72px; z-index: 10;
+    background: var(--bg);
+    display: flex; align-items: center; gap: 8px;
+    height: 40px; margin-top: 24px;
     border-bottom: 1px solid var(--line);
     font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--fg-dim);
   }
@@ -132,26 +150,33 @@
   /* ── 3. prompt stream ───────────────────────────────────────────────── */
   table { width: 100%; border-collapse: collapse; }
   thead th {
-    font-size: 11px; font-weight: 500; color: var(--fg-faint); text-align: left;
-    padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap;
+    /* Sticky under the section header, which is itself sticky under the bar. Three fixed rows
+       is the ceiling — past that the viewport is chrome, not content. */
+    position: sticky; top: 112px; z-index: 9;
+    background: var(--bg);
+    height: 28px; padding: 0 12px;
+    text-align: left; font-weight: 500; font-size: 11px;
+    letter-spacing: .04em; text-transform: uppercase;
+    color: var(--fg-faint); white-space: nowrap;
+    border-bottom: 1px solid var(--line);
   }
   thead th.r { text-align: right; }
   #stop { font: inherit; font-size: 11px; margin-left: 8px; padding: 1px 8px; cursor: pointer;
           background: transparent; color: var(--fg-dim); border: 1px solid var(--line); border-radius: 3px; }
   #stop:hover { color: var(--bg); background: var(--fg-dim); }
-  #role { font-size: 11px; color: var(--fg-dim); padding: 4px 0 8px; }
+  #role { font-size: 11px; line-height: 1.6; color: var(--fg-dim); max-width: 74ch; padding: 0 0 16px; }
   #role b { color: var(--fg); font-weight: 600; }
   .modes { margin-left: 10px; display: inline-flex; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
   .modes button { font: inherit; font-size: 11px; padding: 1px 8px; background: transparent; color: var(--fg-dim);
                   border: 0; border-right: 1px solid var(--line); cursor: pointer; }
   .modes button:last-child { border-right: 0; }
   .modes button.on { background: var(--accent); color: var(--bg); }
-  tbody tr.g { height: 28px; border-bottom: 1px solid var(--line); }
+  tbody tr.g { height: 32px; border-bottom: 1px solid var(--line); }
   tbody tr.g:hover { background: var(--bg-row-hover); }
-  tbody tr.p { height: 28px; cursor: pointer; border-bottom: 1px solid var(--line); }
+  tbody tr.p { height: 32px; cursor: pointer; border-bottom: 1px solid var(--line); }
   tbody tr.p:hover { background: var(--bg-row-hover); }
   tbody tr.p.cursor { background: var(--bg-row-cursor); box-shadow: inset 2px 0 0 var(--accent); }
-  tbody td { padding: 0 8px; font-size: 12px; white-space: nowrap; }
+  tbody td { padding: 0 12px; font-size: 12px; white-space: nowrap; }
   td.t { font-family: var(--mono); color: var(--fg-dim); width: 1%; }
   td.t .d { color: var(--fg-faint); }
   td.s { font-family: var(--mono); color: var(--fg); width: 1%; }
@@ -207,17 +232,19 @@
 </head>
 <body>
 
-<div id="role">
+<div id="scrollaway"><div class="gut"><div id="role">
   <b>peek</b> — 주입 채널 관측. 최근 프롬프트에 <b>어떤 노트가</b> 들어갔고 어시스턴트가 그걸 되썼는지.
   읽기 전용이고 127.0.0.1 에서만 뜬다. 프롬프트 원문·회사 출처 노트의 산문·증명 못 하는 거리는 나오지 않는다.
   판정 줄은 <code>verdict_core</code> 출력 그대로이며 이 페이지의 어떤 조작으로도 바뀌지 않는다.
-</div>
+</div></div></div>
+<header id="bar"><div class="gut">
 <div id="verdict"><span class="seg" id="verdict-line">reading /api/state …</span></div>
+<div id="meta"></div>
+  </div></header>
+<div class="gut"><div id="fault"></div>
 
+  </div>
 <div class="wrap">
-  <div id="meta"></div>
-  <div id="fault"></div>
-
   <div class="sec">
     <span>prompt stream</span>
     <span class="count" id="stream-count"></span>
