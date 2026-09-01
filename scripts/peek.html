@@ -136,6 +136,18 @@
     padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap;
   }
   thead th.r { text-align: right; }
+  #stop { font: inherit; font-size: 11px; margin-left: 8px; padding: 1px 8px; cursor: pointer;
+          background: transparent; color: var(--fg-dim); border: 1px solid var(--line); border-radius: 3px; }
+  #stop:hover { color: var(--bg); background: var(--fg-dim); }
+  #role { font-size: 11px; color: var(--fg-dim); padding: 4px 0 8px; }
+  #role b { color: var(--fg); font-weight: 600; }
+  .modes { margin-left: 10px; display: inline-flex; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+  .modes button { font: inherit; font-size: 11px; padding: 1px 8px; background: transparent; color: var(--fg-dim);
+                  border: 0; border-right: 1px solid var(--line); cursor: pointer; }
+  .modes button:last-child { border-right: 0; }
+  .modes button.on { background: var(--accent); color: var(--bg); }
+  tbody tr.g { height: 28px; border-bottom: 1px solid var(--line); }
+  tbody tr.g:hover { background: var(--bg-row-hover); }
   tbody tr.p { height: 28px; cursor: pointer; border-bottom: 1px solid var(--line); }
   tbody tr.p:hover { background: var(--bg-row-hover); }
   tbody tr.p.cursor { background: var(--bg-row-cursor); box-shadow: inset 2px 0 0 var(--accent); }
@@ -195,6 +207,11 @@
 </head>
 <body>
 
+<div id="role">
+  <b>peek</b> — 주입 채널 관측. 최근 프롬프트에 <b>어떤 노트가</b> 들어갔고 어시스턴트가 그걸 되썼는지.
+  읽기 전용이고 127.0.0.1 에서만 뜬다. 프롬프트 원문·회사 출처 노트의 산문·증명 못 하는 거리는 나오지 않는다.
+  판정 줄은 <code>verdict_core</code> 출력 그대로이며 이 페이지의 어떤 조작으로도 바뀌지 않는다.
+</div>
 <div id="verdict"><span class="seg" id="verdict-line">reading /api/state …</span></div>
 
 <div class="wrap">
@@ -205,9 +222,15 @@
     <span>prompt stream</span>
     <span class="count" id="stream-count"></span>
     <span class="spark" id="stream-spark"></span>
+    <span class="modes" id="modes">
+      <button type="button" data-mode="prompts" class="on">prompts</button
+      ><button type="button" data-mode="sessions">sessions</button
+      ><button type="button" data-mode="notes">notes</button>
+    </span>
     <span class="right">
       <input id="filter" type="search" placeholder="filter  (/)" autocomplete="off" spellcheck="false">
       <span id="help-hint" title="key map (?)">?</span>
+      <button type="button" id="stop" title="stop this local viewer (it writes nothing; the corpus is untouched)">stop</button>
     </span>
   </div>
   <table id="stream">
@@ -473,15 +496,126 @@ function buildDetail(p, colspan) {
   return tr;
 }
 
+
+// --------------------------------------------------------------- grouped views
+// 200 prompt rows fold to 14 sessions or 321 note sources (measured). The flat stream answers
+// "what went in just now"; these answer "what keeps going in". Both read the same payload — no
+// second fetch, no server-side aggregate that could drift from the rows below it.
+let PAGE = null;
+
+function pageLabel(shown, unit) {
+  const base = shown + " " + unit + (shown === 1 ? "" : "s");
+  if (!PAGE || !PAGE.truncated) return base;
+  // "200 prompts" and "200 of 974 prompts" are different claims about the same screen.
+  return shown + " of " + PAGE.total + " " + unit + "s  (newest, server cap " + PAGE.limit + ")";
+}
+
+let MODE = "prompts";
+let LAST_PROMPTS = [];
+
+function bindModes() {
+  const box = $("modes");
+  if (!box) return;
+  box.addEventListener("click", (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest("button[data-mode]") : null;
+    if (!btn) return;
+    MODE = btn.getAttribute("data-mode");
+    Array.prototype.forEach.call(box.querySelectorAll("button"), (b) =>
+      b.classList.toggle("on", b === btn));
+    paintStream();
+  });
+}
+
+function paintStream() {
+  if (MODE === "prompts") { renderStream(LAST_PROMPTS); return; }
+  $("stream").hidden = false;
+  $("stream-empty").hidden = true;
+  renderGrouped(LAST_PROMPTS, MODE);
+}
+
+function groupRows(prompts, mode) {
+  const map = new Map();
+  (prompts || []).forEach((p) => {
+    if (mode === "sessions") {
+      const k = (p && p.session) || "—";
+      const g = map.get(k) || { key: k, prompts: 0, srcs: new Set(), first: null, last: null, echoed: undefined };
+      g.prompts += 1;
+      (p.hits || []).forEach((h) => h && h.src && g.srcs.add(h.src));
+      const ms = stamp(p && p.ts).ms;
+      if (ms) { if (g.first === null || ms < g.first) g.first = ms; if (g.last === null || ms > g.last) g.last = ms; }
+      // echoed is a SESSION-level fact in the payload, so it aggregates honestly here.
+      if (g.echoed === undefined) g.echoed = p.echoed;
+      else if (g.echoed !== p.echoed) g.echoed = null;
+      map.set(k, g);
+    } else {
+      (p.hits || []).forEach((h) => {
+        if (!h || !h.src) return;
+        const g = map.get(h.src) || { key: h.src, hits: 0, sessions: new Set(), withheld: false };
+        g.hits += 1;
+        if (p.session) g.sessions.add(p.session);
+        if (h.origin_withheld) g.withheld = true;
+        map.set(h.src, g);
+      });
+    }
+  });
+  const rows = Array.from(map.values());
+  rows.sort((a, b) => (mode === "sessions" ? b.prompts - a.prompts : b.hits - a.hits));
+  return rows;
+}
+
+function renderGrouped(prompts, mode) {
+  const body = $("stream-body");
+  body.textContent = "";
+  ROWS = []; CURSOR = -1;
+  const rows = groupRows(prompts, mode);
+  // Grouped counts are computed over the rows that were RETURNED, not the whole ledger. Saying
+  // "321 notes" without that is a claim about the corpus; it is a claim about 200 prompts.
+  const unit = mode === "sessions" ? "session" : "note";
+  const n = rows.length;
+  $("stream-count").textContent =
+    n + " " + unit + (n === 1 ? "" : "s") +
+    (PAGE && PAGE.truncated ? "  over the newest " + PAGE.returned + " of " + PAGE.total + " prompts" : "");
+  rows.forEach((g) => {
+    const tr = el("tr", "g");
+    if (mode === "sessions") {
+      const clock = (ms) => stamp(new Date(ms).toISOString()).clock;
+      const span = (g.first && g.last) ? (clock(g.first) + " → " + clock(g.last)) : "—";
+      tr.appendChild(el("td", null, ""));
+      tr.appendChild(el("td", null, span));
+      tr.appendChild(el("td", null, g.key));
+      tr.appendChild(el("td", "r", String(g.prompts)));
+      tr.appendChild(el("td", "r", String(g.srcs.size)));
+      const e = el("td");
+      if (g.echoed === true) e.appendChild(txt("echoed"));
+      else if (g.echoed === false) e.appendChild(txt("not echoed"));
+      else e.appendChild(unknown("mixed or never scored — a session is only scored when it ends"));
+      tr.appendChild(e);
+      tr.appendChild(el("td", "dim", g.srcs.size + " distinct notes"));
+    } else {
+      tr.appendChild(el("td", null, ""));
+      tr.appendChild(el("td", null, g.key));
+      tr.appendChild(el("td", "r", String(g.hits)));
+      tr.appendChild(el("td", "r", String(g.sessions.size)));
+      // No echoed column here on purpose: `echoed` is a session-level fact and the payload
+      // carries no per-note attribution. A per-note echo rate would be invented.
+      const w = el("td");
+      if (g.withheld) w.appendChild(unknown("company-origin — phrase windows stayed on the server"));
+      else w.appendChild(txt("shown"));
+      tr.appendChild(w);
+      tr.appendChild(el("td", "dim", ""));
+      tr.appendChild(el("td", "dim", ""));
+    }
+    body.appendChild(tr);
+  });
+}
+
 function renderStream(prompts) {
   const body = $("stream-body"), emptyBox = $("stream-empty");
   body.textContent = "";
   ROWS = []; CURSOR = -1;
   const list = Array.isArray(prompts) ? prompts : [];
 
-  $("stream-count").textContent = list.length
-    ? list.length + (list.length === 1 ? " prompt" : " prompts")
-    : "";
+  $("stream-count").textContent = list.length ? pageLabel(list.length, "prompt") : "";
   const spark = $("stream-spark");
   spark.textContent = "";
   if (list.length) spark.appendChild(sparkline(list.map((p) => stamp(p && p.ts).ms)));
@@ -651,7 +785,9 @@ function renderAll(s) {
   renderVerdict(s.window);
   renderMeta(s);
   renderFault(s.instrument_fault);
-  renderStream(s.prompts);
+  PAGE = s.page || null;
+  LAST_PROMPTS = s.prompts;
+  paintStream();
   applyFilter();
   renderLabels(s.labels);
   renderNotes(s.notes);
@@ -701,6 +837,25 @@ document.addEventListener("keydown", (ev) => {
 });
 $("filter").addEventListener("input", applyFilter);
 $("help-hint").addEventListener("click", () => $("help").classList.toggle("open"));
+bindModes();
+$("stop").addEventListener("click", async () => {
+  const b = $("stop");
+  b.disabled = true; b.textContent = "stopping…";
+  try { await fetch("/api/stop", { method: "POST" }); } catch (_) { /* the socket dies mid-reply */ }
+  b.textContent = "stopped";
+  document.getElementById("role").textContent = "viewer stopped. 다시 보려면: python3 scripts/peek.py";
+});
+// `g` cycles prompts -> sessions -> notes. Same payload, three readings of it.
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "g" || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  const t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+  ev.preventDefault();
+  const order = ["prompts", "sessions", "notes"];
+  const next = order[(order.indexOf(MODE) + 1) % order.length];
+  const btn = document.querySelector('[data-mode="' + next + '"]');
+  if (btn) btn.click();
+});
 </script>
 </body>
 </html>

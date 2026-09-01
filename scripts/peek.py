@@ -42,6 +42,7 @@ import pathlib
 import os
 import re
 import sys
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -443,9 +444,19 @@ def _echo_map(rows):
     return out
 
 
-def prompt_rows(ledger, echoes, notes):
-    """The sanctioned question, newest first: which sources went in, and was anything echoed."""
+def prompt_rows(ledger, echoes, notes, page=None):
+    """The sanctioned question, newest first: which sources went in, and was anything echoed.
+
+    `page` is filled in with what was kept and what the ledger actually held. The prose note stays
+    too, but a caveat at the bottom of a page is not a number a reader can see beside the list —
+    "200 prompts" and "200 of 974 prompts" are different claims about the same screen.
+    """
     rows = sorted(ledger or [], key=lambda r: r.get("ts") or 0, reverse=True)
+    if page is not None:
+        page["total"] = len(rows)
+        page["limit"] = MAX_PROMPT_ROWS
+        page["returned"] = min(len(rows), MAX_PROMPT_ROWS)
+        page["truncated"] = len(rows) > MAX_PROMPT_ROWS
     if len(rows) > MAX_PROMPT_ROWS:
         notes.append(
             f"원장 {len(rows)}행 중 최신 {MAX_PROMPT_ROWS}행만 실었다 — 목록이 짧은 것이 아니라"
@@ -568,6 +579,9 @@ def build_state():
         " 빠졌다. 무편집 원문이고 코퍼스 문서 1154/1541 이 회사 출처라 나갈 수 없다."
     )
 
+    # Filled by prompt_rows below; a ledger we could not read leaves every count at zero and
+    # `truncated` false, which the page reads together with the "could not read" note.
+    page = {"returned": 0, "total": 0, "limit": MAX_PROMPT_ROWS, "truncated": False}
     echoes = _echo_map(rows or [])
     if ledger:
         extra, total, sessions = uptake_core.duplicate_injections(ledger_file)
@@ -582,8 +596,9 @@ def build_state():
         "engine": engine_block(health),
         "window": window_block(rows, notes),
         "instrument_fault": instrument_fault(rows),
-        "prompts": prompt_rows(ledger, echoes, notes),
+        "prompts": prompt_rows(ledger, echoes, notes, page),
         "labels": labels_block(_get_json("/recall-label-stats")),
+        "page": page,
         "notes": notes,
     }
 
@@ -609,6 +624,24 @@ class PeekHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(payload)
+
+    def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
+        """One POST, and it only ever stops this process.
+
+        POST rather than GET on purpose: a GET that shuts a server down is a link a browser
+        prefetch, a link checker, or an extension can follow, and the first symptom is a viewer
+        that keeps dying for no visible reason. This route touches no corpus, no ledger and no
+        measurement — it is process lifecycle for a tool the user started by hand, and it must
+        never grow into anything that writes.
+        """
+        route = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if route != "/api/stop":
+            self._send(404, "not found\n", "text/plain; charset=utf-8")
+            return
+        self._send(200, json.dumps({"stopping": True}), "application/json; charset=utf-8")
+        # Shut down from another thread: serve_forever() is running on this one and calling
+        # shutdown() from inside a handler deadlocks.
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
         route = self.path.split("?", 1)[0].rstrip("/") or "/"
@@ -654,7 +687,7 @@ def main(argv=None):
         print("[peek] refusing to bind anything but 127.0.0.1", file=sys.stderr)
         return 2
     httpd = HTTPServer((BIND_HOST, args.port), PeekHandler)
-    print(f"[peek] http://{BIND_HOST}:{args.port}/  (GET / and GET /api/state only)")
+    print(f"[peek] http://{BIND_HOST}:{args.port}/  (GET / · GET /api/state · POST /api/stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
