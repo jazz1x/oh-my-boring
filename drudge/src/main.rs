@@ -338,7 +338,7 @@ async fn main() -> Result<()> {
             let corpus = [vault_wiki_dir(vault_dir.as_deref(), home_dir.as_deref())?];
             let is = ingest::run(store, &ol, &cfg, &corpus).await?;
             println!(
-                "sync: ingest(new={} updated={} deleted={} chunks={}) graph(tools={} concepts={} claims={} edges={})",
+                "sync: ingest(new={} updated={} deleted={} chunks={}) graph(tools={} concepts={} claims={} claims_unchanged={} edges={})",
                 is.new,
                 is.updated,
                 is.deleted,
@@ -346,6 +346,7 @@ async fn main() -> Result<()> {
                 is.tools,
                 is.concepts,
                 is.claims,
+                is.claims_unchanged,
                 is.edges,
             );
             let ss = store.semantic_stats().await?;

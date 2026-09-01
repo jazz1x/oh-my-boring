@@ -134,7 +134,7 @@ async fn run_sync(
 ) {
     match do_sync(store, llm, vault_dir, cfg).await {
         Ok(o) => eprintln!(
-            "[scheduler] sync done — ingest(new={} updated={} deleted={} chunks={}) graph(tools={} concepts={} claims={} edges={})",
+            "[scheduler] sync done — ingest(new={} updated={} deleted={} chunks={}) graph(tools={} concepts={} claims={} claims_unchanged={} edges={})",
             o.ingest.new,
             o.ingest.updated,
             o.ingest.deleted,
@@ -142,6 +142,7 @@ async fn run_sync(
             o.ingest.tools,
             o.ingest.concepts,
             o.ingest.claims,
+            o.ingest.claims_unchanged,
             o.ingest.edges
         ),
         Err(e) => eprintln!("[scheduler] sync error: {e:#}"),
