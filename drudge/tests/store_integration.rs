@@ -928,3 +928,116 @@ async fn query_log_legacy_rows_read_empty_distances() {
         .await
         .expect("cleanup query_log");
 }
+
+/// A re-asserted claim that says exactly the same thing is not a new version.
+///
+/// Re-ingesting a note re-asserts every claim in it, and `valid_from` is the note's mtime, so
+/// editing one line used to write a fresh row — and a fresh 1024-dim embedding — for every
+/// unrelated claim in that note. Measured before this guard: 36,421 of 55,498 rows (66%) were
+/// byte-identical re-writes, and `claim` was 393 MB of a 744 MB database.
+#[tokio::test]
+async fn an_identical_claim_is_not_a_new_version() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+    let db = connect(&dsn).await;
+    let subject = format!("unchanged-probe-{}", std::process::id());
+    let path = format!("/vault/wiki/{subject}.md");
+
+    let unchanged = store
+        .claim_is_unchanged(&subject, "axis", "v1", &path, "fact", "certain")
+        .await
+        .expect("probe");
+    assert!(
+        !unchanged,
+        "nothing stored yet, so nothing can be unchanged"
+    );
+
+    store
+        .upsert_claim(
+            &subject,
+            "axis",
+            "v1",
+            &path,
+            SystemTime::now(),
+            &[0.0_f32; 1024],
+            "fact",
+            "certain",
+        )
+        .await
+        .expect("first insert");
+
+    assert!(
+        store
+            .claim_is_unchanged(&subject, "axis", "v1", &path, "fact", "certain")
+            .await
+            .expect("probe"),
+        "the same tuple must read as unchanged"
+    );
+
+    // Each of these is new information, so none may read as unchanged: a different value
+    // supersedes, a different note is new provenance, and kind/confidence are part of the claim.
+    for (value, src, kind, conf, why) in [
+        ("v2", path.as_str(), "fact", "certain", "a changed value"),
+        (
+            "v1",
+            "/vault/wiki/other.md",
+            "fact",
+            "certain",
+            "a different note",
+        ),
+        ("v1", path.as_str(), "decision", "certain", "a changed kind"),
+        (
+            "v1",
+            path.as_str(),
+            "fact",
+            "likely",
+            "a changed confidence",
+        ),
+    ] {
+        assert!(
+            !store
+                .claim_is_unchanged(&subject, "axis", value, src, kind, conf)
+                .await
+                .expect("probe"),
+            "{why} must not read as unchanged"
+        );
+    }
+
+    // A value that was superseded and then came back must NOT read as unchanged. Without the
+    // `superseded_at IS NULL` filter the probe finds the sealed row, skips the insert, and the
+    // current value stays at v2 — so `claims` answers with something the note no longer says.
+    store
+        .upsert_claim(
+            &subject,
+            "axis",
+            "v2",
+            &path,
+            SystemTime::now(),
+            &[0.0_f32; 1024],
+            "fact",
+            "certain",
+        )
+        .await
+        .expect("supersede with v2");
+    assert!(
+        !store
+            .claim_is_unchanged(&subject, "axis", "v1", &path, "fact", "certain")
+            .await
+            .expect("probe"),
+        "a sealed value returning is new information, not an unchanged claim"
+    );
+    assert!(
+        store
+            .claim_is_unchanged(&subject, "axis", "v2", &path, "fact", "certain")
+            .await
+            .expect("probe"),
+        "the current value must still read as unchanged"
+    );
+
+    db.execute("DELETE FROM claim WHERE subject = $1;", &[&subject])
+        .await
+        .expect("cleanup claim");
+}
