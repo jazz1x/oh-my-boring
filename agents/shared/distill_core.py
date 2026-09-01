@@ -128,15 +128,55 @@ def git_remote_url(cwd):
         return ""
 
 
+def git_main_worktree(cwd):
+    """The main working tree behind `cwd`, or "" — the repo a worktree belongs to.
+
+    `--git-common-dir` points at the shared `.git` of the checkout a linked worktree was created
+    from, so this survives a worktree whose remote cannot be read. Worktrees normally resolve by
+    remote already (they share the config), but a task worktree outlives nothing: when the parent
+    checkout is gone, or the remote was never set, the remote lookup returns "" and the folder
+    name is all that is left — and a task worktree's folder name is `<repo>-<task>`.
+    """
+    if not cwd:
+        return ""
+    try:
+        common = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ""
+    if not common:
+        return ""
+    # `--git-common-dir` is relative to cwd when it is just ".git".
+    if not os.path.isabs(common):
+        common = os.path.join(cwd, common)
+    parent = os.path.dirname(os.path.abspath(common))
+    return parent if os.path.isdir(parent) else ""
+
+
 def repo_slug(cwd):
-    """Category axis: canonical repo slug from the git remote, falling back to folder name."""
+    """Category axis: the canonical repo slug, or "" when there is no repo to name.
+
+    Order: the git remote (a linked worktree shares it, so `<repo>-<task>` collapses to `<repo>`),
+    then the main working tree's folder name for a worktree whose remote is unreadable.
+
+    A directory that is not a repository at all returns **empty**, deliberately. The old
+    behaviour named the project after the folder, which invented one: 18 notes are filed under
+    `다시한번` and single notes under `t5-parts` and `boro-janus-worker` — a phantom project takes
+    a line in the briefing and a row in the graph, and nothing later can tell it from a real one.
+    No project is a fact; a made-up project is not.
+    """
     url = git_remote_url(cwd)
     if url:
         slug = re.sub(r"^.*[:/]([^/]+/[^/]+?)(?:\.git)?$", r"\1", url)
         if slug and slug != url:
             return boring_config.canonical_repo(slug)
-    if cwd:
-        return boring_config.canonical_repo(os.path.basename(cwd.rstrip("/")))
+    main = git_main_worktree(cwd)
+    if main:
+        return boring_config.canonical_repo(os.path.basename(main.rstrip("/")))
     return ""
 
 
