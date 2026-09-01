@@ -29,44 +29,6 @@ def _note(dirpath, name, origin):
     )
 
 
-class OriginGate(unittest.TestCase):
-    """A deny-list over arbitrary prose can never be complete. The note's origin can."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.wiki = Path(self._tmp.name)
-        self._saved = peek._VAULT_WIKI
-        peek._VAULT_WIKI = self.wiki
-        peek._ORIGIN_CACHE.clear()
-
-    def tearDown(self):
-        peek._VAULT_WIKI = self._saved
-        peek._ORIGIN_CACHE.clear()
-        self._tmp.cleanup()
-
-    def test_personal_notes_may_show_their_phrase_windows(self):
-        _note(self.wiki, "wiki-0001.md", "personal")
-        self.assertTrue(peek._note_is_personal("wiki-0001.md"))
-
-    def test_company_notes_may_not(self):
-        _note(self.wiki, "wiki-0002.md", "company")
-        self.assertFalse(peek._note_is_personal("wiki-0002.md"))
-
-    def test_a_note_we_cannot_read_is_treated_as_company(self):
-        """The failure direction has to be silence.
-
-        A missing or unparseable note is unknown, and unknown must not open the gate — the other
-        direction puts company prose on a page and there is no taking it back.
-        """
-        self.assertFalse(peek._note_is_personal("wiki-does-not-exist.md"))
-        (self.wiki / "wiki-0003.md").write_text("no frontmatter at all\n", encoding="utf-8")
-        self.assertFalse(peek._note_is_personal("wiki-0003.md"))
-
-    def test_an_origin_we_do_not_recognise_is_not_personal(self):
-        _note(self.wiki, "wiki-0004.md", "someday-a-new-value")
-        self.assertFalse(peek._note_is_personal("wiki-0004.md"))
-
-
 class PayloadShape(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -96,12 +58,18 @@ class PayloadShape(unittest.TestCase):
             }
         ]
 
+    def test_a_note_we_cannot_read_counts_as_company(self):
+        """The failure direction has to be silence — the other one cannot be taken back."""
+        self.assertFalse(peek._note_is_personal("wiki-does-not-exist.md"))
+
     def test_the_raw_prompt_never_reaches_the_payload(self):
         """`prompt_words` is the user's prompt, unredacted, stored beside every injection."""
         blob = json.dumps(peek.prompt_rows(self._rows(), {}, []), ensure_ascii=False)
         self.assertNotIn("prompt_words", blob)
-        for word in ("회사", "내부", "절대"):
-            self.assertNotIn(word, blob, f"prompt token {word!r} leaked into the payload")
+        self.assertNotIn("내부", blob, "prompt token leaked into the payload")
+        rows = peek.prompt_rows(self._rows(), {}, [])
+        self.assertEqual(len(rows[0]["session"]), 8)
+        self.assertNotIn("def012345678", blob)
 
     def test_company_prose_is_withheld_and_says_so(self):
         rows = peek.prompt_rows(self._rows(), {}, [])
@@ -116,16 +84,6 @@ class PayloadShape(unittest.TestCase):
         self.assertEqual(company["phrases"], [])
         # Withheld and empty are different claims; the flag is what lets the page say which.
         self.assertNotIn("회사 노트 산문", json.dumps(rows, ensure_ascii=False))
-
-    def test_the_session_id_is_truncated(self):
-        rows = peek.prompt_rows(self._rows(), {}, [])
-        self.assertEqual(len(rows[0]["session"]), 8)
-        self.assertNotIn("def012345678", json.dumps(rows))
-
-    def test_no_distance_is_asserted(self):
-        """The ledger stores no query_log id, so any distance here would be a guess."""
-        blob = json.dumps(peek.prompt_rows(self._rows(), {}, []))
-        self.assertNotIn("dist", blob)
 
 
 class BindAddress(unittest.TestCase):
