@@ -15,6 +15,15 @@
     --status-ok: #15803d;
     /* 8px rhythm: 8 / 16 / 24. The page gutter is the largest of them. */
     --gut: 24px;
+    --page: 1120px;
+    /* Every block's horizontal inset, table cells included. Measured before this token: four
+       different text-left values (24 / 32 / 36 / 36 px) down one page — the section label, the
+       band grid, the notes box and the table columns each picked their own padding, so nothing
+       lined up with anything. One token, one left edge. */
+    --inset: 12px;
+    /* Chrome above the stream pane: bar + section header + a breath. The pane is sized off this
+       so the summary blocks stay on screen instead of sitting below a 6400px table. */
+    --chrome: 300px;
     color-scheme: light dark;
     --bg:            #fbfbfa;
     --bg-raised:     #ffffff;
@@ -64,13 +73,30 @@
   .r { text-align: right; }
   /* One gutter for everything. Linear aligns every left edge to the same rail; a full-bleed
      header over constrained content reads as two pages stacked. */
-  .gut, .wrap { max-width: 1120px; margin: 0 auto; padding: 0 var(--gut); }
+  .gut, .wrap { max-width: var(--page); margin: 0 auto; padding: 0 var(--gut); }
+
+  /* Wide viewports get a rail instead of a taller page. The stream is the detail and the bands,
+     label floors and caveats are what the verdict rests on — stacked, the evidence lands below
+     the fold no matter how short the pane is, because the pane is what fills the fold. */
+  @media (min-width: 1180px) {
+    :root { --page: 1440px; --chrome: 260px; }
+    .wrap {
+      display: grid; grid-template-columns: minmax(0, 1fr) 340px;
+      column-gap: var(--gut); align-items: start;
+    }
+    #help, .foot { grid-column: 1 / -1; }
+    #main { grid-column: 1; min-width: 0; }
+    #rail { grid-column: 2; }
+    /* The rail starts level with the stream, so its first section header repeats no top margin. */
+    #rail > .sec:first-child { margin-top: 24px; }
+  }
   .wrap { padding-bottom: 64px; }
 
   /* The bar stays. Everything above it is an explainer you read once and scroll past. */
   #scrollaway { padding-top: 16px; }
   #bar {
     position: sticky; top: 0; z-index: 20;
+    padding-top: 16px;
     background: var(--bg);
     border-bottom: 1px solid var(--line-strong);
   }
@@ -78,7 +104,8 @@
     #bar { background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); }
   }
 
-  #hero { display: flex; align-items: baseline; gap: 8px; padding: 16px 0 0; }
+  /* The bar owns the top breath now, so the hero only carries the shared inset. */
+  #hero { display: flex; align-items: baseline; gap: 8px; padding: 0 var(--inset); }
   #hero-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-faint); flex: none;
               transform: translateY(-2px); }
   #hero-dot.warn { background: var(--status-warn); }
@@ -86,12 +113,17 @@
   #hero-label { font-size: var(--t-hero); font-weight: 600; letter-spacing: -.01em; }
   #hero-label.warn { color: var(--status-warn); }
   #hero-label.ok { color: var(--status-ok); }
-  #hero-sub { font-size: var(--t-body); color: var(--fg-dim); padding: 4px 0 0; max-width: 82ch; }
+  #hero-sub { font-size: var(--t-body); color: var(--fg-dim); padding: 4px var(--inset) 0;
+               max-width: 96ch; }
+  .nowrap { white-space: nowrap; }
   #floors { display: flex; gap: 24px; font-size: var(--t-cell); color: var(--fg-dim);
-            padding: 8px 0 16px; font-variant-numeric: tabular-nums; }
+            padding: 8px var(--inset) 16px; font-variant-numeric: tabular-nums; }
   #floors .k { color: var(--fg-faint); }
   #floors b { font-weight: 600; color: var(--fg); }
   #meta-wrap { padding: 8px 0 0; }
+  /* The gutter already insets the page; blocks add --inset on top, so a bare .gut child needs
+     it too or its text hangs 12px left of every column. */
+  #meta-wrap { padding-left: var(--inset); padding-right: var(--inset); }
   #meta-toggle { font: inherit; font-size: var(--t-label); color: var(--fg-faint); background: none;
                  border: 0; padding: 0; cursor: pointer; }
   #meta-toggle:hover { color: var(--fg-dim); }
@@ -129,7 +161,7 @@
   #fault {
     margin: 8px 0 0;
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
-    min-height: 28px; padding: 5px 0;
+    min-height: 32px; padding: 6px var(--inset);
     border-bottom: 1px solid var(--line);
     font-size: 12px;
   }
@@ -151,7 +183,11 @@
   /* ── section headers ────────────────────────────────────────────────── */
   /* Nothing in this row may wrap or shrink except the footnote: a two-line section header and a
      button reading "note" instead of "notes" are both the row running out of width silently. */
+  /* No-shrink for the labels and buttons, which is what wrapping used to break. The right-hand
+     group is the exception: with `flex: none` on it the 200px filter forced the row 80px past the
+     section's own right edge and drew the `?` and `stop` controls on top of the rail. */
   .sec > * { flex: none; }
+  .sec > .right, .sec > .count.dim { flex: 0 1 auto; min-width: 0; }
   .sec > .label, .sec .count, .modes, .modes button { white-space: nowrap; }
   .sec .right { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
   /* The footnote is the only thing here that may be dropped when the row runs out of width;
@@ -164,7 +200,7 @@
     position: sticky; top: 72px; z-index: 10;
     background: var(--bg);
     display: flex; align-items: center; gap: 8px;
-    height: 40px; margin-top: 24px;
+    height: 40px; margin-top: 24px; padding: 0 var(--inset);
     border-bottom: 1px solid var(--line);
     font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--fg-dim);
   }
@@ -177,19 +213,30 @@
                 text-transform: none; letter-spacing: 0; }
   #filter {
     font: 11px/1 var(--mono); color: var(--fg); background: var(--bg-muted);
-    border: 1px solid var(--line); border-radius: 2px; padding: 5px 7px; width: 200px;
+    border: 1px solid var(--line); border-radius: 2px; padding: 5px 7px;
+    flex: 0 1 200px; width: 200px; min-width: 72px;
   }
   #filter:focus { outline: none; border-color: var(--accent); }
   #filter::placeholder { color: var(--fg-faint); }
 
   /* ── 3. prompt stream ───────────────────────────────────────────────── */
+  /* The stream scrolls INSIDE a pane rather than growing the page. Measured before this: 200
+     prompts expanded to 400 rows and 6429px in an 834px viewport, which put the verdict's own
+     evidence — distance bands, label floors, the caveat list — about eight screens below the
+     fold. A number nobody scrolls to is not reported. */
+  #stream-pane {
+    max-height: calc(100vh - var(--chrome)); min-height: 240px; overflow: auto;
+    border-bottom: 1px solid var(--line);
+    overscroll-behavior: contain;
+  }
   table { width: 100%; border-collapse: collapse; }
   thead th {
-    /* Sticky under the section header, which is itself sticky under the bar. Three fixed rows
-       is the ceiling — past that the viewport is chrome, not content. */
-    position: sticky; top: 112px; z-index: 9;
+    /* Sticky to the pane's own top. It used to chain off two hardcoded page offsets (72px,
+       112px) that no longer matched the measured heights (68px, 117px); scoping the sticky to
+       the scroll container removes the arithmetic instead of correcting it. */
+    position: sticky; top: 0; z-index: 9;
     background: var(--bg);
-    height: 28px; padding: 0 12px;
+    height: 28px; padding: 0 var(--inset);
     text-align: left; font-weight: 500; font-size: 11px;
     letter-spacing: .04em; text-transform: uppercase;
     color: var(--fg-faint); white-space: nowrap;
@@ -215,7 +262,7 @@
   td.mark .yes { color: var(--accent); }
   td.mark .no { color: var(--fg-dim); }
   td.mark .faint { color: var(--fg-faint); }
-  tbody td { padding: 0 12px; font-size: 12px; white-space: nowrap; }
+  tbody td { padding: 0 var(--inset); font-size: 12px; white-space: nowrap; }
   td.t { font-family: var(--mono); color: var(--fg-dim); width: 1%; }
   td.t .d { color: var(--fg-faint); }
   td.s { font-family: var(--mono); color: var(--fg); width: 1%; }
@@ -225,7 +272,7 @@
   .yes { color: var(--accent); }
   .no  { color: var(--fg-dim); }
   .unk { color: var(--fg-faint); cursor: help; border-bottom: 1px dotted var(--line-strong); }
-  tr.detail > td { padding: 0 8px 10px 30px; background: var(--bg-muted);
+  tr.detail > td { padding: 0 var(--inset) 12px 30px; background: var(--bg-muted);
                    border-bottom: 1px solid var(--line); white-space: normal; }
   .hit { padding: 6px 0 0; }
   .hit .src { font-family: var(--mono); font-size: 11px; color: var(--fg); }
@@ -235,12 +282,12 @@
     padding: 1px 0 1px 10px; border-left: 1px solid var(--line-strong);
     white-space: pre-wrap; word-break: break-word;
   }
-  .empty { padding: 10px 8px; font-size: 12px; color: var(--fg-dim); }
+  .empty { padding: 12px var(--inset); font-size: 12px; color: var(--fg-dim); }
 
   /* ── 4. labels line ────────────────────────────────────────────────── */
   #labels {
     display: flex; flex-wrap: wrap; gap: 4px 20px; align-items: baseline;
-    min-height: 28px; padding: 6px 8px;
+    min-height: 32px; padding: 8px var(--inset);
     border-bottom: 1px solid var(--line); font-size: 12px; color: var(--fg-dim);
   }
   #labels b { font-family: var(--mono); font-weight: 600; color: var(--fg);
@@ -249,12 +296,21 @@
   /* ── 4b. why (retrieval distance bands) ────────────────────────────── */
   /* Bands, not rows: 120 individual distances do not show a shape, and the reader's question is
      what shape of distance the retriever accepted. One table per `dist_kind` — never pooled. */
-  #why { padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 12px; }
-  #why .kind { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px;
-               color: var(--fg-dim); }
+  #why { padding: 8px var(--inset); border-bottom: 1px solid var(--line); font-size: 12px; }
+  #why .kind { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+               margin-bottom: 8px; color: var(--fg-dim); }
   #why .kind b { font-family: var(--mono); font-weight: 600; color: var(--fg);
                  font-variant-numeric: tabular-nums; }
-  #why .bands { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 10px; }
+  /* Six bands, always. Full width fits all six; the 340px rail fits three, so the rail's media
+     query re-splits them. auto-fit was tried first and left four collapsed 0px tracks whose gaps
+     still occupied 32px of dead space. */
+  #why .bands { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+                gap: 8px; margin-bottom: 8px; }
+  /* Placed AFTER the base rule on purpose: same specificity, so source order decides. Declared up
+     with the other rail rules it lost the cascade and the range labels wrapped mid-number. */
+  @media (min-width: 1180px) {
+    #why .bands { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
   #why .band { min-width: 0; }
   #why .band .rng { font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
                     font-variant-numeric: tabular-nums; }
@@ -265,14 +321,17 @@
 
   /* ── 5. notes ──────────────────────────────────────────────────────── */
   #notes {
-    margin-top: 18px; padding: 10px 12px;
+    margin-top: 24px; padding: 12px var(--inset);
     background: var(--bg-muted); border: 1px solid var(--line); border-radius: 2px;
     font-size: 11px; color: var(--fg-dim);
   }
-  #notes ul { margin: 0; padding-left: 16px; }
+  /* The marker sits on the shared left edge and the text hangs off it; padding-left on the
+     list would push the bullet 16px right of every other block instead. */
+  #notes ul { margin: 0; padding-left: 0; list-style-position: outside; }
+  #notes li { margin-left: 14px; }
   #notes li { padding: 1px 0; white-space: pre-wrap; }
 
-  #help { display: none; margin-top: 14px; padding: 10px 12px;
+  #help { display: none; margin-top: 24px; padding: 12px var(--inset);
           border: 1px solid var(--line-strong); border-radius: 2px; background: var(--bg-raised);
           font-size: 11px; color: var(--fg-dim); }
   #help.open { display: block; }
@@ -283,7 +342,7 @@
   #help-hint { font-family: var(--mono); color: var(--fg-faint); cursor: pointer;
                padding: 0 3px; user-select: none; }
   #help-hint:hover { color: var(--accent); }
-  .foot { margin-top: 14px; font-size: 11px; color: var(--fg-faint); }
+  .foot { margin-top: 24px; padding: 0 var(--inset); font-size: 11px; color: var(--fg-faint); }
 </style>
 </head>
 <body>
@@ -300,7 +359,8 @@
   <button type="button" id="meta-toggle">detail</button><div id="meta" hidden></div>
 </div></div>
 <div class="wrap">
-  <div class="sec">
+ <div id="main">
+  <div class="sec" id="sec-stream">
     <span class="label">prompt stream</span>
     <span class="count" id="stream-count"></span>
     <span class="count dim" id="stream-foot"></span><span class="spark" id="stream-spark"></span>
@@ -315,19 +375,23 @@
       <button type="button" id="stop" title="stop this local viewer (it writes nothing; the corpus is untouched)">stop</button>
     </span>
   </div>
-  <table id="stream">
-    <thead><tr id="head-row"></tr></thead>
-    <tbody id="stream-body"></tbody>
-  </table>
-  <div class="empty" id="stream-empty" hidden></div>
+  <div id="stream-pane">
+    <table id="stream">
+      <thead><tr id="head-row"></tr></thead>
+      <tbody id="stream-body"></tbody>
+    </table>
+    <div class="empty" id="stream-empty" hidden></div>
+  </div>
+  <div id="notes"></div>
+ </div>
 
-  <div class="sec"><span class="label">why these notes</span><span class="count dim" id="why-foot"></span></div>
+ <aside id="rail">
+  <div class="sec" id="sec-why"><span class="label">why these notes</span><span class="count dim" id="why-foot"></span></div>
   <div id="why"></div>
 
-  <div class="sec"><span class="label">labels</span></div>
+  <div class="sec" id="sec-labels"><span class="label">labels</span></div>
   <div id="labels"></div>
-
-  <div id="notes"></div>
+ </aside>
 
   <div id="help">
     <dl>
@@ -436,7 +500,9 @@ function renderVerdict(w, scoring, pace) {
   sub.appendChild(txt(
     "채점된 범위에서 에코 " + ech + "/" + det + " — 무신호이지 무효과 판정이 아니다. "
   ));
-  const why = el("span", "dim", "표본 하한 미달로 판정 보류 · 창 마감 " + ((w && w.until) || "?"));
+  const why = el("span", "dim", "표본 하한 미달로 판정 보류 · ");
+  const deadline = el("span", "dim nowrap", "창 마감 " + ((w && w.until) || "?"));
+  why.appendChild(deadline);
   sub.appendChild(why);
 
   const box = $("floors");
@@ -758,7 +824,12 @@ function renderStream(prompts) {
     ? pageLabel(list.length, "prompt")
     : "";
   const foot = $("stream-foot");
-  if (foot) foot.textContent = list.length ? "top-3 주입 + 대조 2" : "";
+  if (foot) {
+    foot.textContent = list.length ? "top-3" : "";
+    foot.title = list.length
+      ? "각 행은 주입된 상위 3개 출처와 대조 2개를 보여준다 (원장이 저장하는 전부)"
+      : "";
+  }
   const spark = $("stream-spark");
   spark.textContent = "";
   if (list.length) spark.appendChild(sparkline(list.map((p) => stamp(p && p.ts).ms)));
@@ -887,18 +958,21 @@ function renderWhy(w) {
     box.appendChild(unknown("query_log carried no scored search rows — undetermined, not zero"));
     return;
   }
-  foot.appendChild(txt("최근 " + w.queries + "개 search 질의의 top-3 회수 거리"));
+  foot.textContent = "최근 " + w.queries + "개 질의";
+  foot.title = "최근 " + w.queries + "개 search 질의의 top-3 회수 거리 — dist_kind 별로 분리";
 
   w.kinds.forEach((k) => {
     const head = el("div", "kind");
-    head.appendChild(txt(k.kind + "  "));
-    const nb = el("b"); nb.appendChild(txt("n=" + k.n)); head.appendChild(nb);
-    head.appendChild(txt("  min "));
-    const a = el("b"); a.appendChild(txt(k.min.toFixed(3))); head.appendChild(a);
-    head.appendChild(txt("  median "));
-    const m = el("b"); m.appendChild(txt(k.median.toFixed(3))); head.appendChild(m);
-    head.appendChild(txt("  max "));
-    const z = el("b"); z.appendChild(txt(k.max.toFixed(3))); head.appendChild(z);
+    head.appendChild(el("span", "nowrap", k.kind));
+    // A label and its number are one token. Letting the flex row break between them puts a bare
+    // `max` at the end of a line and the figure on the next, which reads as two facts.
+    [["n=", k.n], ["min ", k.min.toFixed(3)], ["median ", k.median.toFixed(3)],
+     ["max ", k.max.toFixed(3)]].forEach(([label, value]) => {
+      const pair = el("span", "nowrap");
+      pair.appendChild(txt(label));
+      const b = el("b"); b.appendChild(txt(String(value))); pair.appendChild(b);
+      head.appendChild(pair);
+    });
     box.appendChild(head);
 
     // Scale within this kind only — a shared scale across kinds would imply comparable units.
