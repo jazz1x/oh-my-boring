@@ -66,6 +66,7 @@ python3 agents/shared/test_transcript.py
 python3 agents/shared/test_recall_core.py
 python3 agents/shared/test_label_core.py
 python3 agents/shared/test_uptake_core.py
+python3 agents/shared/test_verdict_core.py
 python3 agents/shared/test_drudge_client.py
 python3 agents/claude-code/test_hooks.py
 python3 agents/kimi/test_kimi.py
@@ -77,6 +78,7 @@ python3 scripts/test_data_steward.py
 python3 scripts/test_vault_cleanup_gate.py
 python3 scripts/test_retention.py
 python3 scripts/test_self_verify_contract.py
+python3 scripts/test_peek.py
 echo "6) shell destructive-path guardrails (restore-db)…"
 sh scripts/test_restore_db.sh
 echo "7) shell readiness gate guardrails (doctor --strict)…"
