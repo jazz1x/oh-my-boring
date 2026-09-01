@@ -138,12 +138,15 @@ class RepoSlugTests(unittest.TestCase):
         # An empty cwd has no git remote → folder-name fallback; "" cwd → "".
         self.assertEqual(distill.repo_slug(""), "")
 
-    def test_basename_of_cwd(self):
-        # repo_slug calls git first; for a non-repo temp dir the remote is "" → folder name.
+    def test_a_non_repo_directory_names_no_project(self):
+        # Was `test_basename_of_cwd`: a folder outside git used to be named after itself, which
+        # invented projects — 18 notes ended up filed under `다시한번`, and single notes under
+        # `t5-parts` and `boro-janus-worker`. A phantom project takes a line in the briefing and
+        # a row in the graph, and nothing later can tell it from a real one.
         with tempfile.TemporaryDirectory() as d:
             sub = os.path.join(d, "my-project")
             os.makedirs(sub)
-            self.assertEqual(distill.repo_slug(sub), "my-project")
+            self.assertEqual(distill.repo_slug(sub), "")
 
     def test_git_remote_from_subdirectory(self):
         # Working from a subdir should still resolve to the repo's remote slug.
@@ -170,10 +173,35 @@ class RepoSlugTests(unittest.TestCase):
             with mock.patch.object(distill_core, "git_remote_url", return_value=url):
                 self.assertEqual(distill.repo_slug("/tmp/foo"), expected)
 
-    def test_repo_slug_no_remote_falls_back_to_basename(self):
-        with mock.patch.object(distill_core, "git_remote_url", return_value=""):
-            self.assertEqual(distill.repo_slug("/tmp/my-project"), "my-project")
-            self.assertEqual(distill.repo_slug(""), "")
+    def test_no_remote_resolves_through_the_main_worktree_not_the_folder_name(self):
+        # A task worktree whose remote cannot be read (never set, or the parent checkout is gone)
+        # used to be named after its own folder — and that name is `<repo>-<task>`.
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "widget")
+            os.makedirs(repo)
+            for args in (
+                ["init", "-q"],
+                ["config", "user.email", "t@example.invalid"],
+                ["config", "user.name", "t"],
+                ["config", "commit.gpgsign", "false"],
+            ):
+                subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True)
+            open(os.path.join(repo, "f"), "w").close()
+            subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", repo, "commit", "-qm", "init"], check=True, capture_output=True
+            )
+            wt = os.path.join(d, "widget-t5-parts")
+            subprocess.run(
+                ["git", "-C", repo, "worktree", "add", "-q", "--detach", wt, "HEAD"],
+                check=True,
+                capture_output=True,
+            )
+
+            with mock.patch.object(distill_core, "git_remote_url", return_value=""):
+                self.assertEqual(distill.repo_slug(wt), "widget")
+                self.assertEqual(distill.repo_slug(repo), "widget")
+                self.assertEqual(distill.repo_slug(""), "")
 
 
 class ExtractTranscriptTests(unittest.TestCase):

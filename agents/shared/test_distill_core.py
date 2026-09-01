@@ -5,6 +5,8 @@ Run: python3 agents/shared/test_distill_core.py
 """
 import io
 import json
+import subprocess
+import pathlib
 import os
 import tempfile
 import unittest
@@ -463,6 +465,53 @@ class BackstopClampTests(unittest.TestCase):
         prompt, _err = self._run(text)
         body = prompt[prompt.find("y" * 200):]
         self.assertNotIn("y" * 201, body)
+
+
+class RepoIdentityAcrossWorktrees(unittest.TestCase):
+    """A task worktree is the same repo. Its folder name is not the repo's name."""
+
+    def _repo(self, tmp):
+        repo = pathlib.Path(tmp) / "parent-repo"
+        repo.mkdir()
+        run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True)
+        run("init", "-q")
+        run("config", "user.email", "t@example.invalid")
+        run("config", "user.name", "t")
+        run("config", "commit.gpgsign", "false")
+        (repo / "f").write_text("x", encoding="utf-8")
+        run("add", "-A")
+        run("commit", "-qm", "init")
+        return repo
+
+    def test_a_worktree_resolves_to_the_repo_even_without_a_remote(self):
+        # Worktrees share the config, so a readable remote already collapses them. This is the
+        # case that used to leak: a task worktree whose remote was never set or whose parent is
+        # gone fell back to its own folder name, and that name is `<repo>-<task>`.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp)
+            wt = pathlib.Path(tmp) / "parent-repo-t5-parts"
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(wt), "HEAD"],
+                capture_output=True,
+            )
+            self.assertTrue(wt.is_dir(), "worktree was not created")
+
+            self.assertEqual(distill_core.repo_slug(str(wt)), "parent-repo")
+            self.assertEqual(distill_core.repo_slug(str(repo)), "parent-repo")
+
+    def test_a_directory_that_is_not_a_repo_names_no_project(self):
+        """Naming the project after the folder invented one — 18 notes under `다시한번`.
+
+        A phantom project takes a line in the briefing and a row in the graph, and nothing
+        later can tell it from a real one.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = pathlib.Path(tmp) / "다시한번"
+            plain.mkdir()
+            self.assertEqual(distill_core.repo_slug(str(plain)), "")
+
+    def test_no_cwd_names_no_project(self):
+        self.assertEqual(distill_core.repo_slug(""), "")
 
 
 def _read_last_event():
