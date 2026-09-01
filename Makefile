@@ -176,6 +176,9 @@ bench-llm-tier: ## Compare LLM distillation quality by RAM tier: make bench-llm-
 bench-embed: ## Benchmark local embedding model (dim, latency, sanity)
 	@python3 scripts/bench-embed.py
 
+peek: ## Local read-only view of what gets injected and whether it lands (127.0.0.1:7788)
+	@python3 scripts/peek.py
+
 psql: ## Connect directly to Postgres (requires vector mode / --profile vector)
 	$(COMPOSE) exec boring-postgres psql -U boring -d boring
 

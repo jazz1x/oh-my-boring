@@ -84,6 +84,13 @@ This installs Claude/Kimi hooks, Cursor/Codex MCP entries, the Codex host worker
 
 The notes are just markdown, so **open the `vault/` folder as an [Obsidian](https://obsidian.md) vault** — graph view, backlinks, tags, and full-text search come for free. The compiled notes already carry Obsidian-safe `tags` and `[[wiki-NNNN]]` `relates_to` links, so the graph view draws your memory's connections directly (richest with `BORING_VECTOR=on`, which projects the GraphRAG graph into those links). No custom UI to build. Obsidian's own `.obsidian/` workspace folder is gitignored, so your layout stays local and never leaks into git.
 
+Obsidian shows you what the corpus *holds*. To see what it actually **does** — which notes the
+recall hook injected into your sessions, how far the retriever reached to find them, and whether
+the measurement window is on track — run `make peek` and open <http://127.0.0.1:7788>. It is
+read-only, binds to loopback with no flag to change that, never calls a generative endpoint, and
+withholds the prose of company-origin notes. Press `?` in the page for the key map, `stop` to shut
+it down.
+
 ---
 
 ## Architecture
