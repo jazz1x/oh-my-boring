@@ -201,6 +201,24 @@ impl GraphExtractor for FrontmatterGraphExtractor {
                 {
                     continue;
                 }
+                // Nothing changed for this axis, so there is nothing to embed and nothing to
+                // seal. Leaving the existing row alone also keeps its `valid_from`, which is
+                // the first time this value was true rather than the last time the note was
+                // touched — the more honest of the two.
+                if store
+                    .claim_is_unchanged(
+                        &subject,
+                        &predicate,
+                        value,
+                        path,
+                        cl.kind(),
+                        cl.confidence(),
+                    )
+                    .await?
+                {
+                    stats.claims_unchanged += 1;
+                    continue;
+                }
                 let emb = llm.embed(&format!("{subject} {predicate} {value}")).await?;
                 store
                     .upsert_claim(
@@ -241,6 +259,8 @@ pub struct Stats {
     pub tools: usize,
     pub concepts: usize,
     pub claims: usize,
+    /// Claims re-asserted with no change — no embedding, no new row. Reported, not hidden.
+    pub claims_unchanged: usize,
     pub edges: usize,
 }
 

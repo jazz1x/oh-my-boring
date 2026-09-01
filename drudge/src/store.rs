@@ -777,6 +777,48 @@ impl Store {
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// True when the current row for `(subject, predicate)` already says exactly this.
+    ///
+    /// Re-ingesting a note re-asserts every claim in it, and `valid_from` is the note's mtime —
+    /// so editing one line of a note wrote a fresh row, and a fresh 1024-dim embedding, for
+    /// every unrelated claim it contains. Measured on this corpus: 36,421 of 55,498 claim rows
+    /// (66%) are byte-identical re-writes of the row before them, and the `claim` table is
+    /// 393 MB of a 744 MB database with 85% of it superseded.
+    ///
+    /// Comparing the whole tuple, not just the value: a different note asserting the same value
+    /// is new provenance and must still be recorded, and so is a change of `kind` or
+    /// `confidence`. Only an exact repeat is nothing.
+    pub async fn claim_is_unchanged(
+        &self,
+        subject: &str,
+        predicate: &str,
+        value: &str,
+        source_path: &str,
+        kind: &str,
+        confidence: &str,
+    ) -> Result<bool> {
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "SELECT 1 FROM claim
+                 WHERE subject = $1 AND predicate = $2 AND superseded_at IS NULL
+                   AND value = $3 AND source_path = $4 AND kind = $5 AND confidence = $6
+                 LIMIT 1;",
+                &[
+                    &subject,
+                    &predicate,
+                    &value,
+                    &source_path,
+                    &kind,
+                    &confidence,
+                ],
+            )
+            .await
+            .context("claim unchanged probe")?;
+        Ok(!rows.is_empty())
+    }
+
     /// Temporal fact claim upsert + supersede. For the same `(subject,predicate)`, old values are
     /// sealed via `superseded_at`, and only the latest `valid_from` row is current (NULL). Idempotent (re-ingesting the same row is harmless).
     /// 0 extra gemma calls — takes the claims that extract already produced as-is.
