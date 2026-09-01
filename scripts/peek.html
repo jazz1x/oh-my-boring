@@ -8,6 +8,11 @@
   /* Every colour is defined here, on bare :root, and only re-valued in the dark block.
      Nothing gets its first definition inside a media query. */
   :root {
+    /* 4 sizes, 2 weights, 3 greys. Accent is spent on interaction only; state gets its own
+       colour, so colour reads as a sentence instead of decoration. */
+    --t-hero: 20px; --t-body: 13px; --t-cell: 12px; --t-label: 11px;
+    --status-warn: #b45309;
+    --status-ok: #15803d;
     /* 8px rhythm: 8 / 16 / 24. The page gutter is the largest of them. */
     --gut: 24px;
     color-scheme: light dark;
@@ -29,6 +34,8 @@
   }
   @media (prefers-color-scheme: dark) {
     :root {
+      --status-warn: #fbbf24;
+      --status-ok: #4ade80;
       --bg:            #0e0e10;
       --bg-raised:     #141417;
       --bg-row-hover:  #1a1a1e;
@@ -71,7 +78,24 @@
     #bar { background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); }
   }
 
-  /* ── 1. verdict strip ───────────────────────────────────────────────── */
+  #hero { display: flex; align-items: baseline; gap: 8px; padding: 16px 0 0; }
+  #hero-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-faint); flex: none;
+              transform: translateY(-2px); }
+  #hero-dot.warn { background: var(--status-warn); }
+  #hero-dot.ok { background: var(--status-ok); }
+  #hero-label { font-size: var(--t-hero); font-weight: 600; letter-spacing: -.01em; }
+  #hero-label.warn { color: var(--status-warn); }
+  #hero-label.ok { color: var(--status-ok); }
+  #hero-sub { font-size: var(--t-body); color: var(--fg-dim); padding: 4px 0 0; max-width: 82ch; }
+  #floors { display: flex; gap: 24px; font-size: var(--t-cell); color: var(--fg-dim);
+            padding: 8px 0 16px; font-variant-numeric: tabular-nums; }
+  #floors .k { color: var(--fg-faint); }
+  #floors b { font-weight: 600; color: var(--fg); }
+  #meta-wrap { padding: 8px 0 0; }
+  #meta-toggle { font: inherit; font-size: var(--t-label); color: var(--fg-faint); background: none;
+                 border: 0; padding: 0; cursor: pointer; }
+  #meta-toggle:hover { color: var(--fg-dim); }
+  /* ── legacy verdict strip (unused) ───────────────────────────────────────────────── */
   #verdict {
     height: 40px;
     display: flex; align-items: center; gap: 12px;
@@ -125,6 +149,17 @@
   #fault.unknown .state { color: var(--fg-faint); }
 
   /* ── section headers ────────────────────────────────────────────────── */
+  /* Nothing in this row may wrap or shrink except the footnote: a two-line section header and a
+     button reading "note" instead of "notes" are both the row running out of width silently. */
+  .sec > * { flex: none; }
+  .sec > .label, .sec .count, .modes, .modes button { white-space: nowrap; }
+  .sec .right { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+  /* The footnote is the only thing here that may be dropped when the row runs out of width;
+     everything else is either the label, a number, or a control. */
+  .sec .count.dim { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #filter { min-width: 0; }
+  .sec .count { white-space: nowrap; }
+  .sec .count.dim { color: var(--fg-faint); letter-spacing: 0; text-transform: none; }
   .sec {
     position: sticky; top: 72px; z-index: 10;
     background: var(--bg);
@@ -176,6 +211,10 @@
   tbody tr.p { height: 32px; cursor: pointer; border-bottom: 1px solid var(--line); }
   tbody tr.p:hover { background: var(--bg-row-hover); }
   tbody tr.p.cursor { background: var(--bg-row-cursor); box-shadow: inset 2px 0 0 var(--accent); }
+  td.mark { width: 20px; text-align: center; }
+  td.mark .yes { color: var(--accent); }
+  td.mark .no { color: var(--fg-dim); }
+  td.mark .faint { color: var(--fg-faint); }
   tbody td { padding: 0 12px; font-size: 12px; white-space: nowrap; }
   td.t { font-family: var(--mono); color: var(--fg-dim); width: 1%; }
   td.t .d { color: var(--fg-faint); }
@@ -207,6 +246,23 @@
   #labels b { font-family: var(--mono); font-weight: 600; color: var(--fg);
               font-variant-numeric: tabular-nums; }
 
+  /* ── 4b. why (retrieval distance bands) ────────────────────────────── */
+  /* Bands, not rows: 120 individual distances do not show a shape, and the reader's question is
+     what shape of distance the retriever accepted. One table per `dist_kind` — never pooled. */
+  #why { padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 12px; }
+  #why .kind { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px;
+               color: var(--fg-dim); }
+  #why .kind b { font-family: var(--mono); font-weight: 600; color: var(--fg);
+                 font-variant-numeric: tabular-nums; }
+  #why .bands { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 10px; }
+  #why .band { min-width: 0; }
+  #why .band .rng { font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+                    font-variant-numeric: tabular-nums; }
+  #why .band .bar { height: 4px; border-radius: 2px; background: var(--accent); margin: 3px 0; }
+  #why .band .bar.zero { background: var(--line); }
+  #why .band .n { font-family: var(--mono); font-size: 11px; color: var(--fg);
+                  font-variant-numeric: tabular-nums; }
+
   /* ── 5. notes ──────────────────────────────────────────────────────── */
   #notes {
     margin-top: 18px; padding: 10px 12px;
@@ -232,23 +288,22 @@
 </head>
 <body>
 
-<div id="scrollaway"><div class="gut"><div id="role">
-  <b>peek</b> — 주입 채널 관측. 최근 프롬프트에 <b>어떤 노트가</b> 들어갔고 어시스턴트가 그걸 되썼는지.
-  읽기 전용이고 127.0.0.1 에서만 뜬다. 프롬프트 원문·회사 출처 노트의 산문·증명 못 하는 거리는 나오지 않는다.
-  판정 줄은 <code>verdict_core</code> 출력 그대로이며 이 페이지의 어떤 조작으로도 바뀌지 않는다.
-</div></div></div>
 <header id="bar"><div class="gut">
-<div id="verdict"><span class="seg" id="verdict-line">reading /api/state …</span></div>
-<div id="meta"></div>
-  </div></header>
-<div class="gut"><div id="fault"></div>
-
+  <div id="hero">
+    <span id="hero-dot"></span><span id="hero-label">reading /api/state …</span>
   </div>
+  <div id="hero-sub"></div>
+  <div id="floors"></div>
+  <div id="fault"></div>
+</div></header>
+<div class="gut"><div id="meta-wrap">
+  <button type="button" id="meta-toggle">detail</button><div id="meta" hidden></div>
+</div></div>
 <div class="wrap">
   <div class="sec">
-    <span>prompt stream</span>
+    <span class="label">prompt stream</span>
     <span class="count" id="stream-count"></span>
-    <span class="spark" id="stream-spark"></span>
+    <span class="count dim" id="stream-foot"></span><span class="spark" id="stream-spark"></span>
     <span class="modes" id="modes">
       <button type="button" data-mode="prompts" class="on">prompts</button
       ><button type="button" data-mode="sessions">sessions</button
@@ -261,20 +316,15 @@
     </span>
   </div>
   <table id="stream">
-    <thead><tr>
-      <th style="width:1%"></th>
-      <th>time</th>
-      <th>session</th>
-      <th class="r">hits</th>
-      <th class="r">controls</th>
-      <th>echoed</th>
-      <th>hit sources</th>
-    </tr></thead>
+    <thead><tr id="head-row"></tr></thead>
     <tbody id="stream-body"></tbody>
   </table>
   <div class="empty" id="stream-empty" hidden></div>
 
-  <div class="sec"><span>labels</span></div>
+  <div class="sec"><span class="label">why these notes</span><span class="count dim" id="why-foot"></span></div>
+  <div id="why"></div>
+
+  <div class="sec"><span class="label">labels</span></div>
   <div id="labels"></div>
 
   <div id="notes"></div>
@@ -330,7 +380,9 @@ function stamp(iso) {
   const p = (n) => String(n).padStart(2, "0");
   return {
     day: p(d.getMonth() + 1) + "-" + p(d.getDate()),
-    clock: p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()),
+    // No seconds. At 32px rows the second changes every row and carries nothing; the full
+    // timestamp lives in the row's title attribute for when it matters.
+    clock: p(d.getHours()) + ":" + p(d.getMinutes()),
     ms: d.getTime(),
   };
 }
@@ -365,34 +417,59 @@ function sparkline(times) {
    unedited. No control on this page recomputes or narrows it: a partial number
    out of an open pre-registered window is what PRD §8 D1 exists to prevent.
    The floors are text. No progress bar toward a floor nobody may top up. */
-function renderVerdict(w) {
-  const strip = $("verdict");
-  strip.textContent = "";
-  const lines = Array.isArray(w && w.line) ? w.line : [];
-  if (!lines.length) {
-    strip.appendChild(el("span", "seg", "verdict line absent from /api/state"));
-  } else {
-    lines.forEach((line, i) => {
-      if (i) strip.appendChild(el("span", "sep", " · "));
-      const isLabel = w && w.label && String(line).indexOf(String(w.label)) !== -1;
-      strip.appendChild(el("span", isLabel ? "seg label" : "seg", line));
-    });
-  }
-  const f = el("span", "floors");
-  const pair = (name, got, need) => {
-    f.appendChild(txt(name + " "));
-    f.appendChild(isInt(got) ? txt(String(got)) : unknown("count absent from window." + (name === "sessions" ? "floor_sessions" : "floor_prompts")));
-    f.appendChild(txt("/"));
-    f.appendChild(isInt(need) ? txt(String(need)) : unknown("floor absent from window." + (name === "sessions" ? "min_sessions" : "min_prompts")));
+function renderVerdict(w, scoring, pace) {
+  // The conclusion, left-aligned and the largest thing on the page. It used to be the rightmost
+  // segment of a seven-part `·` line, which is a page hiding its own answer.
+  const label = (w && w.label) || "—";
+  $("hero-label").textContent = label;
+  const dot = $("hero-dot");
+  const state = label === "작동" ? "ok" : (label === "판정 거부" || label === "비작동") ? "warn" : "";
+  dot.className = state;
+  $("hero-label").className = state;
+
+  // What can be said today, per the contract: the counts are true regardless of the floor; the
+  // verdict is not. "0 of 86 scored" is an observation. "비작동" would be a claim the floor forbids.
+  const sub = $("hero-sub");
+  sub.textContent = "";
+  const det = scoring ? scoring.determined : 0;
+  const ech = scoring ? scoring.echoed : 0;
+  sub.appendChild(txt(
+    "채점된 범위에서 에코 " + ech + "/" + det + " — 무신호이지 무효과 판정이 아니다. "
+  ));
+  const why = el("span", "dim", "표본 하한 미달로 판정 보류 · 창 마감 " + ((w && w.until) || "?"));
+  sub.appendChild(why);
+
+  const box = $("floors");
+  box.textContent = "";
+  const cell = (k, have, floor, extra) => {
+    const d = el("div");
+    d.appendChild(el("span", "k", k + " "));
+    const b = el("b", null, String(have));
+    d.appendChild(b);
+    d.appendChild(txt(" / " + floor));
+    if (extra) d.appendChild(el("span", "k", "  " + extra));
+    return d;
   };
-  pair("sessions", w && w.floor_sessions, w && w.min_sessions);
-  f.appendChild(el("span", "sep", " · "));
-  pair("prompts", w && w.floor_prompts, w && w.min_prompts);
-  f.title = "pre-registered sample floors from verdict_core; not affected by any filter on this page";
-  strip.appendChild(f);
+  if (w) {
+    box.appendChild(cell("세션", w.floor_sessions, w.min_sessions,
+      pace && pace.sessions ? pace.sessions.per_day + "/일" : ""));
+    box.appendChild(cell("주입 프롬프트", w.floor_prompts, w.min_prompts,
+      pace && pace.prompts ? pace.prompts.per_day + "/일" : ""));
+  }
+  if (scoring) {
+    // The hidden risk: the newest rows over-represent sessions that have not ended, so the table
+    // looks busy and permanently pending. Filling the prompt floor buys nothing if this stays low.
+    box.appendChild(cell("채점 확정", scoring.determined, scoring.rows,
+      scoring.pending + " 대기"));
+  }
+  if (pace && !pace.reliable) {
+    const warn = el("div", "k");
+    warn.appendChild(txt("경과 " + pace.elapsed_days + "일 — 이 속도로 전망하지 말 것"));
+    warn.title = "1~2일 위에서 2주를 외삽하면 주말 하나로 결론이 뒤집힌다";
+    box.appendChild(warn);
+  }
 }
 
-/* ── engine + window bounds ───────────────────────────────────────────── */
 function renderMeta(s) {
   const m = $("meta");
   m.textContent = "";
@@ -553,7 +630,31 @@ function bindModes() {
   });
 }
 
+// The header comes out of the same place the body does. It used to be static markup, so
+// switching to `notes` left the columns labelled time/session/hits/controls while the cells held
+// note/injections/sessions/withheld — the header lied and the numbers lined up under the wrong
+// words, which is worse than no header at all.
+const HEADS = {
+  prompts: ["", "time", "session", "", "hit sources"],
+  sessions: ["", "span", "session", "prompts", "notes", "echoed"],
+  notes: ["", "note", "injections", "sessions", "phrases"],
+};
+const RIGHT = { prompts: [], sessions: [3, 4], notes: [2, 3] };
+
+function renderHead(mode) {
+  const tr = $("head-row");
+  tr.textContent = "";
+  (HEADS[mode] || HEADS.prompts).forEach((label, i) => {
+    const th = document.createElement("th");
+    if (!i) th.style.width = "1%";
+    if ((RIGHT[mode] || []).indexOf(i) >= 0) th.className = "r";
+    th.appendChild(txt(label));
+    tr.appendChild(th);
+  });
+}
+
 function paintStream() {
+  renderHead(MODE);
   if (MODE === "prompts") { renderStream(LAST_PROMPTS); return; }
   $("stream").hidden = false;
   $("stream-empty").hidden = true;
@@ -640,9 +741,24 @@ function renderStream(prompts) {
   const body = $("stream-body"), emptyBox = $("stream-empty");
   body.textContent = "";
   ROWS = []; CURSOR = -1;
-  const list = Array.isArray(prompts) ? prompts : [];
+  // Scored rows first. The newest rows are structurally the least scored — sessions run for days
+  // and the ledger ages out after three — so newest-first buries every row that can actually
+  // answer the question under a wall of pending ones.
+  const list = (Array.isArray(prompts) ? prompts.slice() : []).sort((a, b) => {
+    const da = (a && a.echoed !== null && a.echoed !== undefined) ? 0 : 1;
+    const db = (b && b.echoed !== null && b.echoed !== undefined) ? 0 : 1;
+    if (da !== db) return da - db;
+    return stamp(b && b.ts).ms - stamp(a && a.ts).ms;
+  });
 
-  $("stream-count").textContent = list.length ? pageLabel(list.length, "prompt") : "";
+  // `hits` and `controls` were columns holding 3 and 2 on all two hundred rows. A configured
+  // constant repeated per row is a false signal that there is something to read; it belongs in
+  // the header once.
+  $("stream-count").textContent = list.length
+    ? pageLabel(list.length, "prompt")
+    : "";
+  const foot = $("stream-foot");
+  if (foot) foot.textContent = list.length ? "top-3 주입 + 대조 2" : "";
   const spark = $("stream-spark");
   spark.textContent = "";
   if (list.length) spark.appendChild(sparkline(list.map((p) => stamp(p && p.ts).ms)));
@@ -656,7 +772,7 @@ function renderStream(prompts) {
   $("stream").hidden = false;
   emptyBox.hidden = true;
 
-  const COLS = 7;
+  const COLS = 5;
   list.forEach((p) => {
     p = p || {};
     const tr = el("tr", "p");
@@ -678,17 +794,23 @@ function renderStream(prompts) {
     tr.appendChild(s);
 
     const hits = Array.isArray(p.hits) ? p.hits : [];
-    tr.appendChild(el("td", "num r", String(hits.length)));
 
-    const cn = el("td", "num r");
-    cn.appendChild(isInt(p.controls_n) ? txt(String(p.controls_n))
-      : unknown("controls_n absent for this prompt"));
-    tr.appendChild(cn);
-
-    const ec = document.createElement("td");
-    if (p.echoed === true) ec.appendChild(el("span", "yes", "echoed"));
-    else if (p.echoed === false) ec.appendChild(el("span", "no", "not echoed"));
-    else ec.appendChild(unknown("never scored — the session has not ended, so there is no echo outcome either way"));
+    // A glyph, not a word: this column is unknown on most rows, so the rare determined ones have
+    // to be what the eye catches. Filled = echoed, hollow = scored and not echoed, dot = unscored.
+    const ec = el("td", "mark");
+    if (p.echoed === true) {
+      const g = el("span", "yes", "●");
+      g.title = "the assistant echoed an injected note in this session";
+      ec.appendChild(g);
+    } else if (p.echoed === false) {
+      const g = el("span", "no", "○");
+      g.title = "scored: nothing injected in this session was echoed";
+      ec.appendChild(g);
+    } else {
+      const g = el("span", "faint", "·");
+      g.title = "not scored — the session has not ended, so there is no outcome either way";
+      ec.appendChild(g);
+    }
     tr.appendChild(ec);
 
     const srcs = el("td", "srcs");
@@ -755,6 +877,50 @@ function applyFilter() {
   }
 }
 
+/* ── 4b. why ─────────────────────────────────────────────────────────── */
+function renderWhy(w) {
+  const box = $("why");
+  const foot = $("why-foot");
+  box.textContent = "";
+  foot.textContent = "";
+  if (!w || !Array.isArray(w.kinds) || !w.kinds.length) {
+    box.appendChild(unknown("query_log carried no scored search rows — undetermined, not zero"));
+    return;
+  }
+  foot.appendChild(txt("최근 " + w.queries + "개 search 질의의 top-3 회수 거리"));
+
+  w.kinds.forEach((k) => {
+    const head = el("div", "kind");
+    head.appendChild(txt(k.kind + "  "));
+    const nb = el("b"); nb.appendChild(txt("n=" + k.n)); head.appendChild(nb);
+    head.appendChild(txt("  min "));
+    const a = el("b"); a.appendChild(txt(k.min.toFixed(3))); head.appendChild(a);
+    head.appendChild(txt("  median "));
+    const m = el("b"); m.appendChild(txt(k.median.toFixed(3))); head.appendChild(m);
+    head.appendChild(txt("  max "));
+    const z = el("b"); z.appendChild(txt(k.max.toFixed(3))); head.appendChild(z);
+    box.appendChild(head);
+
+    // Scale within this kind only — a shared scale across kinds would imply comparable units.
+    const peak = k.bands.reduce((mx, b) => Math.max(mx, b.n), 0) || 1;
+    const grid = el("div", "bands");
+    k.bands.forEach((b) => {
+      const cell = el("div", "band");
+      const rng = el("div", "rng");
+      rng.appendChild(txt(b.lo.toFixed(2) + "–" + b.hi.toFixed(2)));
+      cell.appendChild(rng);
+      const bar = el("div", "bar" + (b.n ? "" : " zero"));
+      bar.style.width = b.n ? Math.max(6, Math.round((b.n / peak) * 100)) + "%" : "100%";
+      cell.appendChild(bar);
+      const n = el("div", "n");
+      n.appendChild(txt(String(b.n)));
+      cell.appendChild(n);
+      grid.appendChild(cell);
+    });
+    box.appendChild(grid);
+  });
+}
+
 /* ── 4. labels ───────────────────────────────────────────────────────── */
 function renderLabels(l) {
   const box = $("labels");
@@ -769,8 +935,23 @@ function renderLabels(l) {
     box.appendChild(w);
   };
 
+  // The LLM judge shares an embedding family with the retriever it is grading, so the contract
+  // makes its precision unusable until `compared >= min_compared` human labels exist. A number
+  // printed next to the verdict gets read as the verdict, so below the floor the count is shown
+  // and the figure is withheld — the label work is visible, the unusable number is not.
+  const floorMet = isInt(l.compared) && isInt(l.min_compared) && l.compared >= l.min_compared;
   if (!isInt(l.llm_n) || l.llm_n === 0) {
-    seg("llm precision", unknown("no LLM labels in this window, so precision is undefined — not 0.00"));
+    seg("llm labels", unknown("no LLM labels in this window — undefined, not 0"));
+  } else if (!floorMet) {
+    seg("llm labels", txt(String(l.llm_n)));
+    seg(
+      "llm precision",
+      unknown(
+        "withheld: the LLM judge shares the retriever's embedding family, so the contract needs " +
+          (isInt(l.min_compared) ? l.min_compared : "?") + " human comparisons before this figure " +
+          "may be read as a measurement (have " + (isInt(l.compared) ? l.compared : "?") + ")"
+      ),
+    );
   } else if (typeof l.llm_precision === "number" && isFinite(l.llm_precision)) {
     seg("llm precision", txt(l.llm_precision.toFixed(3) + "  (n=" + l.llm_n + ")"));
   } else {
@@ -809,13 +990,14 @@ function renderNotes(notes) {
 
 /* ── load ─────────────────────────────────────────────────────────────── */
 function renderAll(s) {
-  renderVerdict(s.window);
+  renderVerdict(s.window, s.scoring, s.pace);
   renderMeta(s);
   renderFault(s.instrument_fault);
   PAGE = s.page || null;
   LAST_PROMPTS = s.prompts;
   paintStream();
   applyFilter();
+  renderWhy(s.why);
   renderLabels(s.labels);
   renderNotes(s.notes);
   const foot = $("foot");
@@ -865,6 +1047,11 @@ document.addEventListener("keydown", (ev) => {
 $("filter").addEventListener("input", applyFilter);
 $("help-hint").addEventListener("click", () => $("help").classList.toggle("open"));
 bindModes();
+$("meta-toggle").addEventListener("click", () => {
+  const m = $("meta");
+  m.hidden = !m.hidden;
+  $("meta-toggle").textContent = m.hidden ? "detail" : "hide detail";
+});
 $("stop").addEventListener("click", async () => {
   const b = $("stop");
   b.disabled = true; b.textContent = "stopping…";

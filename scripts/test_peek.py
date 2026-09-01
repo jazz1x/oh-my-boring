@@ -86,6 +86,36 @@ class PayloadShape(unittest.TestCase):
         self.assertNotIn("회사 노트 산문", json.dumps(rows, ensure_ascii=False))
 
 
+class WhyBlock(unittest.TestCase):
+    def test_query_log_text_never_reaches_the_payload(self):
+        """`why` reads `query_log`, whose rows carry the raw query AND the raw answer snippet.
+
+        Only distances and `dist_kind` may cross — the same rule as the prompt rows, on a second
+        source that happens to hold the same secrets.
+        """
+        rows = [
+            {
+                "id": 7,
+                "endpoint": "search",
+                "created_at": "2026-09-01T00:00:00Z",
+                "query": "회사 내부 배포 절차 알려줘",
+                "answer_snippet": "사내 파이프라인은 …",
+                "hit_paths": ["/vault/wiki/wiki-0001.md"],
+                "hit_dists": [0.42],
+                "hit_dist_kinds": ["vector_cosine"],
+            }
+        ]
+        blob = json.dumps(peek.why_block(rows), ensure_ascii=False)
+        self.assertNotIn("내부 배포", blob, "the raw query leaked into the why block")
+        self.assertNotIn("사내 파이프라인", blob, "the raw answer snippet leaked into the why block")
+        self.assertIn("vector_cosine", blob, "the band summary must still carry dist_kind")
+
+    def test_a_non_search_endpoint_is_not_counted(self):
+        """`/ask` and `/brief` log their own retrievals; pooling them would mix populations."""
+        rows = [{"endpoint": "ask", "hit_dists": [0.1], "hit_dist_kinds": ["vector_cosine"]}]
+        self.assertIsNone(peek.why_block(rows))
+
+
 class BindAddress(unittest.TestCase):
     def test_the_bind_address_is_loopback_and_there_is_no_flag_to_change_it(self):
         """The loopback bind is the whole access control; nothing may hand it away.

@@ -87,6 +87,7 @@ _ENGINE_URL = (os.environ.get("BORING_URL") or "http://127.0.0.1:7700").rstrip("
 
 #: 127.0.0.1 and nothing else. There is no auth anywhere in this system, so the loopback bind IS
 #: the access control; a --host flag would be an invitation to hand that away.
+WHY_QUERIES = 40  # how many recent `search` rows the distance-band summary reads
 BIND_HOST = "127.0.0.1"
 DEFAULT_PORT = 7788
 
@@ -528,6 +529,126 @@ def labels_block(stats):
     return block
 
 
+
+# --------------------------------------------------------------------------- scoring / pace
+
+
+def scoring_block(prompt_rows_out):
+    """How much of what is on screen has actually been scored.
+
+    The hidden risk this exists to surface: `echoed` is only known when a session ENDS, sessions
+    here run for days, and the ledger ages out after three. So the newest rows structurally
+    over-represent sessions that have not been scored yet — the table looks busy and permanently
+    pending, and whether scoring happens at all never shows. Filling the 200-prompt floor buys
+    nothing if the scored share stays near zero.
+    """
+    total = len(prompt_rows_out)
+    determined = sum(1 for r in prompt_rows_out if r.get("echoed") is not None)
+    echoed = sum(1 for r in prompt_rows_out if r.get("echoed") is True)
+    return {
+        "rows": total,
+        "determined": determined,
+        "echoed": echoed,
+        "pending": total - determined,
+    }
+
+
+def pace_block(window, now=None):
+    """Pure measurement logistics: at this rate, does the sample reach its floor by the close?
+
+    NOT evidence about the channel. It says whether there will be anything to judge, which is a
+    different question from whether the thing works, and it breaks the moment traffic changes.
+    """
+    try:
+        start = datetime.fromisoformat(WINDOW_SINCE + "T00:00:00+00:00")
+        end = datetime.fromisoformat(WINDOW_UNTIL + "T23:59:59+00:00")
+    except ValueError:
+        return None
+    now = now or datetime.now(timezone.utc)
+    elapsed = max((now - start).total_seconds() / 86400.0, 0.25)
+    span = max((end - start).total_seconds() / 86400.0, 1.0)
+    # A linear projection over a day and a half is arithmetic, not a forecast. This exact error
+    # has already been made in this project once — a weekend's session count extrapolated into a
+    # verdict about the whole window — so the flag travels with the number.
+    out = {
+        "elapsed_days": round(elapsed, 1),
+        "window_days": round(span, 1),
+        "reliable": elapsed >= 3.0,
+    }
+    for key, have, floor in (
+        ("prompts", window["floor_prompts"], window["min_prompts"]),
+        ("sessions", window["floor_sessions"], window["min_sessions"]),
+    ):
+        per_day = have / elapsed
+        out[key] = {
+            "have": have,
+            "floor": floor,
+            "per_day": round(per_day, 1),
+            "projected": int(per_day * span),
+            "reaches_floor": int(per_day * span) >= floor,
+        }
+    return out
+
+
+def why_block(entries):
+    """Why these notes came back — the retriever's own numbers, not a guess.
+
+    The ledger records no distance and no query_log id, so a prompt row cannot honestly carry one
+    (a basename-and-timestamp match asserts an identity the data does not support). `query_log` is
+    the engine's own record of the same retrieval, so it is read as its own view instead of
+    stitched onto rows. The query TEXT is not carried: it is the raw prompt.
+
+    Summarised as distance BANDS rather than a row list. A reader asking "why this note" wants the
+    shape of the distances the retriever accepted, and 120 individual numbers do not show a shape.
+    Bands are per `dist_kind`, never pooled: `vector_cosine` and `ts_rank` are different scales, so
+    a single band table across both would compare numbers that mean different things.
+    """
+    if not isinstance(entries, list):
+        return None
+    by_kind = {}
+    queries = 0
+    for row in entries:
+        if row.get("endpoint") != "search":
+            continue
+        dists = row.get("hit_dists") or []
+        kinds = row.get("hit_dist_kinds") or []
+        took = False
+        for i, raw in enumerate(dists[:3]):
+            try:
+                d = float(raw)
+            except (TypeError, ValueError):
+                continue
+            kind = kinds[i] if i < len(kinds) else None
+            by_kind.setdefault(kind or "unknown", []).append(d)
+            took = True
+        if took:
+            queries += 1
+        if queries >= WHY_QUERIES:
+            break
+    if not by_kind:
+        return None
+
+    out = []
+    for kind, values in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
+        values.sort()
+        edges = [0.0, 0.30, 0.40, 0.45, 0.50, 0.55, 1.0]
+        bands = []
+        for lo, hi in zip(edges, edges[1:]):
+            n = sum(1 for v in values if lo <= v < hi)
+            bands.append({"lo": lo, "hi": hi, "n": n})
+        out.append(
+            {
+                "kind": kind,
+                "n": len(values),
+                "min": round(values[0], 3),
+                "median": round(values[len(values) // 2], 3),
+                "max": round(values[-1], 3),
+                "bands": bands,
+            }
+        )
+    return {"queries": queries, "kinds": out}
+
+
 # --------------------------------------------------------------------------- state
 
 
@@ -571,8 +692,9 @@ def build_state():
     )
     notes.append(
         "prompt 행에는 거리(dist)가 없다. 원장에 query_log id 가 없어서 basename 과 시간창으로"
-        " 이어붙이는 수밖에 없고, 그것은 증명할 수 없는 동일성 주장이다 — '왜'를 보는 화면에서는"
-        " 특히 쓰면 안 된다."
+        " 이어붙이는 수밖에 없고, 그것은 증명할 수 없는 동일성 주장이다. 그래서 거리는 행에"
+        " 붙이지 않고 'why these notes' 에서 query_log 자신의 뷰로 따로 읽는다 — 같은 회수의"
+        " 기록이지만 어느 프롬프트의 것인지는 주장하지 않는다."
     )
     notes.append(
         "프롬프트 원문은 이 응답에 없다 — 원장이 함께 보관하는 사용자 발화 토큰 필드도 같이"
@@ -591,13 +713,26 @@ def build_state():
                 " 그대로지만 표본 하한(주입 프롬프트 수)이 부풀어 보인다."
             )
 
+    prompts_out = prompt_rows(ledger, echoes, notes, page)
+    # The engine's own record of the same retrievals. Read as its own view, never joined onto a
+    # prompt row — the ledger holds no query_log id and matching by basename would assert an
+    # identity the data cannot support.
+    qlog = (_get_json("/query-log?limit=200") or {}).get("entries")
+    if qlog is None:
+        notes.append(
+            "query_log 을 못 읽어 '왜 뽑혔나'(거리) 패널이 비었다 — 거리가 0 이라는 뜻이 아니다."
+        )
+    window = window_block(rows, notes)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "engine": engine_block(health),
-        "window": window_block(rows, notes),
+        "window": window,
         "instrument_fault": instrument_fault(rows),
-        "prompts": prompt_rows(ledger, echoes, notes, page),
+        "prompts": prompts_out,
         "labels": labels_block(_get_json("/recall-label-stats")),
+        "scoring": scoring_block(prompts_out),
+        "pace": pace_block(window),
+        "why": why_block(qlog),
         "page": page,
         "notes": notes,
     }
