@@ -105,6 +105,18 @@ case "${1:-}" in
         done
         exit 0
     fi
+    # doctor asks the installer whether any hook of ours is registered more than once — read from
+    # the agent configs, not from ledger damage, so an adapter that is wired twice but never runs
+    # is still caught.
+    if [ "${2:-}" = --check-registrations ]; then
+        if [ "${DOCTOR_DUPLICATE_HOOKS:-0}" = 1 ]; then
+            echo "hook_registered_twice agent=kimi count=2 script=/x/agents/kimi/recall.py" >&2
+            echo "hook_registrations checked_configs=2 duplicates=1"
+            exit 1
+        fi
+        echo "hook_registrations checked_configs=2 duplicates=0"
+        exit 0
+    fi
     echo "fake python3: unmodelled agent_wiring call: $*" >&2
     exit 7
     ;;
@@ -582,6 +594,22 @@ esac
 # (d5c) One prompt recorded twice means the recall hook fired twice. The uptake rate cannot see
 # it — both halves of the fraction double — so the ledger is the only place it shows, and it
 # quietly halves the evidence behind a pre-registered sample floor (docs/PRD.md §2).
+# A hook registered twice fires twice, which halves the evidence behind a pre-registered floor
+# while leaving every rate looking normal — so it fails readiness rather than warning.
+( make_case "$TMP/dup-hooks" yes
+  if DOCTOR_DUPLICATE_HOOKS=1 run_strict "$TMP/dup-hooks" "$TMP/dup-hooks.out"; then
+      cat "$TMP/dup-hooks.out"
+      echo "FAIL: a hook registered twice must fail strict doctor" >&2
+      exit 1
+  fi
+  grep -q "HOOK REGISTERED TWICE" "$TMP/dup-hooks.out" || {
+      cat "$TMP/dup-hooks.out"
+      echo "FAIL: the duplicate registration must be named" >&2
+      exit 1
+  }
+  echo "ok - a hook registered twice fails readiness"
+)
+
 # A blind uptake detector has to fail readiness, not warn: the window closes on a verdict, and a
 # verdict read off a scorer that sees nothing is worse than no verdict at all.
 ( make_case "$TMP/uptake-blind" yes

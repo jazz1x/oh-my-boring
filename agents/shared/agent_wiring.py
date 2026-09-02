@@ -1133,6 +1133,89 @@ def install(enabled_agents, server_name, server_config, boring_home: str | None 
     return results, failed
 
 
+#: Where a hook of ours can be registered. The ledger check `doctor (d5c)` finds a hook that
+#: fired twice, which means it only speaks after the duplicate has already written rows — and it
+#: is silent forever for an adapter that is registered twice but never runs. Kimi was in exactly
+#: that state on 2026-09-02: two spellings of both hooks, no ledger evidence at all, because kimi
+#: had produced no sessions. Reading the configs catches it before there is anything to clean up.
+_REGISTRATION_FILES = (
+    ("claude-code", "~/.claude/settings.json"),
+    ("kimi", "~/.kimi-code/config.toml"),
+)
+
+
+def _registered_commands(path: Path):
+    """Every hook command string in a config, whatever its format."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    if path.suffix == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return []
+        out = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("command"), str):
+                    out.append(node["command"])
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(data)
+        return out
+    return [
+        line.split("=", 1)[-1].strip().strip("\"'")
+        for line in text.splitlines()
+        if line.strip().startswith("command")
+    ]
+
+
+def _report_duplicate_registrations():
+    home = Path(BORING_HOME).resolve()
+    duplicates = 0
+    checked = 0
+    for agent_id, spelling in _REGISTRATION_FILES:
+        path = Path(os.path.expanduser(spelling))
+        if not path.exists():
+            continue
+        checked += 1
+        counts = {}
+        for command in _registered_commands(path):
+            for script in _hook_scripts(command):
+                # Only hooks that live in this checkout are ours to count. Somebody else's tool
+                # registered twice is their business, and a checker that reports it teaches the
+                # reader to skim past the ones that matter.
+                #
+                # Absolute and existing, both required. The token scanner also picks up fragments
+                # of shell-quoted commands (`"${HOME-}/.orca/...`), and a relative fragment
+                # resolves against the current directory — which is this checkout when doctor runs
+                # here, so every such fragment reported itself as our hook registered a dozen
+                # times. A path that is not absolute is not a hook path.
+                candidate = Path(script)
+                if not candidate.is_absolute() or not candidate.exists():
+                    continue
+                try:
+                    candidate.resolve().relative_to(home)
+                except ValueError:
+                    continue
+                counts[script] = counts.get(script, 0) + 1
+        for script, count in sorted(counts.items()):
+            if count > 1:
+                duplicates += 1
+                print(
+                    f"hook_registered_twice agent={agent_id} count={count} script={script}",
+                    file=sys.stderr,
+                )
+    print(f"hook_registrations checked_configs={checked} duplicates={duplicates}")
+    return 1 if duplicates else 0
+
+
 def main():
     global BORING_HOME
     parser = argparse.ArgumentParser(
@@ -1145,6 +1228,11 @@ def main():
         "--list-hermes-scripts",
         action="store_true",
         help="Print every file this installer copies into ~/.hermes/scripts, one path per line",
+    )
+    parser.add_argument(
+        "--check-registrations",
+        action="store_true",
+        help="Report hooks of ours registered more than once across every agent config",
     )
     parser.add_argument("--server-name", default="ohmyboring")
     parser.add_argument("--server-url", default="http://localhost:7700/mcp")
@@ -1169,6 +1257,9 @@ def main():
             print(path)
         return 0
 
+    if args.check_registrations:
+        return _report_duplicate_registrations()
+
     cfg = boring_config.load()
     enabled = [a["id"] for a in cfg.get("agents", []) if a.get("enabled", True)]
 
@@ -1185,4 +1276,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # The return value is the point for the check modes: doctor reads the exit status, and a
+    # checker whose failures exit 0 is a checker nobody has to fix.
+    sys.exit(main() or 0)
