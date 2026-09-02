@@ -89,16 +89,30 @@ class WhatCounts(unittest.TestCase):
 
 
 class VaultSearch(unittest.TestCase):
-    def test_the_vault_search_ignores_gitignore(self):
-        """Ripgrep honours `.gitignore` when walking a directory, and this repo ignores the vault.
+    def test_a_vault_it_cannot_read_raises_instead_of_answering_zero(self):
+        """The failure that this whole script measures, sitting in the script itself.
 
-        Without `--no-ignore` the traversal returns nothing and coverage reads as a clean 0% — the
-        exact reading produced and nearly believed on 2026-09-02.
+        The first version shelled out to `rg` and swallowed `OSError` into a count of 0 — so on a
+        machine without ripgrep (the CI runner, as it turns out) every file reported "no note
+        mentions this" and the coverage read as a clean 0%. An unreadable vault has to be
+        distinguishable from an empty one.
+        """
+        import tempfile
+
+        saved = shadow.VAULT
+        try:
+            shadow.VAULT = Path(tempfile.gettempdir()) / "definitely-not-a-vault-xyzzy"
+            with self.assertRaises(FileNotFoundError):
+                shadow.vault_mentions(["anything"])
+        finally:
+            shadow.VAULT = saved
+
+    def test_it_reads_notes_the_repo_gitignores(self):
+        """`.gitignore` carries `vault/wiki/*`; a tool that honours it returns nothing here.
 
         Hermetic on purpose. An earlier version asserted against the repo's own vault and passed
-        locally while failing in CI, where the checkout carries only the committed notes and the
-        file the glob happened to pick was not ignored at all. A test whose subject depends on
-        which files exist is testing the environment.
+        locally while failing in CI, where the checkout carries only the committed notes — a test
+        whose subject depends on which files happen to exist is testing the environment.
         """
         import subprocess
         import tempfile

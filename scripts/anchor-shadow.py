@@ -19,7 +19,6 @@ import collections
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -73,26 +72,32 @@ def edits(paths):
 
 
 def vault_mentions(basenames):
-    """Notes naming each file. `--no-ignore` is not optional here.
+    """Notes naming each file, counted by reading the vault directly.
 
-    `.gitignore` carries `vault/wiki/*`, and ripgrep honours it when walking a directory — so the
-    default traversal returns nothing and the coverage reads as a clean 0%. That exact reading was
-    produced and nearly believed on 2026-09-02.
+    Not `rg`. Two reasons, and the second is the one that matters:
+
+    - It is not installed on the CI runner, so the check silently reported zero everywhere.
+    - **A missing tool returned 0, which reads exactly like "no note mentions this file."** That is
+      the defect this whole measurement exists to avoid — absence rendered as a measurement — and
+      it was sitting in the code that measures it. Reading the files has no such failure: a
+      directory that cannot be read raises rather than answers.
+
+    (`rg` would also need `--no-ignore` here, since `.gitignore` carries `vault/wiki/*` and
+    ripgrep honours it when walking a directory. Reading the files sidesteps that too.)
     """
-    out = {}
-    for name in basenames:
+    counts = dict.fromkeys(basenames, 0)
+    if not VAULT.is_dir():
+        raise FileNotFoundError(f"vault not readable: {VAULT}")
+    wanted = [n for n in basenames if n]
+    for note in VAULT.glob("*.md"):
         try:
-            found = subprocess.run(
-                ["rg", "--no-ignore", "-l", "--fixed-strings", name, str(VAULT)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            out[name] = 0
+            body = note.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
-        out[name] = len(found.stdout.strip().splitlines()) if found.stdout.strip() else 0
-    return out
+        for name in wanted:
+            if name in body:
+                counts[name] += 1
+    return counts
 
 
 def main(argv=None):
