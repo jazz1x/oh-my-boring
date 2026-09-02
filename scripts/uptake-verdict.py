@@ -137,6 +137,25 @@ def main(argv=None):
             " (0 으로 세면 우연율이 0 인 것처럼 읽힌다)",
             file=note,
         )
+    # Ahead of the "no sample" early return on purpose. That branch answers the human question
+    # ("is anything accruing?") with exit 1, and routing the gate through it made
+    # MIDPOINT_UNREADABLE unreachable from the CLI — the function returned 4 and the command
+    # returned 1, so the four-way distinction existed only in a unit test that called the function
+    # directly. It also broke the out-of-window silence: before 09-08, an empty post-repair bucket
+    # exited 1 and doctor warned every day about a gate that is not due.
+    if args.midpoint:
+        if args.json:
+            print(
+                "[uptake-verdict] --midpoint 와 --json 은 함께 못 쓴다 —"
+                " 전자는 종료코드로, 후자는 페이로드로 답한다",
+                file=sys.stderr,
+            )
+            return 2
+        # `BORING_TODAY` exists so the gate can be exercised through the CLI on a date other
+        # than today. A unit test that calls `_midpoint` directly cannot see the wiring, and the
+        # wiring is exactly where this gate was broken.
+        return _midpoint(per_agent, skipped_old, today=os.environ.get("BORING_TODAY"))
+
     if not per_agent:
         # §2 turns "0 events" into an instrumentation investigation, but the clause it registers
         # is "세션 종료가 있는데 ... 0건" — sessions ended and nothing was recorded. Rows that were
@@ -174,19 +193,6 @@ def main(argv=None):
             " — 종료되지 않고 사라진 세션. 판정에 합산하지 않는다(결과가 없으므로)",
             file=note,
         )
-
-    if args.midpoint:
-        # `--json` asks for a payload and `--midpoint` answers with an exit code. Silently
-        # dropping one of them hands the caller a result they did not ask for, which is how a
-        # machine consumer ends up parsing nothing and reading it as empty.
-        if args.json:
-            print(
-                "[uptake-verdict] --midpoint 와 --json 은 함께 못 쓴다 —"
-                " 전자는 종료코드로, 후자는 페이로드로 답한다",
-                file=sys.stderr,
-            )
-            return 2
-        return _midpoint(per_agent, skipped_old)
 
     if args.json:
         payload = {

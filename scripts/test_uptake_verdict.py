@@ -99,62 +99,62 @@ class JsonMode(unittest.TestCase):
 
 
 class Midpoint(unittest.TestCase):
-    """PRD §2's one-time progress gate. Four different absences must not all read as a shortfall."""
+    """PRD §2's one-time progress gate, exercised THROUGH THE CLI.
 
-    def _gate(self, per_agent, today, skipped=0):
+    An earlier version of these called `uv._midpoint()` directly and passed while the command
+    returned something else entirely: `main()` hit its "no sample" early return first, so
+    MIDPOINT_UNREADABLE was unreachable and the out-of-window silence was broken — before 09-08 an
+    empty bucket exited 1 and doctor would have warned daily about a gate that is not due. The
+    function was right and the wiring was wrong, which is the only place this gate can be wrong.
+    """
+
+    def _cli(self, rows, today, argv=("--midpoint",), url_ok=True):
         err = io.StringIO()
-        with redirect_stderr(err):
-            code = uv._midpoint(per_agent, skipped, today=today)
+        fetch = (lambda *a, **k: rows) if url_ok else (lambda *a, **k: None)
+        with mock.patch.object(uv, "fetch_events", fetch):
+            with mock.patch.dict(os.environ, {"BORING_TODAY": today}):
+                with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    code = uv.main(list(argv))
         return code, err.getvalue()
 
+    def _events(self, per_session):
+        return [_event(f"s{i}", 0, 10) for i in range(per_session)]
+
     def test_it_is_silent_outside_its_own_window(self):
-        """Before the midpoint it is not due; after the close it is spent.
-
-        A gate that keeps firing past the window makes a red doctor the background colour, and a
-        signal nobody reads is worse than no signal — the extension changes no threshold, so there
-        is nothing for it to gate.
-        """
-        thin = {"claude-code": {"sessions": 1}}
-        self.assertEqual(self._gate(thin, "2026-09-02")[0], uv.MIDPOINT_NOT_DUE)
-        self.assertEqual(self._gate(thin, "2026-09-20")[0], uv.MIDPOINT_NOT_DUE)
-        self.assertEqual(self._gate(thin, "2026-09-08")[0], uv.MIDPOINT_SHORT)
-
-    def test_the_floor_is_per_adapter(self):
-        """Summing adapters would clear a gate neither of them clears.
-
-        Eight Claude Code sessions plus three from Kimi is eleven, and the floor is ten — but the
-        adapters run different products (§3 M8), which is why MIN_SESSIONS is per-agent too.
-        """
-        code, out = self._gate(
-            {"claude-code": {"sessions": 8}, "kimi": {"sessions": 3}}, "2026-09-08"
-        )
-        self.assertEqual(code, uv.MIDPOINT_SHORT, out)
-        self.assertIn("claude-code 8", out)
-        self.assertIn("kimi 3", out)
+        """Before the midpoint it is not due; after the close it is spent — and an empty sample
+        must not turn either into noise."""
+        thin = self._events(1)
+        self.assertEqual(self._cli(thin, "2026-09-02")[0], uv.MIDPOINT_NOT_DUE)
+        self.assertEqual(self._cli(thin, "2026-09-20")[0], uv.MIDPOINT_NOT_DUE)
+        self.assertEqual(self._cli([], "2026-09-02")[0], uv.MIDPOINT_NOT_DUE)
+        self.assertEqual(self._cli(thin, "2026-09-08")[0], uv.MIDPOINT_SHORT)
 
     def test_nothing_to_read_is_not_a_shortfall(self):
-        """No events, and only pre-counter events, are failures of observation, not of sample.
-
-        Both would count as zero sessions. Calling them a shortfall points whoever reads it at the
-        wrong repair — the sample is not behind, the instrument is not answering.
-        """
-        self.assertEqual(self._gate({}, "2026-09-08")[0], uv.MIDPOINT_UNREADABLE)
-        code, out = self._gate({}, "2026-09-08", skipped=9)
-        self.assertEqual(code, uv.MIDPOINT_UNREADABLE)
+        """No events at all is a failure of observation, not of sample — and it must survive the
+        trip through `main()`, which is where it did not."""
+        code, out = self._cli([], "2026-09-08")
+        self.assertEqual(code, uv.MIDPOINT_UNREADABLE, out)
         self.assertIn("관측 불가", out)
 
-    def test_json_and_midpoint_refuse_each_other(self):
-        """One answers with a payload, the other with an exit code; dropping either is silent.
-
-        A caller that asked for JSON and got an exit code parses nothing and reads it as empty —
-        the absence-as-measurement failure, arriving through an argument parser this time.
-        """
-        err = io.StringIO()
-        with mock.patch.object(uv, "fetch_events", return_value=[_event("a", 0, 10)]):
-            with redirect_stdout(io.StringIO()), redirect_stderr(err):
-                code = uv.main(["--json", "--midpoint"])
+    def test_an_unreachable_engine_never_reads_as_a_shortfall(self):
+        code, _ = self._cli([], "2026-09-08", url_ok=False)
         self.assertEqual(code, 2)
-        self.assertIn("함께 못 쓴다", err.getvalue())
+
+    def test_the_floor_is_per_adapter(self):
+        """Summing adapters would clear a gate neither of them clears."""
+        rows = [_event("a", 0, 10) for _ in range(8)]
+        rows += [dict(_event("k", 0, 10), attributes={**_event("k", 0, 10)["attributes"],
+                                                      "agent": "kimi"}) for _ in range(3)]
+        code, out = self._cli(rows, "2026-09-08")
+        self.assertEqual(code, uv.MIDPOINT_SHORT, out)
+        self.assertIn("claude-code", out)
+        self.assertIn("kimi", out)
+
+    def test_json_and_midpoint_refuse_each_other(self):
+        """One answers with a payload, the other with an exit code; dropping either is silent."""
+        code, out = self._cli(self._events(1), "2026-09-08", argv=("--json", "--midpoint"))
+        self.assertEqual(code, 2)
+        self.assertIn("함께 못 쓴다", out)
 
     def test_the_dates_are_not_spelled_here(self):
         """The gate reads `verdict_core`, which the PRD-transcription test covers."""
