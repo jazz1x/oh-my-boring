@@ -970,7 +970,11 @@ function renderWhy(w) {
     box.appendChild(unknown("query_log carried no scored search rows — undetermined, not zero"));
     return;
   }
-  foot.textContent = "최근 " + w.queries + "개 질의";
+  // The sample size sits inline, not in a `title`. This block was read as a statement about the
+  // whole corpus and quoted that way — "no hit under 0.30" is true of these 40 queries and false
+  // of the log, which holds 137 of them. A population you have to hover to see is one you will
+  // forget you narrowed.
+  foot.textContent = "최근 " + w.queries + "개 질의만 · 전체 로그 아님";
   foot.title = "최근 " + w.queries + "개 search 질의의 top-3 회수 거리 — dist_kind 별로 분리";
 
   w.kinds.forEach((k) => {
@@ -1021,10 +1025,12 @@ function renderLabels(l) {
     box.appendChild(w);
   };
 
-  // The LLM judge shares an embedding family with the retriever it is grading, so the contract
-  // makes its precision unusable until `compared >= min_compared` human labels exist. A number
-  // printed next to the verdict gets read as the verdict, so below the floor the count is shown
-  // and the figure is withheld — the label work is visible, the unusable number is not.
+  // Nobody has checked this judge, and a judge cannot establish its own accuracy — so the
+  // contract makes its precision unusable until `compared >= min_compared` reference labels
+  // exist. (An earlier version of this comment said the judge shares the retriever's embedding
+  // family; it does not — `bge-m3` embeds, `gemma4:12b` judges. The claim was wrong and had
+  // spread to three files.) A number printed next to the verdict gets read as the verdict, so
+  // below the floor the count is shown and the figure is withheld.
   const floorMet = isInt(l.compared) && isInt(l.min_compared) && l.compared >= l.min_compared;
   if (!isInt(l.llm_n) || l.llm_n === 0) {
     seg("llm labels", unknown("no LLM labels in this window — undefined, not 0"));
@@ -1033,7 +1039,7 @@ function renderLabels(l) {
     seg(
       "llm precision",
       unknown(
-        "withheld: the LLM judge shares the retriever's embedding family, so the contract needs " +
+        "withheld: nobody has checked this judge, and it cannot check itself — the contract needs " +
           (isInt(l.min_compared) ? l.min_compared : "?") + " human comparisons before this figure " +
           "may be read as a measurement (have " + (isInt(l.compared) ? l.compared : "?") + ")"
       ),

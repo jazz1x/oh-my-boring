@@ -25,7 +25,15 @@ VERDICTS = (VERDICT_RELEVANT, VERDICT_IRRELEVANT, VERDICT_UNSURE)
 #: returns None instead, and callers must print the sample size rather than a percentage.
 MIN_DECIDED = 30
 #: Same rule for llm/human agreement: an agreement rate over a handful of pairs cannot clear an
-#: LLM judge that shares the system's embedding family.
+#: unverified judge.
+#:
+#: The reason is NOT that the judge shares the retriever's embedding family — measured 2026-09-02,
+#: the retriever embeds with `bge-m3` and the judge is `gemma4:12b`, different lineages. That
+#: sentence was wrong and had been copied into three other files. The real reason is plainer and
+#: survives the correction: nobody has ever checked whether this judge is any good, and a judge
+#: cannot establish its own accuracy. What the floor buys is an independent reference, and the
+#: construct being measured — "would a person reading this have been helped" — makes a person the
+#: reference by definition rather than by preference.
 MIN_COMPARED = 20
 
 
