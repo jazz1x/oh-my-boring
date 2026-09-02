@@ -514,6 +514,21 @@ if [ -f "$ledger_probe" ] && [ "${BORING_SKIP_LEDGER_PROBE:-0}" != 1 ]; then
     fi
 fi
 
+wiring="$BORING_HOME/agents/shared/agent_wiring.py"
+# (d5e) The same hook registered twice, read from the configs rather than from the damage.
+# (d5c) below finds a hook that FIRED twice, which means it only speaks after the duplicate has
+# written rows, and it stays silent forever for an adapter registered twice that never runs. Kimi
+# was in exactly that state on 2026-09-02 — both hooks under two spellings of the same path, and
+# no ledger evidence at all because kimi had produced no sessions.
+if [ -f "$wiring" ]; then
+    if reg_out="$(python3 "$wiring" --check-registrations --boring-home "$BORING_HOME" 2>&1)"; then
+        ok "no hook of ours is registered twice (${reg_out##*checked_configs=})"
+    else
+        bad "HOOK REGISTERED TWICE — $reg_out. Every prompt fires it twice, which leaves the rate unchanged and halves the evidence behind the sample floor (PRD §2)."
+        failed_hooks=1
+    fi
+fi
+
 # (d5d) Can the uptake detector see a use it is handed on a plate? Treatment and control both
 # sitting at zero is equally the signature of a channel nobody used and of a scorer that sees
 # nothing, and the rates cannot separate them — so docs/PRD.md §2 refuses a "not working" reading
@@ -539,7 +554,6 @@ fi
 # gate was green the whole time. The installer owns the list of files it writes, so ask it
 # instead of keeping a second list here that can fall behind exactly the same way.
 hermes_scripts_dir="$HOME/.hermes/scripts"
-wiring="$BORING_HOME/agents/shared/agent_wiring.py"
 if [ -d "$hermes_scripts_dir" ] && [ -f "$wiring" ]; then
     script_list="$(mktemp)"
     if python3 "$wiring" --list-hermes-scripts --boring-home "$BORING_HOME" >"$script_list" 2>/dev/null; then
