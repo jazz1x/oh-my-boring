@@ -73,7 +73,17 @@ def phrases(snippet, size=PHRASE_WORDS, limit=MAX_PHRASES):
 #: forever: nothing prunes what nothing measures. Those rows are also a selection bias — the
 #: sessions that report are the ones that ended cleanly — so they are dropped by age rather than
 #: silently counted later against a transcript that no longer exists.
-LEDGER_MAX_AGE_DAYS = 3
+#:
+#: The bound has to exceed how long a session actually lives, or it stops being a guard against
+#: never-ending sessions and becomes a guard against LONG ones. At 3 days it was the latter:
+#: measured 2026-09-02, the live ledger held 22 sessions with a median span of 48h and a max of
+#: 177h, 10 of them past 72h, and those 10 held 875 of 1125 rows (78%). `log_uptake_event` returns
+#: silently when a session has no rows, so those sessions were scored as nothing at all — 93
+#: sessions distilled inside the measurement window, 11 with an uptake row. The exclusion is not
+#: random: long sessions receive the most injections and carry the most opportunity for uptake, so
+#: the sample kept exactly the sessions least likely to show a signal. 14 days clears the observed
+#: maximum with margin and still bounds the file (~2k rows). See docs/PRD.md §8 D4.
+LEDGER_MAX_AGE_DAYS = 14
 
 
 def _fingerprints(hits, limit):

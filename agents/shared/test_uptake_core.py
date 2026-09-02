@@ -105,12 +105,16 @@ def test_a_long_running_session_does_not_lose_its_early_rows():
     with tempfile.TemporaryDirectory() as d:
         path = str(Path(d) / "injections.jsonl")
         now = _time.time()
+        # Expressed against the constant, not a literal: this test pinned "5 days is old" and
+        # broke the moment the cutoff moved off 3, which is the wrong thing to notice about a
+        # change to the cutoff.
+        stale = now - (uptake_core.LEDGER_MAX_AGE_DAYS + 2) * 86400
         early = uptake_core.injection_record("long", "p", [_hit()], 3)
-        early["ts"] = now - 5 * 86400            # older than the cutoff …
+        early["ts"] = stale                       # older than the cutoff …
         recent = uptake_core.injection_record("long", "p", [_hit()], 3)
         recent["ts"] = now                        # … but the session is still alive
         dead = uptake_core.injection_record("dead", "p", [_hit()], 3)
-        dead["ts"] = now - 5 * 86400
+        dead["ts"] = stale
         Path(path).write_text(
             "\n".join(_json.dumps(r, ensure_ascii=False) for r in (early, recent, dead)) + "\n",
             encoding="utf-8",
@@ -244,7 +248,7 @@ def test_abandoned_sessions_are_pruned_by_age():
     with tempfile.TemporaryDirectory() as d:
         path = str(Path(d) / "injections.jsonl")
         old = uptake_core.injection_record("dead", "p", [_hit()], 3)
-        old["ts"] = _time.time() - 10 * 86400
+        old["ts"] = _time.time() - (uptake_core.LEDGER_MAX_AGE_DAYS + 7) * 86400
         Path(path).write_text(_json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
         uptake_core.append_record(uptake_core.injection_record("fresh", "p", [_hit()], 3), path)
 
@@ -327,6 +331,44 @@ def test_a_repeat_outside_the_window_is_a_real_repeat():
 
 def test_a_missing_ledger_is_not_a_duplicate_report():
     assert uptake_core.duplicate_injections("/nonexistent/injections.jsonl") == (0, 0, 0)
+
+
+#: The longest session span measured in the live ledger on 2026-09-02 was 177h (7.4 days), with a
+#: median of 48h. A cutoff below that stops guarding against sessions that never end and starts
+#: discarding the ones that run longest — which are also the ones carrying the most injections.
+OBSERVED_MAX_SESSION_DAYS = 7.4
+
+
+def test_the_cutoff_outlives_the_longest_session_and_still_expires():
+    """Both halves matter, and each kills a different mistake.
+
+    Too short and long-running sessions lose their ledger before SessionEnd can score them (the
+    3-day cutoff dropped 875 of 1125 rows this way — docs/PRD.md §8 D4). Never expiring and the
+    rows of sessions that were killed before SessionEnd pile up forever, counted against
+    transcripts that no longer exist.
+    """
+    import json as _json
+    import time as _time
+
+    assert uptake_core.LEDGER_MAX_AGE_DAYS > OBSERVED_MAX_SESSION_DAYS, (
+        "the cutoff must clear the longest session actually observed, not a guessed one"
+    )
+    # And an upper bound, or "never expire" reads as a valid cutoff. 30 is not a taste: it is
+    # `scripts/retention.py` DEFAULT_PROCESSED_DAYS, when a processed session's transcript is
+    # archived. A ledger row older than that has nothing left to be scored against.
+    assert uptake_core.LEDGER_MAX_AGE_DAYS <= 30, (
+        "past transcript retention a ledger row can never be scored, only carried"
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        path = str(Path(d) / "injections.jsonl")
+        row = uptake_core.injection_record("abandoned", "p", [_hit()], 3)
+        row["ts"] = _time.time() - (uptake_core.LEDGER_MAX_AGE_DAYS + 1) * 86400
+        Path(path).write_text(_json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+        uptake_core.prune_session("unrelated", path)
+        assert uptake_core.load_records("abandoned", path) == [], (
+            "expiry must still happen — an unbounded ledger is the other failure"
+        )
 
 
 if __name__ == "__main__":
