@@ -447,6 +447,44 @@ def test_the_window_sample_is_named_in_both_renderings_and_falls_silent_when_met
     assert slack_briefing.window_notice(None) == "", "an unreachable engine is not a zero sample"
 
 
+def test_the_midpoint_warning_rides_the_one_channel_that_reaches_a_person():
+    """PRD §2's midpoint gate, on the briefing rather than only in doctor.
+
+    doctor carries the same check and doctor is in no crontab (measured 2026-09-02), so a gate
+    that fires once, on a date days out, under a command nobody runs is a dead letter. The morning
+    briefing is the only path that reaches a person every day.
+
+    Silent outside 09-08 → the window close: the gate is one-time by contract, and a warning that
+    repeats after it has been answered teaches the reader to skip the line it rides on.
+    """
+    import os
+
+    short = {"sessions": 3, "total_prompts": 31}
+    floor = V.MIDPOINT_MIN_SCORED
+
+    def on(day):
+        os.environ["BORING_TODAY"] = day
+        try:
+            return slack_briefing.window_notice(short)
+        finally:
+            os.environ.pop("BORING_TODAY", None)
+
+    assert "중간점" not in on("2026-09-02"), "before the midpoint it is not due"
+    assert "중간점" not in on("2026-09-20"), "after the close it is spent"
+
+    due = on(V.MIDPOINT)
+    assert "중간점" in due and f"3/{floor}" in due, due
+    assert f"3/{V.MIN_SESSIONS}" in due, "the sample line must survive alongside it"
+
+    os.environ["BORING_TODAY"] = V.MIDPOINT
+    try:
+        assert "중간점" not in slack_briefing.window_notice(
+            {"sessions": floor, "total_prompts": 31}
+        ), "at the floor there is no shortfall to report"
+    finally:
+        os.environ.pop("BORING_TODAY", None)
+
+
 def test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met():
     slack_briefing = load_module("slack_briefing_audit", ROOT / "slack_briefing.py")
 
