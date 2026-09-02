@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 import re
 import sys
 from dataclasses import dataclass, field
@@ -205,6 +206,11 @@ def audit_notice(label_stats) -> str:
     return f"📋 판정 대기 — 사람 라벨 {owed}건 더 필요 · `label-recall.py --audit`"
 
 
+def _today() -> str:
+    """UTC date, overridable so the midpoint branch is reachable from a test on any day."""
+    return os.environ.get("BORING_TODAY") or datetime.now(timezone.utc).date().isoformat()
+
+
 def window_notice(uptake_stats) -> str:
     """How far the injection-channel sample has come, or "" when there is nothing to say.
 
@@ -222,10 +228,23 @@ def window_notice(uptake_stats) -> str:
     prompts = int(uptake_stats.get("total_prompts") or 0)
     if sessions >= verdict_core.MIN_SESSIONS and prompts >= verdict_core.MIN_INJECTED_PROMPTS:
         return ""
-    return (
+    line = (
         f"📐 주입 채널 판정 표본 — 세션 {sessions}/{verdict_core.MIN_SESSIONS} · "
         f"프롬프트 {prompts}/{verdict_core.MIN_INJECTED_PROMPTS} · `uptake-verdict.py`"
     )
+    # The midpoint gate rides the one channel that reaches a person every morning. doctor carries
+    # the same check, but doctor is not in any crontab — measured 2026-09-02 — so a gate that
+    # fires once, on a date six days out, and only under a command nobody runs is a dead letter.
+    # This does not recompute it: same constants, and the shortfall says which adapter.
+    today = _today()
+    if verdict_core.MIDPOINT <= today <= verdict_core.WINDOW_UNTIL:
+        floor = verdict_core.MIDPOINT_MIN_SCORED
+        if sessions < floor:
+            line += (
+                f"\n⚠️ 중간점({verdict_core.MIDPOINT}) 미달 — 채점 세션 {sessions}/{floor}."
+                " PRD §2 는 창 종료를 기다리지 말고 계측 조사로 전환하도록 등록했다"
+            )
+    return line
 
 
 def render_message_mrkdwn(

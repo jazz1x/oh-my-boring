@@ -59,8 +59,10 @@ import verdict_core  # noqa: E402
 #: The window, transcribed from docs/PRD.md §8 D1 (the first window, 08-26 -> 09-09, was reset for
 #: an instrumentation fault; no threshold moved). Constants rather than flags on purpose: a window
 #: you can widen from the command line is a window that gets widened on the day it closes short.
-WINDOW_SINCE = "2026-08-31"
-WINDOW_UNTIL = "2026-09-14"
+# Dates come from `verdict_core`, which the PRD-transcription test covers. Spelling them here
+# again is how a window that was reset on 08-31 left a docstring claiming it closed on 09-09.
+WINDOW_SINCE = verdict_core.WINDOW_SINCE
+WINDOW_UNTIL = verdict_core.WINDOW_UNTIL
 
 #: `verdict_core.collect()` takes a `since` and has NO upper bound. The ceiling is applied here,
 #: before collect() ever sees a row, by the same lexical `observed_at[:10]` comparison collect()

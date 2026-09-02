@@ -52,6 +52,7 @@ failed_ollama=0
 failed_containers=0
 failed_note=0
 failed_marker=0
+failed_midpoint=0
 failed_codex=0
 failed_resolution=0
 failed_freshness=0
@@ -529,6 +530,28 @@ if [ -f "$wiring" ]; then
     fi
 fi
 
+# (d5f) The window's one-time progress gate (docs/PRD.md §2). Registered there as prose on
+# 2026-09-02, which on its own fires nothing — "written in the PRD, absent from the code" is the
+# same class as the seven merges that never reached production.
+#
+# The dates and the floor live in `verdict_core` (the PRD-transcription test keeps them honest);
+# this only maps exit codes, so the shell owns no calendar. `failed_midpoint` is deliberately NOT
+# `failed_hooks`: `--fix` runs `fix_hooks` on that flag and would "repair" perfectly healthy hook
+# registrations while swallowing the signal.
+verdict_cli="$BORING_HOME/scripts/uptake-verdict.py"
+if [ -f "$verdict_cli" ] && [ "${BORING_SKIP_MIDPOINT:-0}" != 1 ]; then
+    midpoint_out="$(python3 "$verdict_cli" --midpoint 2>&1)"
+    case $? in
+        0) case "$midpoint_out" in
+               *"아직 아니다"*|*"창이 닫혔다"*) : ;;   # outside the gate's window: silence, by contract
+               *) ok "midpoint: ${midpoint_out##*\[midpoint\] }" ;;
+           esac ;;
+        3) bad "MIDPOINT SHORTFALL — $midpoint_out"; failed_midpoint=1 ;;
+        4) warn "midpoint undetermined — $midpoint_out. Not a shortfall in the sample; a shortfall in what can be read." ;;
+        *) warn "midpoint check could not run — $midpoint_out" ;;
+    esac
+fi
+
 # (d5d) Can the uptake detector see a use it is handed on a plate? Treatment and control both
 # sitting at zero is equally the signature of a channel nobody used and of a scorer that sees
 # nothing, and the rates cannot separate them — so docs/PRD.md §2 refuses a "not working" reading
@@ -600,8 +623,8 @@ fi
 
 echo
 if [ "$STRICT" -eq 1 ]; then
-    failures="${failed_env}${failed_hooks}${failed_engine}${failed_ollama}${failed_containers}${failed_note}${failed_marker}${failed_codex}${failed_resolution}${failed_freshness}"
-    if [ "$failures" = "0000000000" ]; then
+    failures="${failed_env}${failed_hooks}${failed_engine}${failed_ollama}${failed_containers}${failed_note}${failed_marker}${failed_codex}${failed_resolution}${failed_freshness}${failed_midpoint}"
+    if [ "$failures" = "00000000000" ]; then
         ok "readiness: all doctor checks passed — briefing/write-door dependencies are ready."
         log_doctor_event ok
         exit 0
