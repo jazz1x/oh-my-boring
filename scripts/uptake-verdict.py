@@ -25,7 +25,7 @@ import urllib.request
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents", "shared"))
 
 import verdict_core  # noqa: E402
-from verdict_core import collect, unreported  # noqa: E402
+from verdict_core import collect, partition_at_repair, unreported  # noqa: E402
 
 DEFAULT_URL = os.environ.get("BORING_URL") or "http://127.0.0.1:7700"
 
@@ -52,7 +52,13 @@ def main(argv=None):
     if rows is None:
         return 2
 
-    per_agent, skipped_old = collect(rows, since=args.since, agent=args.agent)
+    # The owner kept the window and split the sample (PRD §8 D4). Rows written while the ledger
+    # was pruned at 3 days measured a sample biased toward short sessions, so they are reported
+    # but never read by the verdict — and they are reported rather than dropped, because hiding
+    # them is the same move as quoting them.
+    pre_rows, post_rows = partition_at_repair(rows)
+    pre_agent, _ = collect(pre_rows, since=args.since, agent=args.agent)
+    per_agent, skipped_old = collect(post_rows, since=args.since, agent=args.agent)
     if skipped_old:
         print(
             f"[uptake-verdict] {skipped_old}건 제외 — per-prompt 대조가 없던 시기의 이벤트"
@@ -71,6 +77,18 @@ def main(argv=None):
                 " 계측 결함이 아니라 표본이 쌓이는 중"
             )
             return 1
+        if pre_agent:
+            # Same trap the `skipped_old` branch above exists to avoid: an empty post-repair
+            # bucket is not silence from the instrument, it is a boundary that everything is
+            # still on the near side of. Calling it a fault sends someone to debug a hook that
+            # works, and teaches them to distrust the clause when it finally is real.
+            pre_sessions = sum(c["sessions"] for c in pre_agent.values())
+            print(
+                f"[uptake-verdict] 수리 이후 이벤트가 아직 없다 — 계측은 돌고 있고"
+                f"(수리 이전 세션 {pre_sessions}건) 경계 {verdict_core.LEDGER_REPAIR_AT}"
+                " 이후 표본이 쌓이는 중. 계측 결함이 아니다"
+            )
+            return 1
         print("[uptake-verdict] 집계할 injection_uptake 이벤트가 없다 — 계측 조사 대상(PRD §2)")
         return 1
 
@@ -81,11 +99,26 @@ def main(argv=None):
             " — 종료되지 않고 사라진 세션. 판정에 합산하지 않는다(결과가 없으므로)"
         )
 
+    if pre_agent:
+        print(
+            f"\n[수리 이전 · 판정에 쓰지 않음]  경계 {verdict_core.LEDGER_REPAIR_AT}"
+        )
+        for who, c in sorted(pre_agent.items()):
+            used, total = c["used_prompts"], c["total_prompts"]
+            print(
+                f"  {who}: 세션 {c['sessions']} · 주입 프롬프트 {total} · 처치 {used}"
+                f" · 대조 {c['used_control_prompts']}"
+            )
+        print(
+            "  원장이 3일에 잘리던 시기다 — 3일보다 오래 산 세션은 채점 전에 증거가 사라졌고,"
+            " 그 편향은 세션 길이 방향이다(PRD §8 D4). 비율을 내지 않는다."
+        )
+
     for who, c in sorted(per_agent.items()):
         v = verdict_core.verdict(
             c["sessions"], c["used_prompts"], c["total_prompts"], c["used_control_prompts"]
         )
-        print(f"\n[{who}]")
+        print(f"\n[{who} · 수리 이후]")
         for line in verdict_core.format_verdict(v):
             print(f"  {line}")
     return 0

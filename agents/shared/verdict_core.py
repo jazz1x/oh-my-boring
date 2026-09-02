@@ -17,6 +17,7 @@ treatment is a different ratio, not a rougher one — see `uptake_core.session_u
 """
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 #: Sessions the window needs before any number is reported. Below this the rates are noise from
@@ -137,6 +138,46 @@ def unreported(rows):
         sessions += field(row, "aged_sessions")
         total += field(row, "aged_rows")
     return sessions, total
+
+
+#: The moment the ledger cutoff went from 3 days to 14 (commit 1f45fec, docs/PRD.md §8 D4).
+#: Before it, a session that outlived three days had its injection rows pruned before SessionEnd
+#: could score them, and `log_uptake_event` returned silently — 93 sessions distilled inside the
+#: window, 11 with an uptake row. The owner chose to keep the window and split the sample rather
+#: than reset (§8 D4), so this boundary has to be mechanical: it is the commit timestamp, not a
+#: date anybody picked after looking at the rates.
+LEDGER_REPAIR_AT = "2026-09-02T00:45:38+00:00"
+
+
+def _instant(value):
+    """Parse an event timestamp to an aware datetime, or None.
+
+    Compared as datetimes, not as strings: the rows carry a UTC offset and a lexical compare
+    silently reorders anything written with a different one.
+    """
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def partition_at_repair(rows, boundary=LEDGER_REPAIR_AT):
+    """Split uptake rows into the ones the broken instrument produced and the ones it did not.
+
+    The pre-repair rows are not thrown away — they were real sessions and hiding them would be the
+    same move as quoting them. They are reported separately and the verdict reads only the post
+    half, which is what "keep the window and split the sample" means in practice.
+    """
+    edge = _instant(boundary)
+    pre, post = [], []
+    for row in rows or []:
+        at = _instant(row.get("observed_at"))
+        # A row whose timestamp will not parse cannot be placed on either side, and guessing would
+        # place it wherever the guess is convenient. It counts as pre — the conservative side,
+        # since that is the half the verdict does not read.
+        (post if (at and edge and at >= edge) else pre).append(row)
+    return pre, post
 
 
 def field(row, key):

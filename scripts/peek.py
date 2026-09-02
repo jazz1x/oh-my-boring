@@ -269,7 +269,19 @@ def _in_window(row):
 def window_block(rows, notes):
     """The verdict, taken verbatim from verdict_core. No threshold is recomputed here."""
     windowed = [r for r in (rows or []) if _in_window(r)]
-    per_agent, skipped_old = verdict_core.collect(windowed, since=WINDOW_SINCE)
+    # The owner kept the window and split the sample at the ledger repair (PRD §8 D4). The page
+    # must read the same half the verdict reads, or it becomes a second opinion nobody registered.
+    pre_rows, post_rows = verdict_core.partition_at_repair(windowed)
+    pre_agent, _ = verdict_core.collect(pre_rows, since=WINDOW_SINCE)
+    per_agent, skipped_old = verdict_core.collect(post_rows, since=WINDOW_SINCE)
+    if pre_agent:
+        pre_sessions = sum(c["sessions"] for c in pre_agent.values())
+        pre_prompts = sum(c["total_prompts"] for c in pre_agent.values())
+        notes.append(
+            f"수리 이전 표본 세션 {pre_sessions} · 주입 프롬프트 {pre_prompts} 은 판정에서 제외된다"
+            f" (경계 {verdict_core.LEDGER_REPAIR_AT}). 원장이 3일에 잘리던 시기라 3일보다 오래 산"
+            " 세션은 채점 전에 증거가 사라졌고, 그 편향은 세션 길이 방향이다 — PRD §8 D4."
+        )
 
     # Per agent, never pooled: Claude Code injects on every prompt while Kimi throttles to once a
     # session (`verdict_core` / `distill_core.log_uptake_event`), so a pooled rate answers neither
@@ -564,6 +576,14 @@ def pace_block(window, now=None):
         end = datetime.fromisoformat(WINDOW_UNTIL + "T23:59:59+00:00")
     except ValueError:
         return None
+    # The counted sample begins at the ledger repair, not at the window open (PRD §8 D4): the
+    # verdict reads only post-repair rows. Measuring elapsed time from the window open instead
+    # divides a restarted count by days it was never accumulating over, and prints
+    # `reaches_floor: false` — which reads as "we will miss the floor" when the truth is that the
+    # baseline is hours old.
+    repair = verdict_core._instant(verdict_core.LEDGER_REPAIR_AT)
+    if repair and repair > start:
+        start = repair
     now = now or datetime.now(timezone.utc)
     elapsed = max((now - start).total_seconds() / 86400.0, 0.25)
     span = max((end - start).total_seconds() / 86400.0, 1.0)

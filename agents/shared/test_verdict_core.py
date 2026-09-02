@@ -186,6 +186,32 @@ def test_the_thresholds_still_match_the_registered_contract():
         assert re.search(rf"\b{value}\b", section), f"{what} {value} 가 PRD §2 에 없다"
 
 
+def test_the_repair_boundary_splits_by_instant_not_by_string():
+    """Rows are compared as instants, and an unplaceable row falls on the side nobody reads.
+
+    The two rows below are written with different UTC offsets and straddle the boundary. A lexical
+    compare on `observed_at` — which is what the surrounding code does for the window's date
+    bounds — puts the +09:00 row on the wrong side, and it would land in the half the verdict
+    reads. That is the direction that matters: a pre-repair session counted as post is exactly the
+    biased sample §8 D4 exists to keep out.
+    """
+    rows = [
+        {"observed_at": "2026-09-02T09:00:00+09:00"},  # 00:00Z — before the repair
+        {"observed_at": "2026-09-02T10:00:00+09:00"},  # 01:00Z — after it
+        {"observed_at": None},
+        {"observed_at": "not a timestamp"},
+    ]
+    pre, post = V.partition_at_repair(rows)
+    assert [r["observed_at"] for r in post] == ["2026-09-02T10:00:00+09:00"], post
+    assert len(pre) == 3, "an unplaceable row counts as pre — the half the verdict does not read"
+
+
+def test_the_boundary_is_the_repair_commit_not_a_chosen_date():
+    """A boundary someone can nudge is not a boundary. It has to trace to the commit."""
+    assert V.LEDGER_REPAIR_AT.startswith("2026-09-02T00:45:38"), V.LEDGER_REPAIR_AT
+    assert V._instant(V.LEDGER_REPAIR_AT) is not None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
