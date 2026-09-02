@@ -541,11 +541,12 @@ fi
 verdict_cli="$BORING_HOME/scripts/uptake-verdict.py"
 if [ -f "$verdict_cli" ] && [ "${BORING_SKIP_MIDPOINT:-0}" != 1 ]; then
     midpoint_out="$(python3 "$verdict_cli" --midpoint 2>&1)"
+    # Exit codes only. This used to read the message text to tell "floor met" from "not due", so
+    # the wording of a Korean sentence was the only thing separating them — rephrasing it would
+    # have silently turned one into the other.
     case $? in
-        0) case "$midpoint_out" in
-               *"아직 아니다"*|*"창이 닫혔다"*) : ;;   # outside the gate's window: silence, by contract
-               *) ok "midpoint: ${midpoint_out##*\[midpoint\] }" ;;
-           esac ;;
+        0) ok "midpoint: ${midpoint_out##*\[midpoint\] }" ;;
+        5) : ;;   # outside the gate's window: silent by contract, one-time gate
         3) bad "MIDPOINT SHORTFALL — $midpoint_out"; failed_midpoint=1 ;;
         4) warn "midpoint undetermined — $midpoint_out. Not a shortfall in the sample; a shortfall in what can be read." ;;
         *) warn "midpoint check could not run — $midpoint_out" ;;

@@ -156,6 +156,40 @@ class Midpoint(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("함께 못 쓴다", out)
 
+    def test_not_due_and_met_are_different_exit_codes(self):
+        """A shell told them apart by reading Korean prose, so a rephrase could swap them.
+
+        Both mean "no action", which is exactly why they were collapsed — and why collapsing them
+        made the message text load-bearing.
+        """
+        met = [_event(f"s{i}", 0, 10) for i in range(uv.verdict_core.MIDPOINT_MIN_SCORED)]
+        self.assertEqual(self._cli(met, "2026-09-08")[0], uv.MIDPOINT_OK)
+        self.assertEqual(self._cli(met, "2026-09-02")[0], uv.MIDPOINT_NOT_DUE)
+        self.assertNotEqual(uv.MIDPOINT_OK, uv.MIDPOINT_NOT_DUE)
+
+    def test_the_gate_cannot_be_narrowed_to_one_adapter(self):
+        """`--agent` would hide another adapter's shortfall — the sum the per-adapter rule forbids,
+        arriving through a flag instead of arithmetic."""
+        code, out = self._cli(
+            self._events(1), "2026-09-08", argv=("--midpoint", "--agent", "claude-code")
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("좁힐 수 없다", out)
+
+    def test_the_window_runs_on_the_owners_calendar_not_utc(self):
+        """The briefing fires at 08:00 KST, which is 23:00 UTC the day before.
+
+        Measured against a UTC date, the 09-08 briefing says nothing and the 09-09 one carries the
+        warning — handing back a day of a window that is short enough to be watched daily.
+        """
+        from datetime import datetime, timedelta, timezone as tz
+
+        V = uv.verdict_core
+        self.assertEqual(V.WINDOW_TZ.utcoffset(None), timedelta(hours=9))
+        run = datetime(2026, 9, 8, 8, 0, tzinfo=V.WINDOW_TZ)
+        self.assertEqual(run.astimezone(tz.utc).date().isoformat(), "2026-09-07")
+        self.assertEqual(run.date().isoformat(), V.MIDPOINT, "the gate must be due on that run")
+
     def test_the_dates_are_not_spelled_here(self):
         """The gate reads `verdict_core`, which the PRD-transcription test covers."""
         source = (HERE / "uptake-verdict.py").read_text(encoding="utf-8")
