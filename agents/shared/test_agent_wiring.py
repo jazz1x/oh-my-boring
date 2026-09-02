@@ -476,6 +476,59 @@ def test_sync_hermes_cron_jobs_adds_managed_job():
         assert codex_worker["no_agent"] is True
 
 
+
+
+def test_kimi_hooks_are_deduped_across_path_spellings():
+    """One registration per script, whichever way the path was spelled when it was written.
+
+    Two spellings of the same file — through the `~/oh-my-boring` symlink and through its target —
+    both passed the old substring test, so a second `[[hooks]]` block was appended and the recall
+    hook fired twice on every prompt. That does not move the uptake rate (numerator and
+    denominator both double) but it halves the evidence behind a pre-registered sample floor
+    (docs/PRD.md §8 D1). Measured on the real config 2026-09-02: four registrations of two hooks.
+
+    Also asserts the blocks the installer does not own are left alone. A deduper that tidies away
+    somebody else's hook is worse than the duplicate.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d) / "oh-my-boring"
+        (home / "hooks").mkdir(parents=True)
+        for name in ("kimi-recall.py", "kimi-distill-session.py"):
+            (home / "hooks" / name).write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        link = Path(d) / "linked"
+        link.symlink_to(home)
+
+        config = Path(d) / "config.toml"
+        config.write_text(
+            "[model]\nname = \"kimi\"\n"
+            "\n[[hooks]]\nevent = \"UserPromptSubmit\"\n"
+            f'command = "python3 {home}/hooks/kimi-recall.py"\ntimeout = 10\n'
+            "\n[[hooks]]\nevent = \"UserPromptSubmit\"\n"
+            f'command = "python3 {link}/hooks/kimi-recall.py"\ntimeout = 10\n'
+            "\n[[hooks]]\nevent = \"SessionEnd\"\n"
+            f'command = "python3 {home}/hooks/kimi-distill-session.py"\ntimeout = 130\n'
+            # Twice on purpose. With one copy, "a foreign hook survives" is true even for a
+            # deduper that removes every duplicate it finds regardless of owner — the assertion
+            # passes because there was nothing to delete. Duplicated, it fails.
+            '\n[[hooks]]\nevent = "SessionEnd"\n'
+            'command = "python3 /somebody/elses/hook.py"\ntimeout = 5\n'
+            '\n[[hooks]]\nevent = "SessionEnd"\n'
+            'command = "python3 /somebody/elses/hook.py"\ntimeout = 5\n',
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(agent_wiring, "BORING_HOME", str(home)):
+            agent_wiring.wire_kimi(config)
+
+        text = config.read_text(encoding="utf-8")
+        assert text.count("kimi-recall.py") == 1, text
+        assert text.count("kimi-distill-session.py") == 1, text
+        assert text.count("/somebody/elses/hook.py") == 2, (
+            "a hook we do not own must survive untouched — including its own duplicates, which"
+            " are not ours to tidy away"
+        )
+        assert 'name = "kimi"' in text, "the rest of the config must survive"
+
 if __name__ == "__main__":
     test_install_reports_failure()
     test_install_returns_success_when_ok()
@@ -491,6 +544,7 @@ if __name__ == "__main__":
     test_install_hermes_briefing_backs_up_existing_scripts()
     test_wire_hermes_missing_slack_briefing_has_no_side_effects()
     test_real_hermes_entry_scripts_ship_every_module_they_import()
+    test_kimi_hooks_are_deduped_across_path_spellings()
     test_local_deps_are_transitive_and_reach_the_shared_dir()
     test_install_hermes_skills_removes_legacy_nested_duplicate()
     test_install_codex_host_worker_macos_writes_launch_agent()
