@@ -1,4 +1,4 @@
-<!-- derived-from: PRD v3 -->
+<!-- derived-from: PRD v4 -->
 # GOALS
 
 Derived from `docs/PRD.md`. The PRD says what the product is; this file says which of its
@@ -23,6 +23,21 @@ In scope:
 - Accumulate labels: the daily pass collects 24, and human `--audit` runs alongside **[R1]**.
 - Two documents: remove the throttle falsehood from the Claude adapter README, and keep this
   file in step with the PRD **[R1]**.
+- Confirm delivery the day a PR merges — `/health.build_sha == HEAD` plus the installer run — for
+  anything that reaches `drudge/` or `~/.hermes`. Seven times now a merge has left production on
+  the old build, twice on 2026-09-02 alone **[R4]**.
+- Mid-window progress check on 2026-09-08: fewer than 10 scored sessions turns the window into an
+  instrumentation investigation rather than a wait **[R1]**.
+- Shadow-log the PostToolUse file trigger — record what a file-scoped anchor lookup *would* have
+  returned, inject nothing. Injecting would change the transcript and contaminate the treatment
+  arm's echo **[R1]**.
+
+Not enforced by this slice, and why:
+
+- **[R7]** (injection surfaces as declaration rather than per-adapter code) is adopted in the PRD
+  but carries no gate here. Its first consumer is the PostToolUse surface, which this slice only
+  shadow-logs; writing the declaration format before a second surface actually exists would be
+  the speculative taxonomy the PRD warns against. It enters scope with the 09-15 slice.
 
 Out of scope for this slice — and why:
 
