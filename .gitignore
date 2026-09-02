@@ -30,6 +30,11 @@ venv/
 # 구조(.gitkeep)·거버넌스(.rules)·예시(example.md) 템플릿만 보존. 개인 노트는 누수 방지.
 vault/raw/*
 vault/wiki/*
+# Generated beside the notes, not written by hand: a stopword list built from corpus frequency,
+# regenerated periodically. It appeared untracked on 2026-09-02 from another session and would
+# have been swept into the next `git add` — the vault's other outputs are excluded and this one
+# was simply missed.
+vault/glossary/*
 !vault/raw/.gitkeep
 !vault/raw/example.md
 !vault/wiki/.gitkeep
