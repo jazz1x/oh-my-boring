@@ -194,6 +194,10 @@ def test_the_thresholds_still_match_the_registered_contract():
         (V.MIDPOINT, "중간점"),
     ):
         assert date in section, f"{what} {date} 가 PRD §2 에 없다"
+    # The zone is half the meaning of the dates: read as UTC they are a different day, and the
+    # briefing runs at 08:00 in this one. A code comment registered that and the contract did not.
+    hours = int(V.WINDOW_TZ.utcoffset(None).total_seconds() // 3600)
+    assert f"UTC+{hours:02d}:00" in section, f"창 시간대 UTC+{hours:02d}:00 이 PRD §2 에 없다"
 
 
 def test_the_repair_boundary_splits_by_instant_not_by_string():
