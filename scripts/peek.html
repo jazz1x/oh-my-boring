@@ -10,11 +10,23 @@
   :root {
     /* 4 sizes, 2 weights, 3 greys. Accent is spent on interaction only; state gets its own
        colour, so colour reads as a sentence instead of decoration. */
-    --t-hero: 20px; --t-body: 13px; --t-cell: 12px; --t-label: 11px;
+    /* Every font-size on the page resolves to one of these four. They used to be declared and
+       then ignored — 23 hardcoded px values against 4 token uses — so raising a token changed
+       nothing. Converted first, raised second. */
+    --t-hero: 24px; --t-body: 15px; --t-cell: 14px; --t-label: 12px;
     --status-warn: #b45309;
     --status-ok: #15803d;
     /* 8px rhythm: 8 / 16 / 24. The page gutter is the largest of them. */
     --gut: 24px;
+    --page: 1120px;
+    /* Every block's horizontal inset, table cells included. Measured before this token: four
+       different text-left values (24 / 32 / 36 / 36 px) down one page — the section label, the
+       band grid, the notes box and the table columns each picked their own padding, so nothing
+       lined up with anything. One token, one left edge. */
+    --inset: 12px;
+    /* Chrome above the stream pane: bar + section header + a breath. The pane is sized off this
+       so the summary blocks stay on screen instead of sitting below a 6400px table. */
+    --chrome: 330px;
     color-scheme: light dark;
     --bg:            #fbfbfa;
     --bg-raised:     #ffffff;
@@ -57,20 +69,37 @@
   body {
     background: var(--bg);
     color: var(--fg);
-    font: 13px/1.45 var(--sans);
+    font: var(--t-body)/1.5 var(--sans);
     -webkit-font-smoothing: antialiased;
   }
   .num, time, .mono { font-variant-numeric: tabular-nums; font-family: var(--mono); }
   .r { text-align: right; }
   /* One gutter for everything. Linear aligns every left edge to the same rail; a full-bleed
      header over constrained content reads as two pages stacked. */
-  .gut, .wrap { max-width: 1120px; margin: 0 auto; padding: 0 var(--gut); }
+  .gut, .wrap { max-width: var(--page); margin: 0 auto; padding: 0 var(--gut); }
+
+  /* Wide viewports get a rail instead of a taller page. The stream is the detail and the bands,
+     label floors and caveats are what the verdict rests on — stacked, the evidence lands below
+     the fold no matter how short the pane is, because the pane is what fills the fold. */
+  @media (min-width: 1180px) {
+    :root { --page: 1440px; --chrome: 290px; }
+    .wrap {
+      display: grid; grid-template-columns: minmax(0, 1fr) 340px;
+      column-gap: var(--gut); align-items: start;
+    }
+    #help, .foot { grid-column: 1 / -1; }
+    #main { grid-column: 1; min-width: 0; }
+    #rail { grid-column: 2; }
+    /* The rail starts level with the stream, so its first section header repeats no top margin. */
+    #rail > .sec:first-child { margin-top: 24px; }
+  }
   .wrap { padding-bottom: 64px; }
 
   /* The bar stays. Everything above it is an explainer you read once and scroll past. */
   #scrollaway { padding-top: 16px; }
   #bar {
     position: sticky; top: 0; z-index: 20;
+    padding-top: 16px;
     background: var(--bg);
     border-bottom: 1px solid var(--line-strong);
   }
@@ -78,7 +107,8 @@
     #bar { background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); }
   }
 
-  #hero { display: flex; align-items: baseline; gap: 8px; padding: 16px 0 0; }
+  /* The bar owns the top breath now, so the hero only carries the shared inset. */
+  #hero { display: flex; align-items: baseline; gap: 8px; padding: 0 var(--inset); }
   #hero-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-faint); flex: none;
               transform: translateY(-2px); }
   #hero-dot.warn { background: var(--status-warn); }
@@ -86,24 +116,29 @@
   #hero-label { font-size: var(--t-hero); font-weight: 600; letter-spacing: -.01em; }
   #hero-label.warn { color: var(--status-warn); }
   #hero-label.ok { color: var(--status-ok); }
-  #hero-sub { font-size: var(--t-body); color: var(--fg-dim); padding: 4px 0 0; max-width: 82ch; }
+  #hero-sub { font-size: var(--t-body); color: var(--fg-dim); padding: 4px var(--inset) 0;
+               max-width: 96ch; }
+  .nowrap { white-space: nowrap; }
   #floors { display: flex; gap: 24px; font-size: var(--t-cell); color: var(--fg-dim);
-            padding: 8px 0 16px; font-variant-numeric: tabular-nums; }
+            padding: 8px var(--inset) 16px; font-variant-numeric: tabular-nums; }
   #floors .k { color: var(--fg-faint); }
   #floors b { font-weight: 600; color: var(--fg); }
   #meta-wrap { padding: 8px 0 0; }
+  /* The gutter already insets the page; blocks add --inset on top, so a bare .gut child needs
+     it too or its text hangs 12px left of every column. */
+  #meta-wrap { padding-left: var(--inset); padding-right: var(--inset); }
   #meta-toggle { font: inherit; font-size: var(--t-label); color: var(--fg-faint); background: none;
                  border: 0; padding: 0; cursor: pointer; }
   #meta-toggle:hover { color: var(--fg-dim); }
   /* ── legacy verdict strip (unused) ───────────────────────────────────────────────── */
   #verdict {
-    height: 40px;
+    height: 44px;
     display: flex; align-items: center; gap: 12px;
     border-bottom: 1px solid var(--line-strong);
     padding: 0 16px;
     background: var(--bg-raised);
     white-space: nowrap; overflow-x: auto; scrollbar-width: none;
-    font-family: var(--mono); font-size: 12px;
+    font-family: var(--mono); font-size: var(--t-cell);
   }
   #verdict::-webkit-scrollbar { display: none; }
   #verdict .seg { color: var(--fg); }
@@ -117,7 +152,7 @@
   #meta {
     display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center;
     min-height: 32px; padding: 0 0 8px;
-    font-size: 11px; color: var(--fg-dim);
+    font-size: var(--t-label); color: var(--fg-dim);
   }
   #meta b { font-weight: 600; color: var(--fg); font-family: var(--mono); }
   .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%;
@@ -129,21 +164,21 @@
   #fault {
     margin: 8px 0 0;
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
-    min-height: 28px; padding: 5px 0;
+    min-height: 32px; padding: 6px var(--inset);
     border-bottom: 1px solid var(--line);
-    font-size: 12px;
+    font-size: var(--t-cell);
   }
   #fault .state {
-    font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
+    font-family: var(--mono); font-size: var(--t-label); letter-spacing: .06em;
     text-transform: uppercase; color: var(--fg-dim);
   }
   #fault .reason { color: var(--fg-dim); }
-  #fault .counts { margin-left: auto; color: var(--fg-dim); font-family: var(--mono); font-size: 11px; }
+  #fault .counts { margin-left: auto; color: var(--fg-dim); font-family: var(--mono); font-size: var(--t-label); }
   #fault.investigate {
     background: var(--accent); color: var(--accent-ink);
     padding: 7px 10px; margin: 6px 0; border: 0; border-radius: 2px;
   }
-  #fault.investigate .state { color: var(--accent-ink); font-weight: 700; font-size: 12px; }
+  #fault.investigate .state { color: var(--accent-ink); font-weight: 700; font-size: var(--t-cell); }
   #fault.investigate .reason,
   #fault.investigate .counts { color: var(--accent-ink); }
   #fault.unknown .state { color: var(--fg-faint); }
@@ -151,7 +186,11 @@
   /* ── section headers ────────────────────────────────────────────────── */
   /* Nothing in this row may wrap or shrink except the footnote: a two-line section header and a
      button reading "note" instead of "notes" are both the row running out of width silently. */
+  /* No-shrink for the labels and buttons, which is what wrapping used to break. The right-hand
+     group is the exception: with `flex: none` on it the 200px filter forced the row 80px past the
+     section's own right edge and drew the `?` and `stop` controls on top of the rail. */
   .sec > * { flex: none; }
+  .sec > .right, .sec > .count.dim { flex: 0 1 auto; min-width: 0; }
   .sec > .label, .sec .count, .modes, .modes button { white-space: nowrap; }
   .sec .right { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
   /* The footnote is the only thing here that may be dropped when the row runs out of width;
@@ -164,84 +203,97 @@
     position: sticky; top: 72px; z-index: 10;
     background: var(--bg);
     display: flex; align-items: center; gap: 8px;
-    height: 40px; margin-top: 24px;
+    height: 44px; margin-top: 24px; padding: 0 var(--inset);
     border-bottom: 1px solid var(--line);
-    font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--fg-dim);
+    font-size: var(--t-label); letter-spacing: .06em; text-transform: uppercase; color: var(--fg-dim);
   }
   .sec .count { color: var(--fg); font-family: var(--mono); letter-spacing: 0; }
   .sec .spark { margin-left: 2px; display: inline-flex; }
-  .sparkbox { display: inline-flex; align-items: flex-end; gap: 1px; height: 14px; width: 96px; }
+  .sparkbox { display: inline-flex; align-items: flex-end; gap: 1px; height: 16px; width: 96px; }
   .sparkbox .bar { display: block; width: 3px; background: transparent; }
   .sparkbox .bar.on { background: var(--accent); }
   .sec .right { margin-left: auto; display: flex; align-items: center; gap: 10px;
                 text-transform: none; letter-spacing: 0; }
   #filter {
-    font: 11px/1 var(--mono); color: var(--fg); background: var(--bg-muted);
-    border: 1px solid var(--line); border-radius: 2px; padding: 5px 7px; width: 200px;
+    font: var(--t-label)/1 var(--mono); color: var(--fg); background: var(--bg-muted);
+    border: 1px solid var(--line); border-radius: 2px; padding: 5px 7px;
+    flex: 0 1 200px; width: 200px; min-width: 72px;
   }
   #filter:focus { outline: none; border-color: var(--accent); }
   #filter::placeholder { color: var(--fg-faint); }
 
   /* ── 3. prompt stream ───────────────────────────────────────────────── */
+  /* The stream scrolls INSIDE a pane rather than growing the page. Measured before this: 200
+     prompts expanded to 400 rows and 6429px in an 834px viewport, which put the verdict's own
+     evidence — distance bands, label floors, the caveat list — about eight screens below the
+     fold. A number nobody scrolls to is not reported. */
+  #stream-pane {
+    max-height: calc(100vh - var(--chrome)); min-height: 240px; overflow: auto;
+    border-bottom: 1px solid var(--line);
+    overscroll-behavior: contain;
+  }
   table { width: 100%; border-collapse: collapse; }
   thead th {
-    /* Sticky under the section header, which is itself sticky under the bar. Three fixed rows
-       is the ceiling — past that the viewport is chrome, not content. */
-    position: sticky; top: 112px; z-index: 9;
+    /* Sticky to the pane's own top. It used to chain off two hardcoded page offsets (72px,
+       112px) that no longer matched the measured heights (68px, 117px); scoping the sticky to
+       the scroll container removes the arithmetic instead of correcting it. */
+    position: sticky; top: 0; z-index: 9;
     background: var(--bg);
-    height: 28px; padding: 0 12px;
-    text-align: left; font-weight: 500; font-size: 11px;
+    height: 32px; padding: 0 var(--inset);
+    text-align: left; font-weight: 500; font-size: var(--t-label);
     letter-spacing: .04em; text-transform: uppercase;
     color: var(--fg-faint); white-space: nowrap;
     border-bottom: 1px solid var(--line);
   }
   thead th.r { text-align: right; }
-  #stop { font: inherit; font-size: 11px; margin-left: 8px; padding: 1px 8px; cursor: pointer;
+  thead th.tip { text-decoration: underline dotted var(--line-strong); text-underline-offset: 3px;
+                 cursor: help; }
+  #stop { font: inherit; font-size: var(--t-label); margin-left: 8px; padding: 1px 8px; cursor: pointer;
           background: transparent; color: var(--fg-dim); border: 1px solid var(--line); border-radius: 3px; }
   #stop:hover { color: var(--bg); background: var(--fg-dim); }
-  #role { font-size: 11px; line-height: 1.6; color: var(--fg-dim); max-width: 74ch; padding: 0 0 16px; }
+  #role { font-size: var(--t-label); line-height: 1.6; color: var(--fg-dim); max-width: 74ch; padding: 0 0 16px; }
   #role b { color: var(--fg); font-weight: 600; }
   .modes { margin-left: 10px; display: inline-flex; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
-  .modes button { font: inherit; font-size: 11px; padding: 1px 8px; background: transparent; color: var(--fg-dim);
+  .modes button { font: inherit; font-size: var(--t-label); padding: 1px 8px; background: transparent; color: var(--fg-dim);
                   border: 0; border-right: 1px solid var(--line); cursor: pointer; }
   .modes button:last-child { border-right: 0; }
   .modes button.on { background: var(--accent); color: var(--bg); }
-  tbody tr.g { height: 32px; border-bottom: 1px solid var(--line); }
+  tbody tr.g { height: 36px; border-bottom: 1px solid var(--line); }
   tbody tr.g:hover { background: var(--bg-row-hover); }
-  tbody tr.p { height: 32px; cursor: pointer; border-bottom: 1px solid var(--line); }
+  tbody tr.p { height: 36px; cursor: pointer; border-bottom: 1px solid var(--line); }
   tbody tr.p:hover { background: var(--bg-row-hover); }
   tbody tr.p.cursor { background: var(--bg-row-cursor); box-shadow: inset 2px 0 0 var(--accent); }
   td.mark { width: 20px; text-align: center; }
   td.mark .yes { color: var(--accent); }
   td.mark .no { color: var(--fg-dim); }
   td.mark .faint { color: var(--fg-faint); }
-  tbody td { padding: 0 12px; font-size: 12px; white-space: nowrap; }
+  tbody td { padding: 0 var(--inset); font-size: var(--t-cell); white-space: nowrap; }
   td.t { font-family: var(--mono); color: var(--fg-dim); width: 1%; }
   td.t .d { color: var(--fg-faint); }
   td.s { font-family: var(--mono); color: var(--fg); width: 1%; }
-  td.srcs { color: var(--fg-dim); font-size: 11px; max-width: 0; width: 100%;
+  td.srcs { color: var(--fg-dim); font-size: var(--t-label); max-width: 0; width: 100%;
             overflow: hidden; text-overflow: ellipsis; }
   .chev { color: var(--fg-faint); font-family: var(--mono); width: 1%; }
   .yes { color: var(--accent); }
   .no  { color: var(--fg-dim); }
   .unk { color: var(--fg-faint); cursor: help; border-bottom: 1px dotted var(--line-strong); }
-  tr.detail > td { padding: 0 8px 10px 30px; background: var(--bg-muted);
+  tr.detail > td { padding: 0 var(--inset) 12px 30px; background: var(--bg-muted);
                    border-bottom: 1px solid var(--line); white-space: normal; }
   .hit { padding: 6px 0 0; }
-  .hit .src { font-family: var(--mono); font-size: 11px; color: var(--fg); }
+  .hit .src { font-family: var(--mono); font-size: var(--t-label); color: var(--fg); }
   .hit ul { margin: 3px 0 0; padding: 0; list-style: none; }
   .hit li {
-    font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+    font-family: var(--mono); font-size: var(--t-label); color: var(--fg-dim);
     padding: 1px 0 1px 10px; border-left: 1px solid var(--line-strong);
     white-space: pre-wrap; word-break: break-word;
   }
-  .empty { padding: 10px 8px; font-size: 12px; color: var(--fg-dim); }
+  .empty { padding: 12px var(--inset); font-size: var(--t-cell); color: var(--fg-dim); }
 
   /* ── 4. labels line ────────────────────────────────────────────────── */
   #labels {
     display: flex; flex-wrap: wrap; gap: 4px 20px; align-items: baseline;
-    min-height: 28px; padding: 6px 8px;
-    border-bottom: 1px solid var(--line); font-size: 12px; color: var(--fg-dim);
+    min-height: 32px; padding: 8px var(--inset);
+    border-bottom: 1px solid var(--line); font-size: var(--t-cell); color: var(--fg-dim);
   }
   #labels b { font-family: var(--mono); font-weight: 600; color: var(--fg);
               font-variant-numeric: tabular-nums; }
@@ -249,32 +301,45 @@
   /* ── 4b. why (retrieval distance bands) ────────────────────────────── */
   /* Bands, not rows: 120 individual distances do not show a shape, and the reader's question is
      what shape of distance the retriever accepted. One table per `dist_kind` — never pooled. */
-  #why { padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 12px; }
-  #why .kind { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px;
-               color: var(--fg-dim); }
+  #why { padding: 8px var(--inset); border-bottom: 1px solid var(--line); font-size: var(--t-cell); }
+  #why .kind { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+               margin-bottom: 8px; color: var(--fg-dim); }
   #why .kind b { font-family: var(--mono); font-weight: 600; color: var(--fg);
                  font-variant-numeric: tabular-nums; }
-  #why .bands { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 10px; }
+  /* Six bands, always. Full width fits all six; the 340px rail fits three, so the rail's media
+     query re-splits them. auto-fit was tried first and left four collapsed 0px tracks whose gaps
+     still occupied 32px of dead space. */
+  #why .bands { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+                gap: 8px; margin-bottom: 8px; }
+  /* Placed AFTER the base rule on purpose: same specificity, so source order decides. Declared up
+     with the other rail rules it lost the cascade and the range labels wrapped mid-number. */
+  @media (min-width: 1180px) {
+    #why .bands { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
   #why .band { min-width: 0; }
-  #why .band .rng { font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+  #why .band .rng { font-family: var(--mono); font-size: var(--t-label); color: var(--fg-dim);
                     font-variant-numeric: tabular-nums; }
   #why .band .bar { height: 4px; border-radius: 2px; background: var(--accent); margin: 3px 0; }
   #why .band .bar.zero { background: var(--line); }
-  #why .band .n { font-family: var(--mono); font-size: 11px; color: var(--fg);
+  #why .band .n { font-family: var(--mono); font-size: var(--t-label); color: var(--fg);
                   font-variant-numeric: tabular-nums; }
 
   /* ── 5. notes ──────────────────────────────────────────────────────── */
   #notes {
-    margin-top: 18px; padding: 10px 12px;
+    margin-top: 24px; padding: 12px var(--inset);
     background: var(--bg-muted); border: 1px solid var(--line); border-radius: 2px;
-    font-size: 11px; color: var(--fg-dim);
+    /* Prose, not a label. At --t-label it read two steps smaller than the cells it explains. */
+    font-size: var(--t-cell); line-height: 1.6; color: var(--fg-dim);
   }
-  #notes ul { margin: 0; padding-left: 16px; }
+  /* The marker sits on the shared left edge and the text hangs off it; padding-left on the
+     list would push the bullet 16px right of every other block instead. */
+  #notes ul { margin: 0; padding-left: 0; list-style-position: outside; }
+  #notes li { margin-left: 14px; }
   #notes li { padding: 1px 0; white-space: pre-wrap; }
 
-  #help { display: none; margin-top: 14px; padding: 10px 12px;
+  #help { display: none; margin-top: 24px; padding: 12px var(--inset);
           border: 1px solid var(--line-strong); border-radius: 2px; background: var(--bg-raised);
-          font-size: 11px; color: var(--fg-dim); }
+          font-size: var(--t-label); color: var(--fg-dim); }
   #help.open { display: block; }
   #help dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; }
   #help dt { font-family: var(--mono); color: var(--fg); }
@@ -283,7 +348,7 @@
   #help-hint { font-family: var(--mono); color: var(--fg-faint); cursor: pointer;
                padding: 0 3px; user-select: none; }
   #help-hint:hover { color: var(--accent); }
-  .foot { margin-top: 14px; font-size: 11px; color: var(--fg-faint); }
+  .foot { margin-top: 24px; padding: 0 var(--inset); font-size: var(--t-label); color: var(--fg-faint); }
 </style>
 </head>
 <body>
@@ -300,10 +365,11 @@
   <button type="button" id="meta-toggle">detail</button><div id="meta" hidden></div>
 </div></div>
 <div class="wrap">
-  <div class="sec">
+ <div id="main">
+  <div class="sec" id="sec-stream">
     <span class="label">prompt stream</span>
     <span class="count" id="stream-count"></span>
-    <span class="count dim" id="stream-foot"></span><span class="spark" id="stream-spark"></span>
+    <span class="spark" id="stream-spark"></span>
     <span class="modes" id="modes">
       <button type="button" data-mode="prompts" class="on">prompts</button
       ><button type="button" data-mode="sessions">sessions</button
@@ -315,19 +381,23 @@
       <button type="button" id="stop" title="stop this local viewer (it writes nothing; the corpus is untouched)">stop</button>
     </span>
   </div>
-  <table id="stream">
-    <thead><tr id="head-row"></tr></thead>
-    <tbody id="stream-body"></tbody>
-  </table>
-  <div class="empty" id="stream-empty" hidden></div>
+  <div id="stream-pane">
+    <table id="stream">
+      <thead><tr id="head-row"></tr></thead>
+      <tbody id="stream-body"></tbody>
+    </table>
+    <div class="empty" id="stream-empty" hidden></div>
+  </div>
+  <div id="notes"></div>
+ </div>
 
-  <div class="sec"><span class="label">why these notes</span><span class="count dim" id="why-foot"></span></div>
+ <aside id="rail">
+  <div class="sec" id="sec-why"><span class="label">why these notes</span><span class="count dim" id="why-foot"></span></div>
   <div id="why"></div>
 
-  <div class="sec"><span class="label">labels</span></div>
+  <div class="sec" id="sec-labels"><span class="label">labels</span></div>
   <div id="labels"></div>
-
-  <div id="notes"></div>
+ </aside>
 
   <div id="help">
     <dl>
@@ -436,7 +506,9 @@ function renderVerdict(w, scoring, pace) {
   sub.appendChild(txt(
     "채점된 범위에서 에코 " + ech + "/" + det + " — 무신호이지 무효과 판정이 아니다. "
   ));
-  const why = el("span", "dim", "표본 하한 미달로 판정 보류 · 창 마감 " + ((w && w.until) || "?"));
+  const why = el("span", "dim", "표본 하한 미달로 판정 보류 · ");
+  const deadline = el("span", "dim nowrap", "창 마감 " + ((w && w.until) || "?"));
+  why.appendChild(deadline);
   sub.appendChild(why);
 
   const box = $("floors");
@@ -634,21 +706,40 @@ function bindModes() {
 // switching to `notes` left the columns labelled time/session/hits/controls while the cells held
 // note/injections/sessions/withheld — the header lied and the numbers lined up under the wrong
 // words, which is worse than no header at all.
-const HEADS = {
-  prompts: ["", "time", "session", "", "hit sources"],
-  sessions: ["", "span", "session", "prompts", "notes", "echoed"],
-  notes: ["", "note", "injections", "sessions", "phrases"],
+// One column list per mode; the header labels, the right-alignment and the cells are all read
+// from it. Kept as two hand-maintained lists they diverged twice: `sessions` emitted a seventh
+// cell repeating the note count under no header at all, and `notes` emitted two empty ones. A
+// header that stops one column short of the data is the failure this file already warns about.
+const COLS = {
+  prompts: [{ h: "" }, { h: "time" }, { h: "session" }, { h: "" }, { h: "hit sources", tip: "주입된 상위 3개 출처 + 대조 2개 — 원장이 저장하는 전부" }],
+  sessions: [
+    { h: "" },
+    { h: "span", cell: (g, h) => el("td", null, h.span(g)) },
+    { h: "session", cell: (g) => el("td", null, g.key) },
+    { h: "prompts", r: true, cell: (g) => el("td", "r", String(g.prompts)) },
+    { h: "notes", r: true, cell: (g) => el("td", "r", String(g.srcs.size)) },
+    { h: "echoed", tip: "채점된 프롬프트 중 주입이 실제로 쓰인 것", cell: (g, h) => h.echoed(g) },
+  ],
+  notes: [
+    { h: "" },
+    { h: "note", cell: (g) => el("td", null, g.key) },
+    { h: "injections", r: true, cell: (g) => el("td", "r", String(g.hits)) },
+    { h: "sessions", r: true, cell: (g) => el("td", "r", String(g.sessions.size)) },
+    // No echoed column here on purpose: `echoed` is a session-level fact and the payload carries
+    // no per-note attribution. A per-note echo rate would be invented.
+    { h: "phrases", tip: "노트당 8단어 구문창, 최대 4개", cell: (g, h) => h.phrases(g) },
+  ],
 };
-const RIGHT = { prompts: [], sessions: [3, 4], notes: [2, 3] };
 
 function renderHead(mode) {
   const tr = $("head-row");
   tr.textContent = "";
-  (HEADS[mode] || HEADS.prompts).forEach((label, i) => {
+  (COLS[mode] || COLS.prompts).forEach((col, i) => {
     const th = document.createElement("th");
     if (!i) th.style.width = "1%";
-    if ((RIGHT[mode] || []).indexOf(i) >= 0) th.className = "r";
-    th.appendChild(txt(label));
+    if (col.r) th.className = "r";
+    if (col.tip) { th.title = col.tip; th.classList.add("tip"); }
+    th.appendChild(txt(col.h));
     tr.appendChild(th);
   });
 }
@@ -703,36 +794,30 @@ function renderGrouped(prompts, mode) {
   $("stream-count").textContent =
     n + " " + unit + (n === 1 ? "" : "s") +
     (PAGE && PAGE.truncated ? "  over the newest " + PAGE.returned + " of " + PAGE.total + " prompts" : "");
-  rows.forEach((g) => {
-    const tr = el("tr", "g");
-    if (mode === "sessions") {
+  const helpers = {
+    span: (g) => {
       const clock = (ms) => stamp(new Date(ms).toISOString()).clock;
-      const span = (g.first && g.last) ? (clock(g.first) + " → " + clock(g.last)) : "—";
-      tr.appendChild(el("td", null, ""));
-      tr.appendChild(el("td", null, span));
-      tr.appendChild(el("td", null, g.key));
-      tr.appendChild(el("td", "r", String(g.prompts)));
-      tr.appendChild(el("td", "r", String(g.srcs.size)));
+      return (g.first && g.last) ? (clock(g.first) + " → " + clock(g.last)) : "—";
+    },
+    echoed: (g) => {
       const e = el("td");
       if (g.echoed === true) e.appendChild(txt("echoed"));
       else if (g.echoed === false) e.appendChild(txt("not echoed"));
       else e.appendChild(unknown("mixed or never scored — a session is only scored when it ends"));
-      tr.appendChild(e);
-      tr.appendChild(el("td", "dim", g.srcs.size + " distinct notes"));
-    } else {
-      tr.appendChild(el("td", null, ""));
-      tr.appendChild(el("td", null, g.key));
-      tr.appendChild(el("td", "r", String(g.hits)));
-      tr.appendChild(el("td", "r", String(g.sessions.size)));
-      // No echoed column here on purpose: `echoed` is a session-level fact and the payload
-      // carries no per-note attribution. A per-note echo rate would be invented.
+      return e;
+    },
+    phrases: (g) => {
       const w = el("td");
       if (g.withheld) w.appendChild(unknown("company-origin — phrase windows stayed on the server"));
       else w.appendChild(txt("shown"));
-      tr.appendChild(w);
-      tr.appendChild(el("td", "dim", ""));
-      tr.appendChild(el("td", "dim", ""));
-    }
+      return w;
+    },
+  };
+  rows.forEach((g) => {
+    const tr = el("tr", "g");
+    (COLS[mode] || COLS.notes).forEach((col) => {
+      tr.appendChild(col.cell ? col.cell(g, helpers) : el("td", null, ""));
+    });
     body.appendChild(tr);
   });
 }
@@ -757,8 +842,6 @@ function renderStream(prompts) {
   $("stream-count").textContent = list.length
     ? pageLabel(list.length, "prompt")
     : "";
-  const foot = $("stream-foot");
-  if (foot) foot.textContent = list.length ? "top-3 주입 + 대조 2" : "";
   const spark = $("stream-spark");
   spark.textContent = "";
   if (list.length) spark.appendChild(sparkline(list.map((p) => stamp(p && p.ts).ms)));
@@ -887,18 +970,21 @@ function renderWhy(w) {
     box.appendChild(unknown("query_log carried no scored search rows — undetermined, not zero"));
     return;
   }
-  foot.appendChild(txt("최근 " + w.queries + "개 search 질의의 top-3 회수 거리"));
+  foot.textContent = "최근 " + w.queries + "개 질의";
+  foot.title = "최근 " + w.queries + "개 search 질의의 top-3 회수 거리 — dist_kind 별로 분리";
 
   w.kinds.forEach((k) => {
     const head = el("div", "kind");
-    head.appendChild(txt(k.kind + "  "));
-    const nb = el("b"); nb.appendChild(txt("n=" + k.n)); head.appendChild(nb);
-    head.appendChild(txt("  min "));
-    const a = el("b"); a.appendChild(txt(k.min.toFixed(3))); head.appendChild(a);
-    head.appendChild(txt("  median "));
-    const m = el("b"); m.appendChild(txt(k.median.toFixed(3))); head.appendChild(m);
-    head.appendChild(txt("  max "));
-    const z = el("b"); z.appendChild(txt(k.max.toFixed(3))); head.appendChild(z);
+    head.appendChild(el("span", "nowrap", k.kind));
+    // A label and its number are one token. Letting the flex row break between them puts a bare
+    // `max` at the end of a line and the figure on the next, which reads as two facts.
+    [["n=", k.n], ["min ", k.min.toFixed(3)], ["median ", k.median.toFixed(3)],
+     ["max ", k.max.toFixed(3)]].forEach(([label, value]) => {
+      const pair = el("span", "nowrap");
+      pair.appendChild(txt(label));
+      const b = el("b"); b.appendChild(txt(String(value))); pair.appendChild(b);
+      head.appendChild(pair);
+    });
     box.appendChild(head);
 
     // Scale within this kind only — a shared scale across kinds would imply comparable units.
