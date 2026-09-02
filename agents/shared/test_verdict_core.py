@@ -182,8 +182,18 @@ def test_the_thresholds_still_match_the_registered_contract():
         (int(V.WORKS_RATIO), "작동 배수"),
         (int(V.WORKS_GAP_PP), "작동 격차"),
         (int(V.BROKEN_MARGIN_PP), "비작동 여유"),
+        # Dates and the midpoint gate travel with the thresholds. They used to be spelled in
+        # peek.py, GOALS and a docstring at once, and the docstring still said the window closed
+        # 2026-09-09 a day after the reset moved it to 09-14 — nobody could see that rot.
+        (V.MIDPOINT_MIN_SCORED, "중간점 채점 세션 하한"),
     ):
         assert re.search(rf"\b{value}\b", section), f"{what} {value} 가 PRD §2 에 없다"
+    for date, what in (
+        (V.WINDOW_SINCE, "창 시작"),
+        (V.WINDOW_UNTIL, "창 마감"),
+        (V.MIDPOINT, "중간점"),
+    ):
+        assert date in section, f"{what} {date} 가 PRD §2 에 없다"
 
 
 def test_the_repair_boundary_splits_by_instant_not_by_string():
