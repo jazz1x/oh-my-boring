@@ -91,6 +91,12 @@ read-only, binds to loopback with no flag to change that, never calls a generati
 withholds the prose of company-origin notes. Press `?` in the page for the key map, `stop` to shut
 it down.
 
+`make peek` shows what the corpus does for you. `make usage` shows what it cost: token and model
+usage folded out of the same local transcripts, per day, model, repo, or lane. Fan-out is its own
+lane rather than part of the conversation's own total, retries are charged once, and worktrees
+fold into their parent repo. It prints and exits — no screen, no network, one cached index so a
+rescan is seconds rather than a pass over the whole tree.
+
 ---
 
 ## Architecture
