@@ -442,7 +442,7 @@ impl Store {
                  --   unmeasurable and every relevance threshold was argued from distances alone.
                  --   One row per (query_log row, hit position, judge): `llm` and `human` verdicts
                  --   are stored SIDE BY SIDE, never overwriting each other, so their agreement rate
-                 --   is itself a measurement — an LLM judge sharing the system's embedding family
+                 --   is itself a measurement — an LLM judge nobody has checked
                  --   is a biased instrument until that rate says otherwise.
                  CREATE TABLE IF NOT EXISTS recall_label (
                      query_log_id int NOT NULL REFERENCES query_log(id) ON DELETE CASCADE,

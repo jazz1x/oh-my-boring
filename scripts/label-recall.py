@@ -226,15 +226,23 @@ def run_audit(client, args):
     # Say what this sitting can and cannot finish. "3 candidates" reads as done when the floor
     # still wants 17, and a silent shortfall is how a window closes with no verdict in it.
     print(f"[label-recall] 후보 {len(candidates)}건 · 하한까지 {owed}건 남음")
-    for sample in candidates:
+    done = 0
+    for index, sample in enumerate(candidates, 1):
         excerpt = read_excerpt(sample["path"])
         if excerpt is None:
             continue
         key = (sample["query_log_id"], sample["hit_index"])
         dist = sample.get("dist")
         print("\n" + "=" * 72)
+        print(f"[{index}/{len(candidates)}]  기록됨 {done} · 하한까지 {max(0, owed - done)}")
         print(f"PROMPT: {sample['query'][:300]}")
-        print(f"NOTE  : {sample['path']}  dist={dist}  llm={llm_verdicts.get(key)}")
+        # The model's verdict and the retrieval distance are deliberately NOT shown yet. This
+        # sitting exists to measure how often the person disagrees with the model, and a person
+        # who has just read `llm=irrelevant` is no longer an independent reference — the number
+        # the floor is protecting would be measuring anchoring instead of agreement. Both are
+        # printed straight after the answer, so a disagreement is still visible while it is being
+        # made rather than discovered in a report weeks later.
+        print(f"NOTE  : {sample['path']}")
         print("-" * 72)
         print(excerpt[:600])
         print("-" * 72)
@@ -247,7 +255,10 @@ def run_audit(client, args):
         if verdict is None:
             continue
         record(client, sample, label_core.JUDGE_HUMAN, verdict, "human", "")
-        print(f"  recorded {verdict}")
+        done += 1
+        machine = llm_verdicts.get(key)
+        mark = "일치" if machine == verdict else "불일치"
+        print(f"  recorded {verdict}  ·  llm={machine} ({mark})  ·  dist={dist}")
     return 0
 
 
