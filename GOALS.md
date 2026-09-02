@@ -1,4 +1,4 @@
-<!-- derived-from: PRD v2 -->
+<!-- derived-from: PRD v3 -->
 # GOALS
 
 Derived from `docs/PRD.md`. The PRD says what the product is; this file says which of its

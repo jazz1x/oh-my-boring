@@ -19,6 +19,14 @@ for _var in ("BORING_CONFIG", "BORING_HOME", "BORING_URL", "BORING_EVENT_SINK",
              "BORING_LLM_MODEL", "KIMI_CODE_HOME"):
     os.environ.pop(_var, None)
 
+# The pop above isolates these tests from the host's env, and in doing so it removed the one value
+# that kept event writes off the production store: with no sink set, `event_log` defaults to the
+# DB. Measured before this line, one run of this file wrote 2 rows into the live `event_log`, and
+# `guard.sh` runs it every time — 1014 rows of fixture session `codex-abc` had accumulated by
+# 2026-09-02, growing daily. Isolation and a closed write door are both required, so the pop is
+# followed by an explicit spool rather than by nothing.
+os.environ["BORING_EVENT_SINK"] = "spool"
+
 
 def _load(name, filename):
     spec = importlib.util.spec_from_file_location(name, str(HERE / filename))
