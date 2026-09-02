@@ -216,6 +216,28 @@ class Midpoint(unittest.TestCase):
                 self.assertEqual(V.window_today(), "2026-09-08")
                 self.assertEqual(late.date().isoformat(), "2026-09-07", "UTC would say yesterday")
 
+    def test_a_malformed_override_falls_back_loudly(self):
+        """A back door that turns the measurement off by accident is worse than no back door.
+
+        Measured before this guard: `2026-9-8` — the zero-padding people actually type — plus
+        `internal` and `20260908` each compare below MIDPOINT under the lexical comparison, so the
+        gate went quiet with no error anywhere. Falls back to the real clock rather than raising,
+        because this runs inside the morning briefing: a wrong variable should cost a warning, not
+        the day's report.
+        """
+        V = uv.verdict_core
+        real = V.window_today.__wrapped__ if hasattr(V.window_today, "__wrapped__") else None
+        for bad in ("2026-9-8", "internal", "20260908", "2026-09-08T00:00:00"):
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"BORING_TODAY": bad}):
+                with redirect_stderr(err):
+                    got = V.window_today()
+            self.assertNotEqual(got, bad, f"{bad!r} must not be taken as a date")
+            self.assertIn("YYYY-MM-DD", err.getvalue(), bad)
+
+        with mock.patch.dict(os.environ, {"BORING_TODAY": "2026-09-08"}):
+            self.assertEqual(V.window_today(), "2026-09-08", "a well-formed override still works")
+
     def test_the_dates_are_not_spelled_here(self):
         """The gate reads `verdict_core`, which the PRD-transcription test covers."""
         source = (HERE / "uptake-verdict.py").read_text(encoding="utf-8")

@@ -17,6 +17,8 @@ treatment is a different ratio, not a rougher one — see `uptake_core.session_u
 """
 
 import os
+import sys
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
@@ -185,12 +187,34 @@ def _instant(value):
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+#: `YYYY-MM-DD`. The comparison against MIDPOINT and WINDOW_UNTIL is lexical, which is exact for
+#: this format and silent nonsense for any other.
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def window_today(override=None):
     """Today, on the window's calendar. `BORING_TODAY` overrides it for tests and rehearsal.
 
     One definition, so the briefing and doctor cannot disagree about what day the gate is on.
+
+    A malformed override falls back to the real clock and says so. Measured: `2026-9-8` (the
+    zero-padding people actually type), `internal`, and `20260908` each compare below MIDPOINT and
+    above nothing, so the gate goes quiet with no error anywhere — a back door that turns the
+    measurement off by accident. Falling back rather than raising, because this runs inside the
+    morning briefing: a wrong variable should cost a warning, not the day's report.
     """
-    return override or os.environ.get("BORING_TODAY") or datetime.now(WINDOW_TZ).date().isoformat()
+    if override is not None:
+        return override
+    stamp = os.environ.get("BORING_TODAY")
+    if stamp:
+        if _DATE.match(stamp):
+            return stamp
+        print(
+            f"[verdict] BORING_TODAY={stamp!r} is not YYYY-MM-DD — using the real date instead."
+            " A lexical compare would have taken it and turned the window gate off silently.",
+            file=sys.stderr,
+        )
+    return datetime.now(WINDOW_TZ).date().isoformat()
 
 
 def partition_at_repair(rows, boundary=LEDGER_REPAIR_AT):
