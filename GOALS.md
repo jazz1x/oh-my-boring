@@ -28,9 +28,14 @@ In scope:
   the old build, twice on 2026-09-02 alone **[R4]**.
 - Mid-window progress check on 2026-09-08: fewer than 10 scored sessions turns the window into an
   instrumentation investigation rather than a wait **[R1]**.
-- Shadow-log the PostToolUse file trigger — record what a file-scoped anchor lookup *would* have
-  returned, inject nothing. Injecting would change the transcript and contaminate the treatment
-  arm's echo **[R1]**.
+- Measure what a file-scoped anchor lookup would return, without building the surface that would
+  do it — `make anchor-shadow`, over transcripts already on disk **[R1]**. A PostToolUse hook was
+  the obvious shape and is the wrong one twice over: it is an eighth delivery path to get wrong,
+  and calling `/search` from it writes rows into `query_log`, which is exactly where
+  `label-recall.py` samples from — the shadow lookup would enter M1's sample as a query that was
+  never injected. Injecting from it would also change the transcript and contaminate the treatment
+  arm's echo. The transcripts hold every Edit and Write with its path, so the number comes out of
+  data that already exists.
 
 Not enforced by this slice, and why:
 
