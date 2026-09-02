@@ -219,6 +219,10 @@ pub struct EventLogFilter<'a> {
 pub struct CompactReport {
     pub vacuum_ms: u128,
     pub reindex_ms: u128,
+    /// Half-built indexes a failed `REINDEX CONCURRENTLY` left behind. Reported rather than
+    /// swept silently: a number that climbs every run says reindexing keeps failing, which is
+    /// the fault worth seeing — the leftovers themselves are only its residue.
+    pub dropped_invalid_indexes: usize,
     pub prune_query_log: usize,
     pub gc_tool: usize,
     pub gc_concept: usize,
@@ -1692,6 +1696,31 @@ impl Store {
             "query_log",
             "event_log",
         ] {
+            // Sweep first: a `REINDEX CONCURRENTLY` that fails or is interrupted leaves its
+            // half-built index behind as `<name>_ccnew<N>`, marked invalid. Postgres never
+            // reclaims those on its own, the next REINDEX cannot reuse the name, and they
+            // accumulate one per failed run — twelve of them had collected here by 2026-09-02,
+            // four generations deep on three different indexes. They are invisible to the
+            // planner, so nothing is slower and nothing errors; they simply never leave.
+            let leftovers = db
+                .query(
+                    "SELECT c.relname FROM pg_class c
+                       JOIN pg_index i ON i.indexrelid = c.oid
+                       JOIN pg_class t ON t.oid = i.indrelid
+                      WHERE NOT i.indisvalid AND t.relname = $1
+                        AND c.relname LIKE '%\\_ccnew%'",
+                    &[&table],
+                )
+                .await
+                .with_context(|| format!("list invalid indexes on {table}"))?;
+            for row in leftovers {
+                let name: String = row.get(0);
+                // Quoted as an identifier because it comes from the catalogue, not from a caller.
+                db.batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS \"{name}\";"))
+                    .await
+                    .with_context(|| format!("drop invalid index {name}"))?;
+                report.dropped_invalid_indexes += 1;
+            }
             db.batch_execute(&format!("REINDEX TABLE CONCURRENTLY {table};"))
                 .await
                 .with_context(|| format!("reindex table {table}"))?;
