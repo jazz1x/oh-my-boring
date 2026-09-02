@@ -176,6 +176,16 @@ def main(argv=None):
         )
 
     if args.midpoint:
+        # `--json` asks for a payload and `--midpoint` answers with an exit code. Silently
+        # dropping one of them hands the caller a result they did not ask for, which is how a
+        # machine consumer ends up parsing nothing and reading it as empty.
+        if args.json:
+            print(
+                "[uptake-verdict] --midpoint 와 --json 은 함께 못 쓴다 —"
+                " 전자는 종료코드로, 후자는 페이로드로 답한다",
+                file=sys.stderr,
+            )
+            return 2
         return _midpoint(per_agent, skipped_old)
 
     if args.json:

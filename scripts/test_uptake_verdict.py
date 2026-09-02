@@ -143,6 +143,19 @@ class Midpoint(unittest.TestCase):
         self.assertEqual(code, uv.MIDPOINT_UNREADABLE)
         self.assertIn("관측 불가", out)
 
+    def test_json_and_midpoint_refuse_each_other(self):
+        """One answers with a payload, the other with an exit code; dropping either is silent.
+
+        A caller that asked for JSON and got an exit code parses nothing and reads it as empty —
+        the absence-as-measurement failure, arriving through an argument parser this time.
+        """
+        err = io.StringIO()
+        with mock.patch.object(uv, "fetch_events", return_value=[_event("a", 0, 10)]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                code = uv.main(["--json", "--midpoint"])
+        self.assertEqual(code, 2)
+        self.assertIn("함께 못 쓴다", err.getvalue())
+
     def test_the_dates_are_not_spelled_here(self):
         """The gate reads `verdict_core`, which the PRD-transcription test covers."""
         source = (HERE / "uptake-verdict.py").read_text(encoding="utf-8")
