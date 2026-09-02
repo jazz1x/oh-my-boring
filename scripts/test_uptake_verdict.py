@@ -190,6 +190,32 @@ class Midpoint(unittest.TestCase):
         self.assertEqual(run.astimezone(tz.utc).date().isoformat(), "2026-09-07")
         self.assertEqual(run.date().isoformat(), V.MIDPOINT, "the gate must be due on that run")
 
+    def test_the_unset_path_reads_the_window_zone_not_utc(self):
+        """`BORING_TODAY` is a back door, and every other test walks through it.
+
+        That left `datetime.now(WINDOW_TZ)` — the wiring this whole change is about — untouched by
+        the suite: swapping it for `timezone.utc` passed everything. The same shape as the defect
+        the architect found last round, where the function was right and only the wiring was
+        wrong, so it is asserted here without the override.
+        """
+        from datetime import datetime, timedelta, timezone as tz
+
+        V = uv.verdict_core
+        # 23:30 UTC is already the next day in the window's zone. If `window_today` reads UTC it
+        # answers with yesterday, which is exactly the day the 08:00 KST briefing would lose.
+        late = datetime(2026, 9, 7, 23, 30, tzinfo=tz.utc)
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tzinfo=None):
+                return late.astimezone(tzinfo) if tzinfo else late
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BORING_TODAY", None)
+            with mock.patch.object(V, "datetime", _Frozen):
+                self.assertEqual(V.window_today(), "2026-09-08")
+                self.assertEqual(late.date().isoformat(), "2026-09-07", "UTC would say yesterday")
+
     def test_the_dates_are_not_spelled_here(self):
         """The gate reads `verdict_core`, which the PRD-transcription test covers."""
         source = (HERE / "uptake-verdict.py").read_text(encoding="utf-8")
