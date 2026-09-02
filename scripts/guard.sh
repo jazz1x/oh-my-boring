@@ -77,6 +77,7 @@ python3 agents/hermes/test_ingest_worker.py
 python3 scripts/test_data_steward.py
 python3 scripts/test_vault_cleanup_gate.py
 python3 scripts/test_usage.py
+python3 scripts/test_anchor_shadow.py
 python3 scripts/test_retention.py
 python3 scripts/test_self_verify_contract.py
 python3 scripts/test_peek.py
