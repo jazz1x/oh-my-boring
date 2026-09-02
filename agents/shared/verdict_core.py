@@ -16,8 +16,9 @@ Both rates are per-prompt over the same denominator. A per-hit control against a
 treatment is a different ratio, not a rougher one — see `uptake_core.session_uptake`.
 """
 
+import os
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
 #: Sessions the window needs before any number is reported. Below this the rates are noise from
@@ -148,6 +149,12 @@ def unreported(rows):
 #: The midpoint is a one-time progress gate, not a recurring one: below the floor on that date the
 #: window becomes an instrumentation investigation rather than a wait (docs/PRD.md §2). It does not
 #: apply to the extension, which changes no threshold.
+#: The window's dates are the OWNER'S calendar days, not UTC ones. The morning briefing runs at
+#: 08:00 KST, which is 23:00 UTC the day before — so a UTC comparison makes the 09-08 briefing say
+#: nothing and the 09-09 one carry the warning, handing back a day of a window that is being
+#: watched precisely because it is short. Fixed offset rather than the machine's local zone: this
+#: also runs inside a container, and a gate that moves with `TZ` is not a registered date.
+WINDOW_TZ = timezone(timedelta(hours=9))
 WINDOW_SINCE = "2026-08-31"
 WINDOW_UNTIL = "2026-09-14"
 MIDPOINT = "2026-09-08"
@@ -176,6 +183,14 @@ def _instant(value):
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def window_today(override=None):
+    """Today, on the window's calendar. `BORING_TODAY` overrides it for tests and rehearsal.
+
+    One definition, so the briefing and doctor cannot disagree about what day the gate is on.
+    """
+    return override or os.environ.get("BORING_TODAY") or datetime.now(WINDOW_TZ).date().isoformat()
 
 
 def partition_at_repair(rows, boundary=LEDGER_REPAIR_AT):

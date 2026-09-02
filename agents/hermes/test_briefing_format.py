@@ -447,6 +447,61 @@ def test_the_window_sample_is_named_in_both_renderings_and_falls_silent_when_met
     assert slack_briefing.window_notice(None) == "", "an unreachable engine is not a zero sample"
 
 
+def test_the_briefing_counts_the_verdicts_population_not_a_neighbouring_one():
+    """`uptake_stats` had no test at all, which is why it summed adapters and skipped the split.
+
+    Measured against the live store on 2026-09-02: pooled across the whole event log it said 14
+    sessions where the verdict sees 3. With the midpoint gate riding this number, that pooled 14
+    would have cleared the floor of 10 and the 09-08 briefing would have said nothing while the
+    gate said "short" — a warning wired to the wrong number is not wired.
+    """
+    import importlib.util
+    import sys as _sys
+    from unittest import mock
+
+    spec = importlib.util.spec_from_file_location(
+        "briefing_under_test", Path(__file__).resolve().parent / "briefing.py"
+    )
+    briefing = importlib.util.module_from_spec(spec)
+    _sys.modules["briefing_under_test"] = briefing
+    spec.loader.exec_module(briefing)
+
+    def row(session, agent, when, total):
+        return {
+            "event": "injection_uptake",
+            "observed_at": when,
+            "session_id": session,
+            "attributes": {
+                "agent": agent,
+                "used_prompts": 0,
+                "total_prompts": total,
+                "used_control_prompts": 0,
+            },
+        }
+
+    before, after = "2026-09-01T00:00:00+00:00", "2026-09-03T00:00:00+00:00"
+    rows = [row(f"old{i}", "claude-code", before, 10) for i in range(6)]
+    rows += [row(f"new{i}", "claude-code", after, 10) for i in range(3)]
+    rows += [row(f"k{i}", "kimi", after, 10) for i in range(4)]
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"entries": rows}).encode()
+
+    with mock.patch.object(briefing.urllib.request, "urlopen", lambda *a, **k: _Resp()):
+        stats = briefing.uptake_stats()
+
+    assert stats["sessions"] == 3, (
+        f"pre-repair rows and other adapters must not inflate it: {stats}"
+    )
+
+
 def test_the_midpoint_warning_rides_the_one_channel_that_reaches_a_person():
     """PRD §2's midpoint gate, on the briefing rather than only in doctor.
 
@@ -459,6 +514,8 @@ def test_the_midpoint_warning_rides_the_one_channel_that_reaches_a_person():
     """
     import os
 
+    slack_briefing = load_module("slack_briefing_midpoint", ROOT / "slack_briefing.py")
+    V = slack_briefing.verdict_core
     short = {"sessions": 3, "total_prompts": 31}
     floor = V.MIDPOINT_MIN_SCORED
 
@@ -633,27 +690,18 @@ def test_repeated_project_names_are_written_once():
 
 
 if __name__ == "__main__":
-    test_slack_mrkdwn_uses_flat_readable_bullets()
-    test_blocked_is_never_truncated_and_both_renderers_agree()
-    test_done_does_not_push_blockers_off_the_first_screen()
-    test_long_text_is_cut_at_a_boundary_and_says_so()
-    test_weekly_reports_persistence_not_closure()
-    test_weekly_never_sums_label_counts_across_days()
-    test_weekly_quotes_the_latest_daily_rather_than_resummarising()
-    test_the_weekly_text_carries_what_the_blocks_carry()
-    test_weekly_blocks_carry_the_not_a_closure_rate_caveat()
-    test_slack_mrkdwn_handles_adversarial_inputs()
-    test_slack_mrkdwn_dedups_duplicate_bullets_across_project_sections()
-    test_slack_mrkdwn_filters_placeholders_and_noise()
-    test_done_is_counted_in_the_text_renderer_too()
-    test_singular_labels_are_not_dumped_into_the_unlabelled_bucket()
-    test_the_engines_default_claim_kind_is_a_category_not_a_leftover()
-    test_the_window_sample_is_named_in_both_renderings_and_falls_silent_when_met()
-    test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met()
-    test_the_text_fallback_carries_the_shortlist_too()
-    test_zones_replace_status_headings_but_keep_the_status()
-    test_each_zone_names_the_call_that_digs_into_it()
-    test_endings_are_shaved_not_truncated()
-    test_sources_are_one_line_not_five_titles()
-    test_repeated_project_names_are_written_once()
-    print("ok - hermes briefing Slack formatting")
+    # Every `test_*` defined above, discovered rather than listed. The list was hand-maintained
+    # and two tests written on 2026-09-02 were simply never called — the same defect this repo
+    # already catalogued when a test file sat unregistered in `guard.sh`. A registry you can
+    # forget to update is a registry that eventually lies about coverage.
+    import sys as _sys
+
+    _module = _sys.modules[__name__]
+    _tests = [
+        (name, obj)
+        for name, obj in sorted(vars(_module).items())
+        if name.startswith("test_") and callable(obj)
+    ]
+    for _name, _fn in _tests:
+        _fn()
+    print(f"ok - hermes briefing Slack formatting ({len(_tests)} tests)")

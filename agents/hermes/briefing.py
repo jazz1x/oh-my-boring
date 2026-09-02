@@ -67,14 +67,23 @@ def uptake_stats() -> dict | None:
             rows = json.loads(resp.read().decode("utf-8")).get("entries") or []
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return None
-    per_agent, _skipped = verdict_core.collect(rows)
+    # The verdict's own population, not a neighbouring one. Two corrections, both measured on
+    # 2026-09-02 against the live store:
+    #
+    # - **Post-repair only.** The owner chose to keep the window and split the sample at the
+    #   ledger repair (§8 D4); rows from before it are reported separately and never judged.
+    #   Pooled across the whole store this line said 14 sessions where the verdict sees 3.
+    # - **Per adapter, minimum.** The floors are per-agent because the adapters run different
+    #   products, so summing them clears a floor neither one clears. With the midpoint gate riding
+    #   this number, a pooled 14 would have stayed silent on 09-08 while the gate said "short".
+    _pre, post = verdict_core.partition_at_repair(rows)
+    per_agent, _skipped = verdict_core.collect(post)
     if not per_agent:
         return {"sessions": 0, "total_prompts": 0}
-    totals = {"sessions": 0, "total_prompts": 0}
-    for counts in per_agent.values():
-        totals["sessions"] += counts["sessions"]
-        totals["total_prompts"] += counts["total_prompts"]
-    return totals
+    return {
+        "sessions": min(c["sessions"] for c in per_agent.values()),
+        "total_prompts": min(c["total_prompts"] for c in per_agent.values()),
+    }
 
 
 def main() -> None:

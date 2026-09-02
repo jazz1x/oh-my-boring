@@ -48,14 +48,18 @@ def fetch_events(base_url, limit):
 #: those is a shortfall in the sample; the rest are a shortfall in what we can see, and a doctor
 #: check that calls them the same thing points at the wrong repair.
 MIDPOINT_OK = 0
-MIDPOINT_NOT_DUE = 0
 MIDPOINT_SHORT = 3
 MIDPOINT_UNREADABLE = 4
+#: Distinct from OK. They both mean "no action", but a shell that has to tell them apart was
+#: reading Korean prose to do it — so the wording of a message became the only thing separating
+#: "the floor is met" from "the gate is not due", and rephrasing a sentence would have silently
+#: turned one into the other.
+MIDPOINT_NOT_DUE = 5
 
 
 def _midpoint(per_agent, skipped_old, today=None):
     """The one-time progress gate. Silent outside its window — see PRD §2."""
-    today = today or datetime.now(timezone.utc).date().isoformat()
+    today = verdict_core.window_today(today)
     if today < verdict_core.MIDPOINT:
         print(
             f"[midpoint] 아직 아니다 — 중간점 {verdict_core.MIDPOINT}, 오늘 {today}",
@@ -151,10 +155,20 @@ def main(argv=None):
                 file=sys.stderr,
             )
             return 2
+        if args.agent:
+            # The gate is per-adapter by contract (PRD §2). Filtering to one adapter would let
+            # another adapter's shortfall pass unseen, which is the same arithmetic the per-adapter
+            # rule exists to forbid — just arrived through a flag instead of a sum.
+            print(
+                "[uptake-verdict] --midpoint 는 --agent 로 좁힐 수 없다 —"
+                " 게이트는 어댑터별이고, 거르면 다른 어댑터의 미달이 숨는다",
+                file=sys.stderr,
+            )
+            return 2
         # `BORING_TODAY` exists so the gate can be exercised through the CLI on a date other
         # than today. A unit test that calls `_midpoint` directly cannot see the wiring, and the
         # wiring is exactly where this gate was broken.
-        return _midpoint(per_agent, skipped_old, today=os.environ.get("BORING_TODAY"))
+        return _midpoint(per_agent, skipped_old)
 
     if not per_agent:
         # §2 turns "0 events" into an instrumentation investigation, but the clause it registers
