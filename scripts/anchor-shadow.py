@@ -53,22 +53,23 @@ def edits(paths):
     """(project, path, session) for every Edit/Write of a code file, oldest session first."""
     for f in paths:
         project, session = f.parent.name, f.stem
-        for line in open(f, encoding="utf-8", errors="replace"):
-            try:
-                row = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            message = row.get("message")
-            if not isinstance(message, dict):
-                continue
-            for block in message.get("content") or []:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
+        with open(f, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except (ValueError, TypeError):
                     continue
-                if block.get("name") not in ("Edit", "Write"):
+                message = row.get("message")
+                if not isinstance(message, dict):
                     continue
-                target = (block.get("input") or {}).get("file_path") or ""
-                if CODE.search(target):
-                    yield project, target, session
+                for block in message.get("content") or []:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    if block.get("name") not in ("Edit", "Write"):
+                        continue
+                    target = (block.get("input") or {}).get("file_path") or ""
+                    if CODE.search(target):
+                        yield project, target, session
 
 
 def vault_mentions(basenames):

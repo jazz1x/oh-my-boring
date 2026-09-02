@@ -90,27 +90,41 @@ class WhatCounts(unittest.TestCase):
 
 class VaultSearch(unittest.TestCase):
     def test_the_vault_search_ignores_gitignore(self):
-        """`.gitignore` carries `vault/wiki/*`, and ripgrep honours it when walking a directory.
+        """Ripgrep honours `.gitignore` when walking a directory, and this repo ignores the vault.
 
-        Without `--no-ignore` this returns 0 for every file and the coverage reads as a clean 0% —
-        the exact reading that was produced and nearly believed on 2026-09-02. Asserted by
-        behaviour against the real vault rather than by grepping the source, because the source
-        also contains the word in the comment explaining why it is there.
+        Without `--no-ignore` the traversal returns nothing and coverage reads as a clean 0% — the
+        exact reading produced and nearly believed on 2026-09-02.
+
+        Hermetic on purpose. An earlier version asserted against the repo's own vault and passed
+        locally while failing in CI, where the checkout carries only the committed notes and the
+        file the glob happened to pick was not ignored at all. A test whose subject depends on
+        which files exist is testing the environment.
         """
         import subprocess
+        import tempfile
 
-        sample = next(shadow.VAULT.glob("*.md"), None)
-        self.assertIsNotNone(sample, "vault is empty; this test needs the real corpus")
-        ignored = subprocess.run(
-            ["git", "check-ignore", "-q", str(sample)], cwd=str(HERE.parent)
-        )
-        self.assertEqual(ignored.returncode, 0, "vault is no longer gitignored — trap is gone")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text("notes/*\n", encoding="utf-8")
+            notes = root / "notes"
+            notes.mkdir()
+            (notes / "n1.md").write_text("touches markers.py:63 here\n", encoding="utf-8")
 
-        # A note does not contain its own filename, so probe with a string the corpus is known to
-        # carry: `markers.py` appears in wiki-0994's body and in its claims frontmatter.
-        counts = shadow.vault_mentions(["markers.py", "this-string-is-in-no-note-xyzzy"])
-        self.assertGreaterEqual(counts["markers.py"], 1, "the vault is being skipped again")
-        self.assertEqual(counts["this-string-is-in-no-note-xyzzy"], 0, "absence must read as 0")
+            hidden = subprocess.run(
+                ["git", "check-ignore", "-q", str(notes / "n1.md")], cwd=str(root)
+            )
+            self.assertEqual(hidden.returncode, 0, "fixture must actually be ignored")
+
+            saved = shadow.VAULT
+            try:
+                shadow.VAULT = notes
+                counts = shadow.vault_mentions(["markers.py", "absent-xyzzy"])
+            finally:
+                shadow.VAULT = saved
+
+            self.assertGreaterEqual(counts["markers.py"], 1, "the ignored note must still be read")
+            self.assertEqual(counts["absent-xyzzy"], 0, "absence must read as 0")
 
 
 if __name__ == "__main__":
