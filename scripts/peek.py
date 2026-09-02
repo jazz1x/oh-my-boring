@@ -546,7 +546,14 @@ def labels_block(stats):
 
 
 def scoring_block(prompt_rows_out):
-    """How much of what is on screen has actually been scored.
+    """How much of what is on screen has actually been scored — of what is ON SCREEN.
+
+    The population is the ledger rows this page is showing: the newest 200, capped to the last
+    three days the ledger keeps. It is NOT the verdict's population, which is the
+    `injection_uptake` events, and the two do not agree — read together on 2026-09-02, this block
+    said 61 scored with 0 echoes while the event series held 11 echoes across 770 prompts. Quoting
+    this number as "the echo rate" is quoting a sample as a population, and it was done four times
+    before anyone checked.
 
     The hidden risk this exists to surface: `echoed` is only known when a session ENDS, sessions
     here run for days, and the ledger ages out after three. So the newest rows structurally
@@ -558,6 +565,8 @@ def scoring_block(prompt_rows_out):
     determined = sum(1 for r in prompt_rows_out if r.get("echoed") is not None)
     echoed = sum(1 for r in prompt_rows_out if r.get("echoed") is True)
     return {
+        # `of` names the population on every read, so the number cannot travel without it.
+        "of": "화면의 원장 행 (최근 3일, 판정 모집단 아님)",
         "rows": total,
         "determined": determined,
         "echoed": echoed,
