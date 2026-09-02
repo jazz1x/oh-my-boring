@@ -82,6 +82,17 @@ case "${1:-}" in
         echo "injection_ledger duplicate_rows=0 total_rows=100 sessions=0"
         exit 0
     fi
+    # doctor asks whether the uptake detector can still see a use handed to it verbatim. A zero
+    # rate from a blind scorer looks exactly like a zero rate from an unused channel, and
+    # docs/PRD.md §2 will not read "not working" off one.
+    if [ "${2:-}" = --sensitivity-probe ]; then
+        if [ "${DOCTOR_UPTAKE_BLIND:-0}" = 1 ]; then
+            echo "uptake_sensitivity=blind rows=12 reason=a phrase was handed back and not counted"
+            exit 1
+        fi
+        echo "uptake_sensitivity=ok rows=12 reason=phrase from wiki-0001.md was detected"
+        exit 0
+    fi
     echo "fake python3: unmodelled uptake_core call: $*" >&2
     exit 7
     ;;
@@ -571,6 +582,22 @@ esac
 # (d5c) One prompt recorded twice means the recall hook fired twice. The uptake rate cannot see
 # it — both halves of the fraction double — so the ledger is the only place it shows, and it
 # quietly halves the evidence behind a pre-registered sample floor (docs/PRD.md §2).
+# A blind uptake detector has to fail readiness, not warn: the window closes on a verdict, and a
+# verdict read off a scorer that sees nothing is worse than no verdict at all.
+( make_case "$TMP/uptake-blind" yes
+  if DOCTOR_UPTAKE_BLIND=1 run_strict "$TMP/uptake-blind" "$TMP/uptake-blind.out"; then
+      cat "$TMP/uptake-blind.out"
+      echo "FAIL: a blind uptake detector must fail strict doctor" >&2
+      exit 1
+  fi
+  grep -q "UPTAKE DETECTOR IS BLIND" "$TMP/uptake-blind.out" || {
+      cat "$TMP/uptake-blind.out"
+      echo "FAIL: the blind detector must be named, not merely counted" >&2
+      exit 1
+  }
+  echo "ok - a blind uptake detector fails readiness"
+)
+
 ( make_case "$TMP/ledger-clean" yes
   if ! run_strict "$TMP/ledger-clean" "$TMP/ledger-clean.out"; then
       cat "$TMP/ledger-clean.out"

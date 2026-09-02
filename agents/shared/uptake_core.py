@@ -274,6 +274,43 @@ def session_uptake(records, transcript_text):
     )
 
 
+def sensitivity_probe(records):
+    """Can this detector see a use it is handed on a plate? Returns `(ok, reason)`.
+
+    Treatment and control both sitting at zero is the signature of a channel nobody used AND the
+    signature of a detector that sees nothing, and the rates cannot tell them apart. docs/PRD.md
+    §2 therefore refuses to read a "not working" verdict until sensitivity is shown, and this is
+    what shows it: take a phrase from a hit that was really injected, put it in an assistant turn
+    verbatim, and require the scorer to find it.
+
+    Real ledger records, not a fixture, because the failure modes worth catching live between the
+    parts — a snippet that yields no phrases, a transcript format the turn splitter stopped
+    matching, a normalisation change that makes stored phrases unmatchable. A fixture built from
+    the same constants would pass through all three.
+
+    The phrase is chosen to avoid `prompt_words`: a hit whose words the user already typed is
+    excluded by design (that exclusion is the whole reason this measure is not self-fulfilling),
+    so probing with one would fail for a correct reason and read as a broken detector.
+    """
+    for record in records or []:
+        prompt_words = set(record.get("prompt_words") or [])
+        for hit in record.get("hits") or []:
+            for phrase in hit.get("phrases") or []:
+                words = _words(phrase)
+                if not words or any(w in prompt_words for w in words):
+                    continue
+                probe = [dict(record, controls=[], hits=[hit])]
+                result = session_uptake(probe, "[assistant] " + phrase)
+                if result.used_prompts >= 1:
+                    return True, f"phrase from {hit.get('src') or '?'} was detected"
+                return False, (
+                    f"a phrase injected from {hit.get('src') or '?'} was handed back verbatim and"
+                    " the scorer did not count it — the detector is blind, so a zero rate is not"
+                    " evidence about the channel"
+                )
+    return None, "no ledger record carries a phrase outside its own prompt — nothing to probe with"
+
+
 def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_DAYS):
     """Drop this session's records, and any left behind by sessions that never ended.
 
@@ -382,11 +419,46 @@ def duplicate_injections(path=None, window=DUPLICATE_WINDOW_S):
     return extra, total, len(sessions)
 
 
+def _probe_main(rest):
+    """Run the sensitivity probe against the newest real session in the ledger."""
+    by_session = {}
+    try:
+        with open(rest[0] if rest else ledger_path(), encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                sid = record.get("session_id")
+                if sid:
+                    by_session.setdefault(sid, []).append(record)
+    except OSError:
+        pass
+    if not by_session:
+        print("uptake_sensitivity=unknown reason=empty_ledger")
+        return 0
+    newest = max(
+        by_session.values(), key=lambda rows: max((r.get("ts") or 0) for r in rows)
+    )
+    ok, reason = sensitivity_probe(newest)
+    state = {True: "ok", False: "blind", None: "unknown"}[ok]
+    print(f"uptake_sensitivity={state} rows={len(newest)} reason={reason}")
+    return 1 if ok is False else 0
+
+
 def _main(argv):
-    if "--duplicate-injections" not in argv:
-        print("usage: uptake_core.py --duplicate-injections [ledger-path]", file=sys.stderr)
-        return 2
     rest = [a for a in argv if not a.startswith("--")]
+    if "--sensitivity-probe" in argv:
+        return _probe_main(rest)
+    if "--duplicate-injections" not in argv:
+        print(
+            "usage: uptake_core.py [--duplicate-injections|--sensitivity-probe] [ledger-path]",
+            file=sys.stderr,
+        )
+        return 2
     extra, total, sessions = duplicate_injections(rest[0] if rest else None)
     print(f"injection_ledger duplicate_rows={extra} total_rows={total} sessions={sessions}")
     if extra:

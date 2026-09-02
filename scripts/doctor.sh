@@ -514,6 +514,24 @@ if [ -f "$ledger_probe" ] && [ "${BORING_SKIP_LEDGER_PROBE:-0}" != 1 ]; then
     fi
 fi
 
+# (d5d) Can the uptake detector see a use it is handed on a plate? Treatment and control both
+# sitting at zero is equally the signature of a channel nobody used and of a scorer that sees
+# nothing, and the rates cannot separate them — so docs/PRD.md §2 refuses a "not working" reading
+# until sensitivity is shown. This is that proof, run daily rather than once on verdict day, so a
+# blind stretch is dated instead of discovered at the end. It scores a phrase from a really
+# injected hit against a synthetic assistant turn; it writes nothing.
+if [ -f "$ledger_probe" ] && [ "${BORING_SKIP_LEDGER_PROBE:-0}" != 1 ]; then
+    if probe_out="$(python3 "$ledger_probe" --sensitivity-probe 2>/dev/null)"; then
+        case "$probe_out" in
+            *uptake_sensitivity=ok*) ok "uptake detector is sensitive (${probe_out#*reason=})" ;;
+            *) warn "uptake sensitivity undetermined — $probe_out. Not a fault; the ledger carries nothing to probe with yet." ;;
+        esac
+    else
+        bad "UPTAKE DETECTOR IS BLIND — $probe_out. An injected phrase handed back verbatim was not counted, so a zero uptake rate says nothing about the channel (PRD §2)."
+        failed_hooks=1
+    fi
+fi
+
 # (d5b) The briefing scripts hermes actually runs. `make build` redeploys the engine image, but
 # the scripts hermes executes live in ~/.hermes/scripts and only the installer copies them there
 # — so merging a briefing change does not deliver it. Measured on 2026-08-26: the installed

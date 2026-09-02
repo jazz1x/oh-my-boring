@@ -271,7 +271,25 @@ def wire_kimi(path: Path | None = None) -> dict:
 
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     changed = False
-    if distill not in existing or recall not in existing:
+
+    # Resolved files, not command strings. `BORING_HOME` is `~/oh-my-boring` on one run and the
+    # symlink's target on the next, so a substring test appended a second identical hook — the
+    # same double-registration #245 fixed for Claude Code, which was never delivered here because
+    # each adapter reimplements its own "is this already wired". Measured 2026-09-02: kimi's
+    # config carried both spellings of both hooks.
+    installed = set()
+    for line in existing.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("command"):
+            installed |= _hook_scripts(stripped.split("=", 1)[-1].strip().strip('"\''))
+    wanted = _hook_scripts(distill) | _hook_scripts(recall)
+
+    removed = _drop_duplicate_kimi_hooks(path, wanted) if path.exists() else 0
+    if removed:
+        existing = path.read_text(encoding="utf-8")
+        changed = True
+
+    if not wanted or not wanted.issubset(installed):
         snippet = (
             "\n[[hooks]]\n"
             'event = "SessionEnd"\n'
@@ -289,7 +307,58 @@ def wire_kimi(path: Path | None = None) -> dict:
             f.write(snippet)
         changed = True
 
-    return {"agent": "kimi", "path": str(path), "changed": changed}
+    return {"agent": "kimi", "path": str(path), "changed": changed, "removed": removed}
+
+
+def _drop_duplicate_kimi_hooks(path: Path, ours: set) -> int:
+    """Keep one `[[hooks]]` block per script we own; return how many were removed.
+
+    An install that merely stops adding duplicates leaves every machine that already ran it
+    injecting twice, which is what turned a 200-prompt sample floor into 100 (docs/PRD.md §8 D1).
+    TOML is edited as text here for the same reason the writer appends text: round-tripping the
+    user's whole config to delete two blocks risks more than it fixes.
+    """
+    if not ours:
+        return 0
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    blocks, current = [], None
+    for index, line in enumerate(lines):
+        if line.strip() == "[[hooks]]":
+            if current is not None:
+                blocks.append(current)
+            current = {"start": index, "end": index, "scripts": set()}
+        elif current is not None:
+            if line.strip().startswith("[") and not line.strip().startswith("[["):
+                blocks.append(current)
+                current = None
+                continue
+            if line.strip().startswith("command"):
+                current["scripts"] |= _hook_scripts(
+                    line.strip().split("=", 1)[-1].strip().strip('"\'')
+                )
+            current["end"] = index
+    if current is not None:
+        blocks.append(current)
+
+    seen, drop = set(), []
+    for block in blocks:
+        mine = block["scripts"] & ours
+        if not mine:
+            continue
+        key = frozenset(mine)
+        if key in seen:
+            drop.append(block)
+        else:
+            seen.add(key)
+    if not drop:
+        return 0
+    kill = set()
+    for block in drop:
+        kill.update(range(block["start"], block["end"] + 1))
+    path.write_text(
+        "".join(line for i, line in enumerate(lines) if i not in kill), encoding="utf-8"
+    )
+    return len(drop)
 
 
 def wire_mcp_agent(agent_id: str, server_name: str, server_config: dict, path: Path | None = None) -> dict:
