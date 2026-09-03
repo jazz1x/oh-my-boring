@@ -439,6 +439,14 @@ impl Store {
                      confidence    text NOT NULL DEFAULT 'certain',
                      PRIMARY KEY (subject, predicate, valid_from)
                  );
+                 -- `about` was carrying two different relations under one name: a claim
+                 -- belonging to a project (8,485 rows) and a document mentioning a concept
+                 -- (5,148). Only the second is semantic, and `semantic_stats.about` -- which sits
+                 -- beside `tools`, `concepts` and `uses` -- was counting both, so that number was
+                 -- overstated by the whole of the first. Idempotent: the predicate matches
+                 -- nothing once the rows carry their own name.
+                 UPDATE edge SET kind = 'claim_of_project'
+                  WHERE kind = 'about' AND src LIKE 'claim:%' AND dst LIKE 'project:%';
                  ALTER TABLE claim ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'fact';
                  ALTER TABLE claim ADD COLUMN IF NOT EXISTS confidence text NOT NULL DEFAULT 'certain';
                  CREATE INDEX IF NOT EXISTS claim_current ON claim(subject, predicate)
@@ -934,7 +942,8 @@ impl Store {
         // claim -> project edge
         if !project.is_empty() {
             let project_id = format!("project:{project}");
-            self.upsert_edge(&claim_id, &project_id, "about").await?;
+            self.upsert_edge(&claim_id, &project_id, "claim_of_project")
+                .await?;
         }
 
         Ok(())

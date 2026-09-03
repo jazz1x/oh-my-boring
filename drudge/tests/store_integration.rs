@@ -233,6 +233,82 @@ async fn current_claims_honors_exclude_origins() {
         .expect("cleanup company");
 }
 
+/// `about` meant two relations at once, and only one of them is semantic. A claim belonging to a
+/// project and a document mentioning a concept were stored under the same kind, so
+/// `semantic_stats.about` -- which sits beside `tools`, `concepts` and `uses` -- counted both and
+/// read as roughly two and a half times the number of concept mentions the corpus actually has.
+/// The relabel has to move exactly the claim rows and leave the concept rows where they are.
+#[tokio::test]
+async fn the_relabel_moves_claim_edges_and_leaves_concept_edges() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let db = connect(&dsn).await;
+    let tag = unique_path("about-split").replace('/', "-");
+    let claim_src = format!("claim:{tag}");
+    let doc_src = format!("doc:{tag}");
+    let project_dst = format!("project:{tag}");
+    let concept_dst = format!("concept:{tag}");
+
+    for (src, dst) in [(&claim_src, &project_dst), (&doc_src, &concept_dst)] {
+        db.execute(
+            "INSERT INTO edge (src, dst, kind) VALUES ($1, $2, 'about')
+             ON CONFLICT DO NOTHING;",
+            &[src, dst],
+        )
+        .await
+        .expect("seed edge");
+    }
+
+    db.execute(
+        "UPDATE edge SET kind = 'claim_of_project'
+          WHERE kind = 'about' AND src LIKE 'claim:%' AND dst LIKE 'project:%';",
+        &[],
+    )
+    .await
+    .expect("relabel");
+
+    let kind_of = |src: String, dst: String| {
+        let db = &db;
+        async move {
+            db.query_one(
+                "SELECT kind FROM edge WHERE src = $1 AND dst = $2;",
+                &[&src, &dst],
+            )
+            .await
+            .expect("edge still there")
+            .get::<_, String>(0)
+        }
+    };
+    assert_eq!(
+        kind_of(claim_src.clone(), project_dst.clone()).await,
+        "claim_of_project"
+    );
+    assert_eq!(
+        kind_of(doc_src.clone(), concept_dst.clone()).await,
+        "about",
+        "a document mentioning a concept is the relation `about` is left meaning"
+    );
+
+    // Running it again moves nothing: the predicate no longer matches.
+    let moved = db
+        .execute(
+            "UPDATE edge SET kind = 'claim_of_project'
+              WHERE kind = 'about' AND src LIKE $1 AND dst LIKE 'project:%';",
+            &[&format!("claim:{tag}")],
+        )
+        .await
+        .expect("second run");
+    assert_eq!(moved, 0, "the relabel must be idempotent");
+
+    for (src, dst) in [(&claim_src, &project_dst), (&doc_src, &concept_dst)] {
+        db.execute("DELETE FROM edge WHERE src = $1 AND dst = $2;", &[src, dst])
+            .await
+            .expect("cleanup");
+    }
+}
+
 /// The briefing decides whether a heading names a project by asking this list, so what it leaves
 /// out is as load-bearing as what it returns. A name that reaches it blank or NULL is not a
 /// project anyone can look up, and a name returned twice would make the caller's membership set
