@@ -151,6 +151,51 @@ class BriefItem:
     text: str
 
 
+#: A `## heading` is a project name only if it looks like one. The parser used to take whatever
+#: the model wrote, so prose became the label the reader sees beside every item — measured across
+#: 62 briefings, 109 of 165 distinct headings (66%) were not projects at all: `# 1. **문제 개요**`,
+#: `Risk`, section titles from some other document's outline. A blind reader given eight of these
+#: found the label disagreed with the item's own text in 14 of 24 top picks.
+#:
+#: Shape, not a list of known projects: the renderer has no database and asking one would put a
+#: network call in a pure function. A project name here is a short single line with no markdown
+#: emphasis, no numbering, and no sentence punctuation — which is what every real one looks like
+#: (`foodspring-front`, `kb-rag-bot`, `boro-janus`) and what none of the 109 do.
+#: The caller has already stripped leading `#`, so a heading arrives as `1. **문제 개요**` rather
+#: than `# 1. …` — the first version of this pattern anchored on the hash and let every one of
+#: them through.
+_NOT_A_PROJECT = re.compile(
+    r"""(?:
+          ^\s*\d+[.)]\s     # "1. " — an outline number, which is followed by a space.
+                            # `1.95.3-stage-검증` is a real project here and must survive: a
+                            # version number runs straight into the next character.
+        | [*_]{2}          # **bold** anywhere: prose, not a name
+        | ^\s*[*_]\w       # _italic_ opening
+        | [.!?。]\s*$       # ends like a sentence
+        | \(               # a parenthetical the model appended
+      )
+    """,
+    re.VERBOSE,
+)
+#: Labels the briefing already understands (`Risk`, `Done`, `Stalled`, …). A heading that is one
+#: of these is a section, not a project — the label branch above catches the canonical spellings,
+#: this catches the rest before they become a project name.
+_LABEL_WORDS = frozenset(w.lower() for w in LABEL_ALIASES)
+#: Long enough to hold `omm-consumer-rollout-plan` (25) and `bi-slack-analytics-bot` (22); short
+#: enough to reject `bi-slack-analytics-bot (S11 요구사항)` (32), which is a project name with a
+#: parenthetical the model added and is not the name of anything.
+_PROJECT_HEADING_MAX = 28
+
+
+def _is_project_heading(heading: str) -> bool:
+    text = (heading or "").strip()
+    if not text or len(text) > _PROJECT_HEADING_MAX:
+        return False
+    if text.lower() in _LABEL_WORDS:
+        return False
+    return not _NOT_A_PROJECT.search(text)
+
+
 @dataclass
 class BriefProject:
     name: str
@@ -787,11 +832,21 @@ def parse_brief(answer: str) -> BriefDocument:
             if plain_heading in LABELS:
                 # Sub-heading like "### Done" sets the pending label.
                 pending_label = canonical_label(plain_heading)
-            else:
+            elif _is_project_heading(heading):
                 if heading and heading != previous_heading:
                     current = BriefProject(heading)
                     doc.projects.append(current)
                     previous_heading = heading
+                pending_label = ""
+            else:
+                # A heading that is neither a label nor a project name. Keeping the previous
+                # project means the items below stay attributed to whatever came before, which is
+                # wrong but silent; opening a new group under this text makes the model's prose
+                # the project name, which is wrong and loud. Neither is acceptable, so the items
+                # go into the unattributed group and the reader is not told a project they can
+                # look up when there is none.
+                current = None
+                previous_heading = ""
                 pending_label = ""
             continue
 
