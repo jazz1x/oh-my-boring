@@ -201,20 +201,27 @@ def _is_project_heading(heading: str, known_projects=None) -> bool:
     So when the corpus can be asked, membership decides. `known_projects` is the set of names the
     engine actually has documents for; a heading outside it is not a project, however name-shaped.
 
-    When it cannot be asked -- engine down, endpoint absent, empty corpus -- this falls back to the
-    shape test alone. That is deliberate: an unreachable engine must not be read as "no projects
-    exist", which would strip the label off every item and look like a corpus with nothing in it.
+    When it cannot be asked -- `known_projects` is None -- this falls back to the shape test plus a
+    length cap. That is deliberate: an unreachable engine must not be read as "no projects exist",
+    which would strip the label off every item and look like a corpus with nothing in it.
+
+    An empty list is not that case. It is the corpus answering that it holds no projects, and then
+    no heading names something the reader can look up, so none of them is a project.
     """
     text = (heading or "").strip()
-    if not text or len(text) > _PROJECT_HEADING_MAX:
+    if not text:
         return False
     if text.lower() in _LABEL_WORDS:
         return False
     if _NOT_A_PROJECT.search(text):
         return False
-    if known_projects:
-        return text.lower() in {str(name).strip().lower() for name in known_projects}
-    return True
+    if known_projects is None:
+        # The engine could not be asked. Length stands in for membership here and nowhere else:
+        # a heading long enough to be a sentence is prose, and with no list to check against that
+        # guess is the only thing left. It costs real projects -- three of the 126 names the corpus
+        # holds are longer than this -- which is why it does not apply once the list is available.
+        return len(text) <= _PROJECT_HEADING_MAX
+    return text.lower() in {str(name).strip().lower() for name in known_projects}
 
 
 @dataclass

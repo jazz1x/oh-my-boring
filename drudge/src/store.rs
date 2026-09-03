@@ -1494,8 +1494,6 @@ impl Store {
             .collect())
     }
 
-    /// Per-judge verdict counts, plus how often the two judges agreed on hits both of them
-    /// labelled. `unsure` is counted, never folded into either side — an abstention is not a vote.
     /// Every project name the corpus actually knows.
     ///
     /// The briefing labels each item with the `##` heading the model wrote above it, and the model
@@ -1517,6 +1515,8 @@ impl Store {
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// Per-judge verdict counts, plus how often the two judges agreed on hits both of them
+    /// labelled. `unsure` is counted, never folded into either side — an abstention is not a vote.
     pub async fn recall_label_stats(&self) -> Result<(Vec<RecallLabelStats>, i64, i64)> {
         let rows = self
             .db()

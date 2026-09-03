@@ -233,7 +233,54 @@ async fn current_claims_honors_exclude_origins() {
         .expect("cleanup company");
 }
 
+/// The briefing decides whether a heading names a project by asking this list, so what it leaves
+/// out is as load-bearing as what it returns. A name that reaches it blank or NULL is not a
+/// project anyone can look up, and a name returned twice would make the caller's membership set
+/// no different -- but the duplicate is a signal the DISTINCT was dropped, so pin both.
+#[tokio::test]
+async fn project_names_are_distinct_and_skip_the_unnamed() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+
+    let named = unique_path("project-names-a");
+    let twin = unique_path("project-names-b");
+    let blank = unique_path("project-names-blank");
+    let slug = format!("proj-{}", named.replace('/', "-"));
+
+    for (path, project) in [
+        (&named, slug.as_str()),
+        (&twin, slug.as_str()),
+        (&blank, ""),
+    ] {
+        let mut front = dummy_frontmatter(path);
+        front.project = project.to_owned();
+        store
+            .upsert_document(&front, "sha-project-names", SystemTime::now())
+            .await
+            .expect("upsert document");
+    }
+
+    let listed = store.project_names().await.expect("project names");
+    assert_eq!(
+        listed.iter().filter(|n| *n == &slug).count(),
+        1,
+        "two documents sharing a project must yield the name once, not twice: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(String::is_empty),
+        "a document with no project must not put an empty name in the list: {listed:?}"
+    );
+
+    for path in [&named, &twin, &blank] {
+        store.delete_document(path).await.expect("cleanup");
+    }
+}
+
 /// Ensure delete_document removes not only document/edge rows but also claims,
+/// because claim has no FK to document./// Ensure delete_document removes not only document/edge rows but also claims,
 /// because claim has no FK to document.
 #[tokio::test]
 async fn delete_document_removes_claims() {
