@@ -255,9 +255,20 @@ pub struct Store {
 /// Kernel A: graph is tool/concept only (`uses`/`about`). Narrative (problem/attempt/solution) lives in
 /// the note body markdown, not as graph nodes — so those edge kinds are gone.
 const SEMANTIC_EDGE_KINDS: [&str; 3] = ["uses", "about", "claims"];
-/// Internal eval fixtures must remain searchable while `make eval` is running, but they are not
-/// user memory. Recency and claim surfaces feed briefings/status, so exclude that fixture namespace.
-const INTERNAL_EVAL_FIXTURE_RE: &str = r"(^|/)eval-[^/]*\.md$";
+/// Not user memory, though both live in the vault and stay searchable elsewhere.
+///
+/// - `eval-*.md`: internal fixtures, which must remain searchable while `make eval` runs.
+/// - `daily-brief-*.md` / `weekly-brief-*.md`: **the briefing's own past output.** Recency feeds
+///   the briefing, so leaving these in makes it read yesterday's summary and restate it as
+///   today's work. Measured 2026-09-03: `omb-helper` appears in 18 daily-brief notes and **zero**
+///   real session notes, having entered on 08-01 and been repeated every morning since — an item
+///   with no evidence behind it that the reader cannot act on and cannot get rid of. The vault
+///   holds 29 such notes against 1,522 real ones, so the loop is small in volume and total in
+///   effect: whatever enters it never leaves.
+///
+/// They stay in the corpus and stay retrievable by `recall`/`search` — this excludes them only
+/// from the recency surface that generates the next briefing.
+const NOT_USER_MEMORY_RE: &str = r"(^|/)(eval-|daily-brief-|weekly-brief-)[^/]*\.md$";
 /// I/O-boundary timeout for pool wait/create/recycle. Prevents infinite hangs on DB loss;
 /// drudge/CLAUDE.md treats this as a graceful boundary, distinct from defensive `{timeout:200}` bounds.
 const POOL_TIMEOUT_SECONDS: u64 = 5;
@@ -609,7 +620,7 @@ impl Store {
                         &exclude_origins,
                         &hours,
                         &project,
-                        &INTERNAL_EVAL_FIXTURE_RE,
+                        &NOT_USER_MEMORY_RE,
                     ],
                 )
                 .await
@@ -628,12 +639,7 @@ impl Store {
                          GROUP BY d.source_path, d.project, d.tags, d.updated_at
                          ORDER BY d.updated_at DESC
                          LIMIT $1;",
-                    &[
-                        &limit,
-                        &exclude_origins,
-                        &project,
-                        &INTERNAL_EVAL_FIXTURE_RE,
-                    ],
+                    &[&limit, &exclude_origins, &project, &NOT_USER_MEMORY_RE],
                 )
                 .await
                 .context("recent docs")?,
@@ -947,13 +953,7 @@ impl Store {
                    AND d.source_path !~ $5
                  ORDER BY c.valid_from DESC
                  LIMIT $1;",
-                &[
-                    &k,
-                    &project,
-                    &kinds,
-                    &exclude_origins,
-                    &INTERNAL_EVAL_FIXTURE_RE,
-                ],
+                &[&k, &project, &kinds, &exclude_origins, &NOT_USER_MEMORY_RE],
             )
             .await
             .context("recent claims")?;
@@ -999,7 +999,7 @@ impl Store {
                     &kinds,
                     &exclude_origins,
                     &older_than_days,
-                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &NOT_USER_MEMORY_RE,
                 ],
             )
             .await
@@ -1050,7 +1050,7 @@ impl Store {
                     &exclude_origins,
                     &project,
                     &kinds,
-                    &INTERNAL_EVAL_FIXTURE_RE,
+                    &NOT_USER_MEMORY_RE,
                 ],
             )
             .await
@@ -1957,7 +1957,42 @@ fn row_to_hit(r: &tokio_postgres::Row, dist_kind: DistKind) -> Hit {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::DistKind;
+    use super::{DistKind, NOT_USER_MEMORY_RE};
+
+    /// The recency and claim surfaces feed the briefing, and the briefing writes notes into the
+    /// same vault — so without this exclusion it reads yesterday's summary and restates it as
+    /// today's work. Measured 2026-09-03: `omb-helper` appeared in 18 daily-brief notes and zero
+    /// real session notes, entering on 08-01 and repeating every morning since.
+    ///
+    /// The other half matters as much: this must exclude ONLY generated output. Excluding a real
+    /// note would silently delete memory from every surface that reads recency, and nothing else
+    /// in the system would report it — 59 of 1,581 documents match, and all 59 are briefings.
+    #[test]
+    fn the_exclusion_covers_generated_output_and_nothing_else() {
+        let re = regex::Regex::new(NOT_USER_MEMORY_RE).unwrap();
+
+        for generated in [
+            "/vault/wiki/daily-brief-2026-09-03.md",
+            "/vault/wiki/weekly-brief-2026-08-31.md",
+            "/vault/wiki/eval-fixture-01.md",
+            "daily-brief-2026-01-01.md",
+        ] {
+            assert!(re.is_match(generated), "must be excluded: {generated}");
+        }
+
+        for real in [
+            "/vault/wiki/wiki-0295.md",
+            "/vault/wiki/wiki-1526.md",
+            // Names that merely *contain* the markers are somebody's actual note. Anchoring the
+            // pattern at a path segment is what keeps this from eating them.
+            "/vault/wiki/my-daily-brief-notes.md",
+            "/vault/wiki/notes-on-eval-design.md",
+            "/vault/raw/2026-09-03-session.md",
+        ] {
+            assert!(!re.is_match(real), "must NOT be excluded: {real}");
+        }
+    }
+
 
     /// `agents/shared/recall_core.py` string-matches this exact JSON contract to decide whether a
     /// `dist` is a comparable cosine distance — a silent rename here would break that filter without
