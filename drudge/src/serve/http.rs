@@ -573,7 +573,6 @@ pub(crate) async fn handle_recall_labels(
     Ok(Json(RecallLabelsResp { entries }))
 }
 
-/// Per-judge counts, per-judge precision, and llm/human agreement over hits both decided.
 /// Project names — the set the briefing validates its headings against.
 ///
 /// Read-only and unfiltered on purpose: the caller is asking "is this string a project we know",
@@ -587,6 +586,7 @@ pub(crate) async fn handle_projects(
     }))
 }
 
+/// Per-judge counts, per-judge precision, and llm/human agreement over hits both decided.
 pub(crate) async fn handle_recall_label_stats(
     State(s): State<AppState>,
 ) -> Result<Json<RecallLabelStatsResp>, AppError> {

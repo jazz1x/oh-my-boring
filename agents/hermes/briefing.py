@@ -64,6 +64,8 @@ def known_projects() -> list | None:
             payload = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return None
+    if not isinstance(payload, dict):
+        return None
     names = payload.get("projects")
     return names if isinstance(names, list) else None
 

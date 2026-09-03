@@ -482,6 +482,77 @@ def test_a_heading_becomes_a_project_label_only_if_it_looks_like_one():
         assert not slack_briefing._is_project_heading(prose), f"not a project: {prose!r}"
 
 
+def test_the_rendered_briefing_actually_uses_the_project_list():
+    """The unit tests all call the validator directly, and that is not where the briefing runs.
+
+    `briefing.py` hands the list to `render_message_mrkdwn`, which passes it to
+    `render_body_mrkdwn`, which passes it to `parse_brief`. Drop the argument at any one of those
+    hops and every heading-level test still passes while the cron -- which delivers through the
+    mrkdwn path -- silently stops checking membership. This walks the whole chain.
+    """
+    slack_briefing = load_module("slack_briefing_wired", ROOT / "slack_briefing.py")
+    answer = (
+        "## foodspring-front\n- Next: ship the thing\n"
+        "## 다른 프로젝트\n- Next: something under a section title\n"
+    )
+
+    known = slack_briefing.render_message_mrkdwn(
+        "*brief*", "2026-09-03", answer, [], "없음", None, None, ["foodspring-front"]
+    )
+    assert "foodspring-front" in known
+    assert "다른 프로젝트" not in known, (
+        "the membership list did not reach the renderer the cron delivers through"
+    )
+
+    unavailable = slack_briefing.render_message_mrkdwn(
+        "*brief*", "2026-09-03", answer, [], "없음", None, None, None
+    )
+    assert "다른 프로젝트" in unavailable, (
+        "with no list the shape test admits it, so its absence above proves the list did the work"
+    )
+
+
+def test_each_shape_rule_rejects_something_no_other_rule_catches():
+    """Five rules, and until now two of them carried every rejection between them.
+
+    Every prose example in these tests looked like `1. **제목**`, which trips the outline rule and
+    the bold rule at once -- so the sentence, italic and length rules were never the reason a
+    heading was cut, and deleting any of them changed nothing. Each case below is written to be
+    caught by exactly one rule.
+    """
+    slack_briefing = load_module("slack_briefing_rules", ROOT / "slack_briefing.py")
+
+    assert not slack_briefing._is_project_heading("3. 남은 일")  # outline number alone
+    assert not slack_briefing._is_project_heading("**남은 일**")  # bold alone
+    assert not slack_briefing._is_project_heading("배포를 먼저 한다.")  # sentence punctuation
+    assert not slack_briefing._is_project_heading("_남은 일_")  # italic opening
+    assert not slack_briefing._is_project_heading("bi-slack-analytics-bot (S11)")  # parenthetical
+    assert not slack_briefing._is_project_heading(
+        "배포 순서를 정리하고 남은 일을 나누어 담당자에게 넘긴다"
+    )  # length alone: 29 chars, no punctuation, no markup
+
+    # The version marker is the case the length and outline rules must both let through.
+    assert slack_briefing._is_project_heading("1.95.3-stage-검증")
+
+
+def test_a_project_the_corpus_knows_is_not_cut_for_being_long():
+    """The length cap is a guess, and membership is not -- so the guess must yield to it.
+
+    Three of the 126 names the corpus holds are longer than the cap
+    (`feature-FDS-16742-softnav-remainder` and two siblings). Applying the cap on top of a real
+    membership list threw those away and no test noticed, because the cap was only ever exercised
+    against strings that were prose anyway.
+    """
+    slack_briefing = load_module("slack_briefing_long", ROOT / "slack_briefing.py")
+    long_name = "feature-FDS-16742-softnav-remainder"
+    assert len(long_name) > slack_briefing._PROJECT_HEADING_MAX
+
+    assert slack_briefing._is_project_heading(long_name, [long_name])
+    assert not slack_briefing._is_project_heading(long_name, None), (
+        "with no list to check, length is the only signal left and it still applies"
+    )
+
+
 def test_the_project_list_fetch_reports_absence_as_absence():
     """`None` and `[]` are different answers and the fetch must not collapse them.
 
@@ -579,13 +650,18 @@ def test_an_unreachable_engine_does_not_read_as_a_corpus_with_no_projects():
     """
     slack_briefing = load_module("slack_briefing_absent", ROOT / "slack_briefing.py")
 
-    for unavailable in (None, [], ()):
-        assert slack_briefing._is_project_heading("foodspring-front", unavailable), (
-            "an unavailable project list must not strip the label off a real project"
-        )
-        assert not slack_briefing._is_project_heading("1. **문제 개요**", unavailable), (
-            "falling back must fall back to the shape test, not to accepting everything"
-        )
+    assert slack_briefing._is_project_heading("foodspring-front", None), (
+        "an unavailable project list must not strip the label off a real project"
+    )
+    assert not slack_briefing._is_project_heading("1. **문제 개요**", None), (
+        "falling back must fall back to the shape test, not to accepting everything"
+    )
+    # An empty list is the corpus answering, not the engine failing to. Nothing is lookupable, so
+    # nothing is labelled -- and the two cases stay distinguishable all the way down, rather than
+    # `[]` quietly behaving like None because an empty container is falsy.
+    assert not slack_briefing._is_project_heading("foodspring-front", []), (
+        "an empty corpus is an answer: no heading names a project the reader could look up"
+    )
 
     doc = slack_briefing.parse_brief(
         "## foodspring-front\n- Next: ship the thing\n", known_projects=None
