@@ -194,8 +194,23 @@ async fn run_brief(
             return;
         }
     };
+    // The sources ride along in the frontmatter because `/brief` serves this note back to the cron
+    // instead of generating a second time (see `http::handle_brief`). Without them the Slack
+    // message would lose its evidence line on every day the note already exists -- which is every
+    // day -- and a briefing that cannot say what it read is worth less than one that can.
+    let sources = out
+        .sources
+        .iter()
+        .map(|s| format!("  - {}", s.replace('"', "'")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sources_block = if sources.is_empty() {
+        String::new()
+    } else {
+        format!("sources:\n{sources}\n")
+    };
     let frontmatter = format!(
-        "---\ntitle: \"Daily Brief — {today}\"\norigin: personal\ndate: {today}\nkind: note\ntags: [daily-brief]\n---\n\n"
+        "---\ntitle: \"Daily Brief — {today}\"\norigin: personal\ndate: {today}\nkind: note\ntags: [daily-brief]\n{sources_block}---\n\n"
     );
     let content = format!("{frontmatter}{}\n", out.answer);
     match std::fs::write(&path, content) {

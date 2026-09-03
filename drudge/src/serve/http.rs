@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use crate::ask;
 use crate::audit;
 use crate::graph;
+use std::path::PathBuf;
+
 use crate::retrieve;
 use crate::serve::{
     AppError, AppState, AskReq, AskResp, CompactResp, EventIngestResp, EventLogEntry, EventLogReq,
@@ -79,11 +81,53 @@ pub(crate) async fn handle_ask(
     }))
 }
 
+/// Today's brief note, split back into answer and sources, when the scheduler has already written
+/// it. Returns None whenever anything is missing or unreadable -- a brief that cannot be read is
+/// not an empty brief, and the caller generates one instead of serving nothing.
+fn todays_brief_note(vault_dir: Option<&PathBuf>) -> Option<(String, Vec<String>)> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let path = vault_dir?
+        .join("wiki")
+        .join(format!("daily-brief-{today}.md"));
+    let raw = std::fs::read_to_string(path).ok()?;
+    let body = raw.split("\n---\n").nth(1)?.trim().to_owned();
+    if body.is_empty() {
+        return None;
+    }
+    let head = raw.split("\n---\n").next().unwrap_or_default();
+    let mut sources = Vec::new();
+    let mut in_sources = false;
+    for line in head.lines() {
+        if line.starts_with("sources:") {
+            in_sources = true;
+        } else if let Some(item) = line.strip_prefix("  - ") {
+            if in_sources {
+                sources.push(item.trim().to_owned());
+            }
+        } else if !line.starts_with(' ') {
+            in_sources = false;
+        }
+    }
+    Some((body, sources))
+}
+
 /// Recency-first briefing — no question (recency retrieval). Called by the cron morning briefing.
 /// Recency (updated_at) ordering depends on pgvector → rejected if `BORING_VECTOR=off`.
 pub(crate) async fn handle_brief(State(s): State<AppState>) -> Result<Json<AskResp>, AppError> {
     let started = Instant::now();
     let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    // The scheduler writes today's brief into the vault at BORING_BRIEF_HOUR and the cron asks for
+    // one a minute later, so the same input was being sent through the model twice every morning
+    // (vault note 08:00, cron output 08:01, both from `ask::brief`). The note is the day's brief;
+    // serve it rather than paying to write it again. A day with no note still generates, which is
+    // what happens when the engine was down at that hour or when someone asks off-schedule.
+    if let Some(cached) = todays_brief_note(s.vault_dir.as_ref().as_ref()) {
+        return Ok(Json(AskResp {
+            answer: cached.0,
+            sources: cached.1,
+            injected_claims: Vec::new(),
+        }));
+    }
     let (out, injected_claims) = ask::brief(store, &s.llm, &[], s.cfg.note_lang.as_str()).await?;
     spawn_query_log(
         s.store.clone(),
@@ -715,5 +759,55 @@ mod tests {
             panic!("oversized batch should fail");
         };
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The cached path replaces a model call, so a parse that is subtly wrong does not fail
+    /// loudly -- it serves a different briefing. Frontmatter must not leak into the body, the
+    /// sources must come back, and anything unreadable must return None so the caller generates
+    /// rather than delivering an empty page.
+    #[test]
+    fn todays_brief_note_splits_body_from_frontmatter() {
+        let dir = std::env::temp_dir().join(format!("brief-note-{}", std::process::id()));
+        let wiki = dir.join("wiki");
+        std::fs::create_dir_all(&wiki).expect("mkdir");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let path = wiki.join(format!("daily-brief-{today}.md"));
+
+        std::fs::write(
+            &path,
+            format!(
+                "---\ntitle: \"Daily Brief — {today}\"\ntags: [daily-brief]\nsources:\n  - /vault/wiki/wiki-1.md\n  - /vault/wiki/wiki-2.md\n---\n\n## foodspring-front\n- Next: ship it\n"
+            ),
+        )
+        .expect("write");
+
+        let (body, sources) = super::todays_brief_note(Some(&dir)).expect("note is readable");
+        assert!(body.starts_with("## foodspring-front"), "body was {body:?}");
+        assert!(
+            !body.contains("tags:"),
+            "frontmatter leaked into the body: {body:?}"
+        );
+        assert_eq!(sources, ["/vault/wiki/wiki-1.md", "/vault/wiki/wiki-2.md"]);
+
+        // A note with a body but no sources block is still a usable brief.
+        std::fs::write(&path, format!("---\ndate: {today}\n---\n\nbody only\n")).expect("w");
+        let (body, sources) = super::todays_brief_note(Some(&dir)).expect("still readable");
+        assert_eq!(body, "body only");
+        assert!(sources.is_empty());
+
+        // An empty body is not a brief. Generating one is better than serving a blank page.
+        std::fs::write(&path, format!("---\ndate: {today}\n---\n\n")).expect("w");
+        assert!(super::todays_brief_note(Some(&dir)).is_none());
+
+        std::fs::remove_file(&path).ok();
+        assert!(
+            super::todays_brief_note(Some(&dir)).is_none(),
+            "missing note"
+        );
+        assert!(
+            super::todays_brief_note(None).is_none(),
+            "no vault configured"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
