@@ -186,14 +186,35 @@ _LABEL_WORDS = frozenset(w.lower() for w in LABEL_ALIASES)
 #: parenthetical the model added and is not the name of anything.
 _PROJECT_HEADING_MAX = 28
 
+#: Group name for items whose heading was not a project the reader could look up.
+UNATTRIBUTED = "Brief"
 
-def _is_project_heading(heading: str) -> bool:
+
+def _is_project_heading(heading: str, known_projects=None) -> bool:
+    """Is this heading a project the reader could look up?
+
+    Two gates, and the order matters. The shape test below rejects headings that cannot be a name
+    -- outline numbers, bold prose, sentences. It is sound but not complete: of the 121 headings it
+    passed across the 62 briefings in the vault, only 55 named a project the corpus knows. The rest
+    were plausible strings ("다른 프로젝트") that no pattern can tell from a real name.
+
+    So when the corpus can be asked, membership decides. `known_projects` is the set of names the
+    engine actually has documents for; a heading outside it is not a project, however name-shaped.
+
+    When it cannot be asked -- engine down, endpoint absent, empty corpus -- this falls back to the
+    shape test alone. That is deliberate: an unreachable engine must not be read as "no projects
+    exist", which would strip the label off every item and look like a corpus with nothing in it.
+    """
     text = (heading or "").strip()
     if not text or len(text) > _PROJECT_HEADING_MAX:
         return False
     if text.lower() in _LABEL_WORDS:
         return False
-    return not _NOT_A_PROJECT.search(text)
+    if _NOT_A_PROJECT.search(text):
+        return False
+    if known_projects:
+        return text.lower() in {str(name).strip().lower() for name in known_projects}
+    return True
 
 
 @dataclass
@@ -294,8 +315,9 @@ def render_message_mrkdwn(
     empty_message: str,
     label_stats=None,
     uptake_stats=None,
+    known_projects=None,
 ) -> str:
-    body = render_body_mrkdwn(answer)
+    body = render_body_mrkdwn(answer, known_projects)
     if not body:
         body = empty_message
     out = f"{title}\n`{stamp}`\n\n{body}"
@@ -308,7 +330,7 @@ def render_message_mrkdwn(
     return out
 
 
-def render_body_mrkdwn(answer: str) -> str:
+def render_body_mrkdwn(answer: str, known_projects=None) -> str:
     """Render a priority-first briefing body.
 
     The reader should grasp the day in one glance:
@@ -316,7 +338,7 @@ def render_body_mrkdwn(answer: str) -> str:
     5) recently done. Project names stay attached to each item so context
     is never lost.
     """
-    doc = parse_brief(answer)
+    doc = parse_brief(answer, known_projects)
     if not doc.projects:
         return _compact_text(answer)
 
@@ -609,15 +631,16 @@ def render_blocks_payload(
     empty_message: str,
     label_stats=None,
     uptake_stats=None,
+    known_projects=None,
 ) -> dict[str, Any]:
     """Block Kit version of the priority-first briefing.
 
     Uses single-column sections instead of two-column fields: each status
     group is a clear visual chunk on mobile.
     """
-    doc = parse_brief(answer)
+    doc = parse_brief(answer, known_projects)
     fallback = render_message_mrkdwn(
-        title, stamp, answer, sources, empty_message, label_stats, uptake_stats
+        title, stamp, answer, sources, empty_message, label_stats, uptake_stats, known_projects
     )
     blocks: list[dict[str, Any]] = [
         {
@@ -816,7 +839,7 @@ def render_sources(sources: list[object]) -> str:
     return f"근거: 위키 {len(labels)}건 ({first}" + (f" 외 {rest})" if rest else ")")
 
 
-def parse_brief(answer: str) -> BriefDocument:
+def parse_brief(answer: str, known_projects=None) -> BriefDocument:
     doc = BriefDocument()
     current: BriefProject | None = None
     previous_heading = ""
@@ -832,7 +855,7 @@ def parse_brief(answer: str) -> BriefDocument:
             if plain_heading in LABELS:
                 # Sub-heading like "### Done" sets the pending label.
                 pending_label = canonical_label(plain_heading)
-            elif _is_project_heading(heading):
+            elif _is_project_heading(heading, known_projects):
                 if heading and heading != previous_heading:
                     current = BriefProject(heading)
                     doc.projects.append(current)
@@ -864,8 +887,13 @@ def parse_brief(answer: str) -> BriefDocument:
         if item is None:
             continue
         if current is None:
-            current = BriefProject("Brief")
-            doc.projects.append(current)
+            # One unattributed group, not one per stretch of orphans. Headings the model writes
+            # between real projects would otherwise open a second and third "Brief", and a reader
+            # seeing the same group name three times reads it as three different things.
+            current = next((p for p in doc.projects if p.name == UNATTRIBUTED), None)
+            if current is None:
+                current = BriefProject(UNATTRIBUTED)
+                doc.projects.append(current)
         current.items.append(item)
 
     doc.projects = [project for project in doc.projects if project.items]
@@ -903,11 +931,12 @@ def maybe_print_blocks_json(
     empty_message: str,
     label_stats=None,
     uptake_stats=None,
+    known_projects=None,
 ) -> bool:
     if os.environ.get("BORING_BRIEFING_FORMAT", "").strip().lower() != "blocks":
         return False
     payload = render_blocks_payload(
-        title, stamp, answer, sources, empty_message, label_stats, uptake_stats
+        title, stamp, answer, sources, empty_message, label_stats, uptake_stats, known_projects
     )
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return True

@@ -51,6 +51,23 @@ def label_stats() -> dict | None:
         return None
 
 
+def known_projects() -> list | None:
+    """Project names the corpus has documents for, or None when the engine will not say.
+
+    None and [] are different answers and the renderer treats them differently: None means the
+    question could not be asked, so headings fall back to the shape test; [] would mean the corpus
+    genuinely holds no projects. Returning [] on a failed fetch is how an unreachable engine starts
+    stripping the project off every item in the briefing.
+    """
+    try:
+        with urllib.request.urlopen(f"{HERMES_URL}/projects", timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return None
+    names = payload.get("projects")
+    return names if isinstance(names, list) else None
+
+
 def slack_mrkdwn(answer: str) -> str:
     return render_body_mrkdwn(answer)
 
@@ -110,10 +127,15 @@ def main() -> None:
         return
     stats = label_stats()
     window = uptake_stats()
-    if maybe_print_blocks_json(TITLE, DATE, answer, sources, EMPTY_MESSAGE, stats, window):
+    projects = known_projects()
+    if maybe_print_blocks_json(
+        TITLE, DATE, answer, sources, EMPTY_MESSAGE, stats, window, projects
+    ):
         return
     print(
-        render_message_mrkdwn(f"*{TITLE}*", DATE, answer, sources, EMPTY_MESSAGE, stats, window)
+        render_message_mrkdwn(
+            f"*{TITLE}*", DATE, answer, sources, EMPTY_MESSAGE, stats, window, projects
+        )
     )
 
 

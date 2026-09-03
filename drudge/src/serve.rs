@@ -546,6 +546,11 @@ pub(crate) struct RecallLabelEntry {
 }
 
 #[derive(Serialize)]
+pub(crate) struct ProjectsResp {
+    pub(crate) projects: Vec<String>,
+}
+
+#[derive(Serialize)]
 pub(crate) struct RecallLabelStatsResp {
     pub(crate) judges: Vec<RecallLabelJudgeStats>,
     /// Hits where both judges gave a real verdict, and how many of those matched. Reported even
@@ -764,6 +769,7 @@ pub async fn run(store: Option<Store>, llm: Llm, cfg: config::BoringConfig) -> R
             "/recall-labels",
             get(http::handle_recall_labels).post(http::handle_recall_label_record),
         )
+        .route("/projects", get(http::handle_projects))
         .route("/recall-label-stats", get(http::handle_recall_label_stats))
         .route(
             "/events",

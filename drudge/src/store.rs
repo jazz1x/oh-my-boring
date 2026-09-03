@@ -1496,6 +1496,27 @@ impl Store {
 
     /// Per-judge verdict counts, plus how often the two judges agreed on hits both of them
     /// labelled. `unsure` is counted, never folded into either side — an abstention is not a vote.
+    /// Every project name the corpus actually knows.
+    ///
+    /// The briefing labels each item with the `##` heading the model wrote above it, and the model
+    /// writes section titles there as readily as project names. A name the corpus has never heard
+    /// of is not a project the reader can look up, so the briefing checks its headings against
+    /// this list. Returning the names, not a count: the caller is deciding membership.
+    pub async fn project_names(&self) -> Result<Vec<String>> {
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "SELECT DISTINCT project FROM document
+                  WHERE project IS NOT NULL AND project <> ''
+                  ORDER BY project;",
+                &[],
+            )
+            .await
+            .context("project names")?;
+        Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
     pub async fn recall_label_stats(&self) -> Result<(Vec<RecallLabelStats>, i64, i64)> {
         let rows = self
             .db()
