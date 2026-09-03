@@ -576,8 +576,110 @@ async fn bare_client_does_not_recover_after_connection_kill() {
     );
 }
 
-/// Stalled backlog should respect the requested action kinds; old decisions stay in the decision register.
+/// A stalled report is about work that stalled recently enough to still be the same work, and one
+/// note should not be able to fill the list on its own.
 #[tokio::test]
+async fn stalled_claims_stop_at_the_horizon_and_take_one_row_per_note() {
+    // Two defects that made the same twelve items the briefing's "stalled" list every morning.
+    //
+    // No lower bound: oldest-first with an open floor pinned claims from 2026-06-30 to the top
+    // slots for 65 days. 497 of 548 current `next` claims were over a week old, so the bucket
+    // never emptied and never rotated. Past the horizon an item is not stalled, it is abandoned.
+    //
+    // No per-note limit: one note that emitted several next-steps took several of the twelve
+    // slots. `wiki-0231` held two, `fds-16220` and `fds 16220` — one piece of work under two
+    // spellings of the same axis.
+    let Some(dsn) = test_dsn() else {
+        eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = Store::open(&dsn, 1024).await.expect("open store");
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project = format!("horizon-{stamp}");
+    let emb = [0.1_f32; 1024];
+    let ago = |hours: u64| {
+        SystemTime::now()
+            .checked_sub(Duration::from_hours(hours))
+            .expect("valid timestamp")
+    };
+
+    // One note, two next-steps, both inside the window.
+    let busy = unique_path("claim-horizon-busy");
+    let mut front = dummy_frontmatter(&busy);
+    front.project = project.clone();
+    store
+        .upsert_document(&front, "sha", SystemTime::now())
+        .await
+        .expect("upsert busy doc");
+    for (pred, value, hours) in [
+        ("first-step", "the older of the two", 24 * 20),
+        ("second-step", "same note, same axis restated", 24 * 15),
+    ] {
+        store
+            .upsert_claim(
+                &project,
+                pred,
+                value,
+                &busy,
+                ago(hours),
+                &emb,
+                "next",
+                "certain",
+            )
+            .await
+            .expect("upsert busy claim");
+    }
+
+    // A second note, well past the horizon.
+    let ancient = unique_path("claim-horizon-ancient");
+    let mut front = dummy_frontmatter(&ancient);
+    front.project = project.clone();
+    store
+        .upsert_document(&front, "sha", SystemTime::now())
+        .await
+        .expect("upsert ancient doc");
+    store
+        .upsert_claim(
+            &project,
+            "abandoned",
+            "older than the horizon",
+            &ancient,
+            ago(24 * 90),
+            &emb,
+            "next",
+            "certain",
+        )
+        .await
+        .expect("upsert ancient claim");
+
+    let stalled = store
+        .stalled_claims(10, Some(&project), Some(&["next".to_owned()]), &[], 7)
+        .await
+        .expect("stalled claims");
+
+    assert_eq!(
+        stalled.len(),
+        1,
+        "one row per note, and nothing past the horizon: {stalled:?}"
+    );
+    assert_eq!(
+        stalled[0].predicate, "first-step",
+        "the oldest claim inside the window represents its note"
+    );
+
+    store.delete_document(&busy).await.expect("cleanup busy");
+    store
+        .delete_document(&ancient)
+        .await
+        .expect("cleanup ancient");
+}
+
+#[tokio::test]
+/// Stalled backlog should respect the requested action kinds; old decisions stay in the decision register.
 async fn stalled_claims_honor_requested_kinds() {
     let Some(dsn) = test_dsn() else {
         eprintln!("SKIP: BORING_TEST_DATABASE_URL not set");
