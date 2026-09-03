@@ -482,6 +482,117 @@ def test_a_heading_becomes_a_project_label_only_if_it_looks_like_one():
         assert not slack_briefing._is_project_heading(prose), f"not a project: {prose!r}"
 
 
+def test_the_project_list_fetch_reports_absence_as_absence():
+    """`None` and `[]` are different answers and the fetch must not collapse them.
+
+    Everything downstream depends on it: `[]` says the corpus holds no projects, which strips the
+    label off every item in the briefing; `None` says the engine could not be asked, which falls
+    back to the shape test. A `except: return []` here would render a total outage as a clean
+    briefing with no project on anything.
+    """
+    briefing = load_module("briefing_projects", ROOT / "briefing.py")
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    original = briefing.urllib.request.urlopen
+    try:
+        briefing.urllib.request.urlopen = lambda *a, **k: _Resp(
+            '{"projects": ["foodspring-front", "scenario-compiler"]}'
+        )
+        assert briefing.known_projects() == ["foodspring-front", "scenario-compiler"]
+
+        briefing.urllib.request.urlopen = lambda *a, **k: _Resp('{"projects": []}')
+        assert briefing.known_projects() == [], "an empty corpus is a real answer, not an absence"
+
+        def _down(*_a, **_k):
+            raise OSError("connection refused")
+
+        briefing.urllib.request.urlopen = _down
+        assert briefing.known_projects() is None
+
+        briefing.urllib.request.urlopen = lambda *a, **k: _Resp("not json at all")
+        assert briefing.known_projects() is None
+
+        briefing.urllib.request.urlopen = lambda *a, **k: _Resp('{"projects": "all of them"}')
+        assert briefing.known_projects() is None, "a malformed payload is not a project list"
+    finally:
+        briefing.urllib.request.urlopen = original
+
+
+def test_orphans_from_separate_stretches_share_one_unattributed_group():
+    """Two groups with the same name are two things to the reader, and they are not.
+
+    Non-project headings do not arrive in one run: the model writes a section title, then a real
+    project, then another section title. Appending a fresh group each time renders "Brief" twice
+    in the same briefing with different items under each.
+    """
+    slack_briefing = load_module("slack_briefing_orphan_merge", ROOT / "slack_briefing.py")
+    doc = slack_briefing.parse_brief(
+        "## Risk\n- Next: first orphan\n"
+        "## foodspring-front\n- Next: a real one\n"
+        "## 3. **후속**\n- Next: second orphan\n"
+    )
+    names = [p.name for p in doc.projects]
+    assert names.count(slack_briefing.UNATTRIBUTED) == 1, names
+    orphans = next(p for p in doc.projects if p.name == slack_briefing.UNATTRIBUTED)
+    assert [i.text for i in orphans.items] == ["first orphan", "second orphan"]
+
+
+def test_a_name_shaped_heading_the_corpus_never_heard_of_is_not_a_project():
+    """The shape test is sound but not complete, and this closes the other half.
+
+    Of the 121 headings the shape test passed across 62 briefings, only 55 named a project the
+    corpus knows. `다른 프로젝트` is the rest of them: short, no prose, no outline number -- nothing
+    in the string says it is a section title rather than a name. Only membership does.
+    """
+    slack_briefing = load_module("slack_briefing_known", ROOT / "slack_briefing.py")
+    corpus = ["foodspring-front", "scenario-compiler", "1.95.3-stage-검증"]
+
+    assert slack_briefing._is_project_heading("foodspring-front", corpus)
+    assert slack_briefing._is_project_heading("1.95.3-stage-검증", corpus)
+    assert not slack_briefing._is_project_heading("다른 프로젝트", corpus)
+    assert not slack_briefing._is_project_heading("scenario-compiler-v2", corpus)
+
+    # Membership decides, but it does not resurrect what the shape test already rejected: a corpus
+    # that somehow holds an outline number as a project name still must not label items with it.
+    assert not slack_briefing._is_project_heading("1. **문제 개요**", ["1. **문제 개요**"])
+
+
+def test_an_unreachable_engine_does_not_read_as_a_corpus_with_no_projects():
+    """The failure that this guards is worse than the defect it fixes.
+
+    `known_projects()` returns None when the engine cannot be asked, and None is not []. If an
+    empty list reached the validator as "no projects exist", every heading in the briefing would
+    fail membership and every item would lose its label -- a total outage rendered as a tidy,
+    plausible briefing. Absence of an answer falls back to the shape test instead.
+    """
+    slack_briefing = load_module("slack_briefing_absent", ROOT / "slack_briefing.py")
+
+    for unavailable in (None, [], ()):
+        assert slack_briefing._is_project_heading("foodspring-front", unavailable), (
+            "an unavailable project list must not strip the label off a real project"
+        )
+        assert not slack_briefing._is_project_heading("1. **문제 개요**", unavailable), (
+            "falling back must fall back to the shape test, not to accepting everything"
+        )
+
+    doc = slack_briefing.parse_brief(
+        "## foodspring-front\n- Next: ship the thing\n", known_projects=None
+    )
+    assert [p.name for p in doc.projects] == ["foodspring-front"]
+
+
 def test_items_under_a_non_project_heading_lose_the_label_rather_than_borrow_one():
     """Two wrong answers were available and this picks neither.
 

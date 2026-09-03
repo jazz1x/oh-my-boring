@@ -14,10 +14,10 @@ use crate::graph;
 use crate::retrieve;
 use crate::serve::{
     AppError, AppState, AskReq, AskResp, CompactResp, EventIngestResp, EventLogEntry, EventLogReq,
-    EventLogResp, GraphReq, GraphResp, HealthResp, MCP_MAX_RESULTS, MCP_MAX_TOKENS, QueryLogEntry,
-    QueryLogReq, QueryLogResp, RecallLabelEntry, RecallLabelJudgeStats, RecallLabelReq,
-    RecallLabelStatsResp, RecallLabelsReq, RecallLabelsResp, SearchHit, SearchResp, StalledReq,
-    SyncResp, SyncState, count_wiki_notes, spawn_query_log, vector_disabled,
+    EventLogResp, GraphReq, GraphResp, HealthResp, MCP_MAX_RESULTS, MCP_MAX_TOKENS, ProjectsResp,
+    QueryLogEntry, QueryLogReq, QueryLogResp, RecallLabelEntry, RecallLabelJudgeStats,
+    RecallLabelReq, RecallLabelStatsResp, RecallLabelsReq, RecallLabelsResp, SearchHit, SearchResp,
+    StalledReq, SyncResp, SyncState, count_wiki_notes, spawn_query_log, vector_disabled,
 };
 use crate::store::{EventLogFilter, LoggedHit};
 
@@ -574,6 +574,19 @@ pub(crate) async fn handle_recall_labels(
 }
 
 /// Per-judge counts, per-judge precision, and llm/human agreement over hits both decided.
+/// Project names — the set the briefing validates its headings against.
+///
+/// Read-only and unfiltered on purpose: the caller is asking "is this string a project we know",
+/// and a filtered answer would make a real project look invented.
+pub(crate) async fn handle_projects(
+    State(s): State<AppState>,
+) -> Result<Json<ProjectsResp>, AppError> {
+    let store = s.store.as_ref().ok_or_else(vector_disabled)?;
+    Ok(Json(ProjectsResp {
+        projects: store.project_names().await?,
+    }))
+}
+
 pub(crate) async fn handle_recall_label_stats(
     State(s): State<AppState>,
 ) -> Result<Json<RecallLabelStatsResp>, AppError> {
