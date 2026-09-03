@@ -482,6 +482,66 @@ def test_a_heading_becomes_a_project_label_only_if_it_looks_like_one():
         assert not slack_briefing._is_project_heading(prose), f"not a project: {prose!r}"
 
 
+def test_nothing_in_the_message_names_the_unattributed_group_as_a_project():
+    """`Brief` is a bucket, not a name, and it was being printed everywhere a name goes.
+
+    It led the shortlist (`1. ⏸️ Brief — …`), it headed a bullet group beside real project names,
+    and it was pasted into the follow-up command as `recall("…", "Brief")` -- sending the reader
+    after a project that does not exist. Nearly half of all items land in this bucket (944 of 2016
+    across the 62 briefings in the vault), so none of these is an edge case.
+    """
+    slack_briefing = load_module("slack_briefing_orphan_render", ROOT / "slack_briefing.py")
+    answer = "\n".join(
+        f"## 다른 프로젝트\n- Blocked: 막힌 항목 {n}" for n in range(1, 8)
+    )
+    rendered = slack_briefing.render_message_mrkdwn(
+        "*brief*", "2026-09-03", answer, [], "없음", None, None, ["foodspring-front"]
+    )
+
+    assert "막힌 항목 1" in rendered, "the items themselves must survive"
+    assert slack_briefing.UNATTRIBUTED not in rendered, rendered
+    assert 'recall("…", "Brief")' not in rendered
+    assert "Brief —" not in rendered
+
+
+def test_the_action_zone_and_the_shortlist_agree_on_what_comes_first():
+    """They were two copies of one order, and only one of them got fixed.
+
+    `ZONES` carried its own `("Blocked", "Stalled", "Next")`, so reordering `ACTIONABLE` moved the
+    shortlist while the action zone underneath it still opened with items that had not moved in a
+    week -- the same briefing telling the reader two different things about what matters.
+    """
+    slack_briefing = load_module("slack_briefing_zones", ROOT / "slack_briefing.py")
+    action_zone = dict(slack_briefing.ZONES)["행동"]
+    assert tuple(action_zone) == tuple(slack_briefing.ACTIONABLE), (
+        f"the action zone has its own order again: {action_zone}"
+    )
+
+
+def test_the_shortlist_meets_today_before_it_meets_last_week():
+    """Stalled led the shortlist and kept taking slots from items that were actually for today.
+
+    Measured across the 62 briefings in the vault: Stalled held 34 of 133 shortlist slots (26%),
+    the same few items recurring. Ordered after Next it holds 7 (5%) and Next gains 27, which
+    changes the opening line of 18 of those briefings.
+    """
+    slack_briefing = load_module("slack_briefing_order", ROOT / "slack_briefing.py")
+    assert slack_briefing.ACTIONABLE.index("Next") < slack_briefing.ACTIONABLE.index("Stalled")
+    assert slack_briefing.ACTIONABLE.index("Blocked") == 0, "a blocker still opens the message"
+
+    items = {
+        "Blocked": [("proj-a", slack_briefing.BriefItem("Blocked", "막힘"))],
+        "Stalled": [("proj-b", slack_briefing.BriefItem("Stalled", "일주일째 그대로"))],
+        "Next": [("proj-c", slack_briefing.BriefItem("Next", "오늘 할 일"))],
+    }
+    picks = slack_briefing.top_picks(items, limit=2)
+    assert [label for label, _p, _i in picks] == ["Blocked", "Next"], picks
+
+    # Stalled still reaches the shortlist on a day with room for it.
+    picks = slack_briefing.top_picks(items, limit=3)
+    assert [label for label, _p, _i in picks] == ["Blocked", "Next", "Stalled"], picks
+
+
 def test_the_rendered_briefing_actually_uses_the_project_list():
     """The unit tests all call the validator directly, and that is not where the briefing runs.
 
