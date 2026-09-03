@@ -447,6 +447,64 @@ def test_the_window_sample_is_named_in_both_renderings_and_falls_silent_when_met
     assert slack_briefing.window_notice(None) == "", "an unreachable engine is not a zero sample"
 
 
+def test_a_heading_becomes_a_project_label_only_if_it_looks_like_one():
+    """The parser took whatever the model wrote as the project name beside every item.
+
+    Measured across 62 briefings: 109 of 165 distinct headings were not projects — outline
+    numbers, bolded prose, section titles from some other document. A blind reader given eight of
+    these found the label disagreed with the item's own text in 14 of 24 top picks, and read the
+    grouping as misinformation rather than as context.
+
+    The rejected half matters as much as the accepted half: `1.95.3-stage-검증` is a real project
+    whose name opens with a version number, and an earlier version of the pattern cut it.
+    """
+    slack_briefing = load_module("slack_briefing_heading", ROOT / "slack_briefing.py")
+
+    for real in (
+        "foodspring-front",
+        "kb-rag-bot",
+        "omm-consumer-rollout-plan",
+        "boro-janus-worker",
+        "1.95.3-stage-검증",
+    ):
+        assert slack_briefing._is_project_heading(real), f"real project rejected: {real}"
+
+    for prose in (
+        "1. **문제 개요**",
+        "5. **남은 일**",
+        "2. **해결 방안**",
+        "Risk",
+        "Stalled",
+        "bi-slack-analytics-bot (S11 요구사항)",
+        "필터링 및 자동화 관련 (공통/기타)",
+        "",
+    ):
+        assert not slack_briefing._is_project_heading(prose), f"not a project: {prose!r}"
+
+
+def test_items_under_a_non_project_heading_lose_the_label_rather_than_borrow_one():
+    """Two wrong answers were available and this picks neither.
+
+    Keeping the previous project attributes the items to whatever came before — wrong and silent.
+    Opening a group under the prose makes the model's sentence the project name — wrong and loud.
+    They go unattributed instead, so the reader is never handed a project they can look up when
+    there is none.
+    """
+    slack_briefing = load_module("slack_briefing_orphan", ROOT / "slack_briefing.py")
+    doc = slack_briefing.parse_brief(
+        "## foodspring-front\n"
+        "- Next: ship the thing\n"
+        "## 1. **문제 개요**\n"
+        "- Next: something the model wrote under prose\n"
+    )
+    grouped = {p.name: [i.text for i in p.items] for p in doc.projects}
+    assert "1. **문제 개요**" not in grouped, grouped
+    assert grouped["foodspring-front"] == ["ship the thing"], (
+        "the orphan item must not fall back onto the project above it"
+    )
+    assert "something the model wrote under prose" in grouped["Brief"], grouped
+
+
 def test_the_briefing_counts_the_verdicts_population_not_a_neighbouring_one():
     """`uptake_stats` had no test at all, which is why it summed adapters and skipped the split.
 
