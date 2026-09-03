@@ -198,6 +198,11 @@ async fn run_brief(
     // instead of generating a second time (see `http::handle_brief`). Without them the Slack
     // message would lose its evidence line on every day the note already exists -- which is every
     // day -- and a briefing that cannot say what it read is worth less than one that can.
+    //
+    // Under its own key, not `sources:`. That one is a governed axis -- `vault/.rules/schema.yaml`
+    // restricts it to `raw/`, `meta/` and `.rules/` evidence -- and these are wiki paths. The
+    // linter never sees them today only because a brief note fails the filename pattern first and
+    // audit returns there; borrowing the axis would turn a rename of these files into 60 errors.
     let sources = out
         .sources
         .iter()
@@ -207,7 +212,7 @@ async fn run_brief(
     let sources_block = if sources.is_empty() {
         String::new()
     } else {
-        format!("sources:\n{sources}\n")
+        format!("brief_sources:\n{sources}\n")
     };
     let frontmatter = format!(
         "---\ntitle: \"Daily Brief — {today}\"\norigin: personal\ndate: {today}\nkind: note\ntags: [daily-brief]\n{sources_block}---\n\n"
