@@ -1,5 +1,12 @@
-//! Graph — project/topic edge + vector-hit → graph 1-hop expansion recall.
-//! "find by vector → one hop by graph": pgvector entry + node/edge recursive CTE expansion.
+//! Graph — vector top-1 entry, then the neighbour labels one hop out.
+//!
+//! This is an observation window, not a recall path. It names what a document is linked to; it
+//! does not use those links to find anything. The traversal that changes an answer lives in
+//! `store::related_docs`/`related_doc_content` (two hops, shared-neighbour count >= 2), which
+//! `ask` injects as `# Graph-linked documents`. `retrieve` never reads an edge at all.
+//!
+//! There is no recursive CTE here or anywhere in the crate. The header claimed one for a long
+//! time, which is how a reader comes to believe the search path walks the graph when it does not.
 //!
 //! Cross-reference: design decision D2 (deterministic graph) · ENFORCEMENT.md §B (one-way flow).
 //!
