@@ -268,6 +268,14 @@ const SEMANTIC_EDGE_KINDS: [&str; 3] = ["uses", "about", "claims"];
 ///
 /// They stay in the corpus and stay retrievable by `recall`/`search` — this excludes them only
 /// from the recency surface that generates the next briefing.
+/// How far back a "stalled" report reaches. Beyond this an item is not stalled but abandoned, and
+/// the honest answer is that nobody is working on it — not a line in tomorrow's briefing.
+///
+/// Chosen against the measured distribution rather than picked: `next` claims over 30 days number
+/// 202 of 548, and the four oldest had been pinned to the top slots since 2026-06-30. Thirty days
+/// keeps 295 candidates, which is more than the twelve slots can ever show.
+const STALE_HORIZON_DAYS: i64 = 30;
+
 const NOT_USER_MEMORY_RE: &str = r"(^|/)(eval-|daily-brief-|weekly-brief-)[^/]*\.md$";
 /// I/O-boundary timeout for pool wait/create/recycle. Prevents infinite hangs on DB loss;
 /// drudge/CLAUDE.md treats this as a graceful boundary, distinct from defensive `{timeout:200}` bounds.
@@ -983,16 +991,40 @@ impl Store {
             .db()
             .await?
             .query(
-                "SELECT c.subject, c.predicate, c.value, c.kind, c.confidence FROM claim c
-                 JOIN document d ON d.source_path = c.source_path
-                 WHERE c.superseded_at IS NULL
-                   AND c.valid_from < (NOW() - INTERVAL '1 day' * ($5::bigint))
-                   AND ($2::text IS NULL OR d.project = $2)
-                   AND ($3::text[] IS NULL OR c.kind = ANY($3))
-                   AND NOT (d.origin = ANY($4))
-                   AND d.source_path !~ $6
-                 ORDER BY c.valid_from ASC
-                 LIMIT $1;",
+                // Oldest-first with no lower bound pinned the same twelve claims to the same
+                // slots every single day. Measured 2026-09-03: the top four had not moved since
+                // 2026-06-30 / 07-01 / 07-03, and 497 of 548 current `next` claims are over a
+                // week old, so the bucket never empties and never rotates.
+                //
+                // The floor is not a decay curve and does not treat age as falsehood — the claim
+                // stays current and every other surface still returns it. It says only that a
+                // *stalled* report is about work that stalled recently enough to still be the
+                // same work. Past `STALE_HORIZON_DAYS` an item is not stalled, it is abandoned,
+                // and a briefing that reports it every morning has stopped reporting anything.
+                //
+                // One row per source document, oldest first: a single note that emitted several
+                // next-steps used to take several of the twelve slots. `wiki-0231` held two with
+                // `fds-16220` and `fds 16220` — the same work under two spellings of one axis.
+                "WITH ranked AS (
+                   SELECT c.subject, c.predicate, c.value, c.kind, c.confidence, c.valid_from,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY c.source_path ORDER BY c.valid_from ASC
+                          ) AS per_doc
+                     FROM claim c
+                     JOIN document d ON d.source_path = c.source_path
+                    WHERE c.superseded_at IS NULL
+                      AND c.valid_from <  (NOW() - INTERVAL '1 day' * ($5::bigint))
+                      AND c.valid_from >= (NOW() - INTERVAL '1 day' * ($7::bigint))
+                      AND ($2::text IS NULL OR d.project = $2)
+                      AND ($3::text[] IS NULL OR c.kind = ANY($3))
+                      AND NOT (d.origin = ANY($4))
+                      AND d.source_path !~ $6
+                 )
+                 SELECT subject, predicate, value, kind, confidence
+                   FROM ranked
+                  WHERE per_doc = 1
+                  ORDER BY valid_from ASC
+                  LIMIT $1;",
                 &[
                     &k,
                     &project,
@@ -1000,6 +1032,7 @@ impl Store {
                     &exclude_origins,
                     &older_than_days,
                     &NOT_USER_MEMORY_RE,
+                    &STALE_HORIZON_DAYS,
                 ],
             )
             .await
