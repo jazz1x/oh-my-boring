@@ -1993,7 +1993,6 @@ mod tests {
         }
     }
 
-
     /// `agents/shared/recall_core.py` string-matches this exact JSON contract to decide whether a
     /// `dist` is a comparable cosine distance — a silent rename here would break that filter without
     /// any Rust-side signal that something changed.
