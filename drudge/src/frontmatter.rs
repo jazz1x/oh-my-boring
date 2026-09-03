@@ -106,7 +106,17 @@ impl FrontMatter {
     }
 }
 
-/// The `<proj>` in `…/projects/<proj>/…`, or the parent directory name.
+/// The `<proj>` in `…/projects/<proj>/…`, and nothing else.
+///
+/// This used to fall back to the file's parent directory, which reads a project name out of a
+/// path that never had one. Every note under `vault/wiki/` came out belonging to a project called
+/// `wiki` -- 60 documents, including the briefing's own daily notes, so the briefing was filing
+/// its output under a project, that project was appearing in the corpus's project list, and the
+/// list is what the next briefing checks its headings against. The distiller already decides this
+/// (`distill_core.repo_slug`, which returns empty rather than inventing a folder name); a second
+/// writer with a different rule is how one axis comes to mean two things.
+///
+/// No project is a real answer for a note that belongs to none.
 fn derive_project(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if let Some(i) = parts.iter().position(|&p| p == "projects")
@@ -114,12 +124,7 @@ fn derive_project(path: &str) -> String {
     {
         return (*proj).to_owned();
     }
-    // fallback: the file's parent directory
-    parts
-        .iter()
-        .rev()
-        .nth(1)
-        .map_or_else(|| "unknown".to_owned(), |s| (*s).to_owned())
+    String::new()
 }
 
 /// raw `.md` → (frontmatter, body). Err if frontmatter YAML parsing fails.
@@ -253,5 +258,34 @@ mod tests {
         // ROP: broken frontmatter goes to Err (not a silent fallback)
         let raw = "---\norigin: [unclosed\n---\n본문";
         assert!(parse(raw, "/p.md", &test_cfg()).is_err());
+    }
+
+    /// A path is not a project. The `projects/<name>/` convention is a real declaration and
+    /// survives; the parent directory is not one, and reading it as a project name is what put a
+    /// project called `wiki` in the corpus for every note under `vault/wiki/` -- the briefing's
+    /// own output included, which then fed the list the next briefing validates against.
+    #[test]
+    fn derive_project_reads_a_declaration_and_never_invents_one() {
+        assert_eq!(
+            super::derive_project("/vault/projects/omb/notes/a.md"),
+            "omb"
+        );
+        assert_eq!(
+            super::derive_project("/vault/wiki/daily-brief-2026-09-02.md"),
+            ""
+        );
+        assert_eq!(super::derive_project("/vault/wiki/wiki-0001.md"), "");
+        assert_eq!(super::derive_project("a.md"), "");
+        assert_eq!(super::derive_project(""), "");
+
+        // A declared project still wins over any derivation.
+        let raw = "---\norigin: personal\nproject: foodspring-front\n---\n본문";
+        let (fm, _) = parse(raw, "/vault/wiki/note.md", &test_cfg()).unwrap();
+        assert_eq!(fm.project, "foodspring-front");
+
+        // …and a note that declares none keeps none, rather than borrowing its folder's name.
+        let raw = "---\norigin: personal\n---\n본문";
+        let (fm, _) = parse(raw, "/vault/wiki/note.md", &test_cfg()).unwrap();
+        assert_eq!(fm.project, "");
     }
 }
