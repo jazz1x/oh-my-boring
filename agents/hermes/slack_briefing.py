@@ -383,7 +383,7 @@ def render_body_mrkdwn(answer: str, known_projects=None) -> str:
     if picks and _shortlist_earns_its_place(items_by_label):
         lines.append("*오늘의 1순위*")
         lines.extend(
-            f"{n}. {SECTION_EMOJI[label]} {_slack_inline(project_name)} — {_slack_inline(item.text)}"
+            pick_line(n, label, project_name, item)
             for n, (label, project_name, item) in enumerate(picks, 1)
         )
         lines.append("")
@@ -413,7 +413,14 @@ def render_body_mrkdwn(answer: str, known_projects=None) -> str:
 
 #: Groups that answer "what do I do now", in the order a reader should meet them. Everything else
 #: is confirmation, and confirmation belongs below the fold.
-ACTIONABLE = ("Blocked", "Stalled", "Next")
+#:
+#: Stalled sits after Next, not before it. A stalled item is by definition one that has not moved
+#: in over a week, so it is the least likely of the three to be what today is for -- yet leading
+#: with it gave it 26% of the shortlist slots across the 62 briefings in the vault (34 of 133),
+#: and the same few items kept taking them. Moving it last cuts that to 5% and hands 27 slots to
+#: Next, changing the opening of 18 of those 62 briefings. Stalled still reaches the shortlist on
+#: a day with little else, which is the day it is worth reading.
+ACTIONABLE = ("Blocked", "Next", "Stalled")
 
 #: Six status headings were more precision than the classifier behind them can deliver: the
 #: distiller's own labels wander (a "Blocked" row that is really a task — see the 2026-08-26
@@ -424,7 +431,10 @@ ACTIONABLE = ("Blocked", "Stalled", "Next")
 #: somewhere: an item the distiller failed to label is still an item, and dropping it would make
 #: the briefing quietly lossy — which is worse than the ugly "기타" heading it replaces.
 ZONES = (
-    ("행동", ("Blocked", "Stalled", "Next")),
+    # The action zone is the actionable labels, not a second copy of them. It held its own tuple
+    # in the old order, so moving Stalled last in `ACTIONABLE` fixed the shortlist and left the
+    # zone below it still opening with items that had not moved in a week.
+    ("행동", ACTIONABLE),
     ("참고", ("Risks", "Decisions", "Facts", "")),
 )
 
@@ -447,6 +457,18 @@ ZONE_FOLLOWUP = {
 }
 
 
+def pick_line(number: int, label: str, project_name: str, item) -> str:
+    """One shortlist line, written the same way for both renderers.
+
+    An item with no project prints without one. The alternative -- `1. ⏸️ Brief — …` -- opens the
+    briefing by naming a project that does not exist, in the position the reader trusts most.
+    """
+    head = f"{number}. {SECTION_EMOJI[label]}"
+    if project_name and project_name != UNATTRIBUTED:
+        head = f"{head} {_slack_inline(project_name)} —"
+    return f"{head} {_slack_inline(item.text)}"
+
+
 def zone_followup(zone_title: str, entries) -> str:
     """The MCP call that digs into this zone, aimed at the project carrying the most of it."""
     template = ZONE_FOLLOWUP.get(zone_title)
@@ -454,7 +476,13 @@ def zone_followup(zone_title: str, entries) -> str:
         return ""
     counts: dict[str, int] = {}
     for _label, project_name, _item in entries:
+        if not project_name or project_name == UNATTRIBUTED:
+            # `recall("…", "Brief")` sends the reader after a project that was never real. No
+            # follow-up is better than one that cannot return anything.
+            continue
         counts[project_name] = counts.get(project_name, 0) + 1
+    if not counts:
+        return ""
     busiest = max(counts, key=lambda name: (counts[name], name))
     return template.format(p=_slack_inline(busiest))
 
@@ -577,6 +605,12 @@ def render_zone_lines(entries, limit, sub="   ◦"):
             break
         take = rows[: limit - shown]
         shown += len(take)
+        if project_name == UNATTRIBUTED:
+            # No project the reader could look up, so no name on the line. See `render_group_lines`.
+            lines.extend(
+                f"{SECTION_EMOJI[label]} {_slack_inline(item.text)}" for label, item in take
+            )
+            continue
         name = _slack_inline(project_name)
         if len(take) == 1:
             label, item = take[0]
@@ -607,6 +641,15 @@ def render_group_lines(entries, limit, bullet="•", sub="   ◦"):
         room = limit - shown
         take = items[:room]
         shown += len(take)
+        if project_name == UNATTRIBUTED:
+            # These items had no project the reader could look up, which is why they are here.
+            # Printing the group's internal name beside them puts a project back in front of the
+            # reader -- one that is not a project, cannot be searched, and reads as a real name
+            # sitting among real names. They go flat instead, and the line says nothing it cannot
+            # support. Nearly half of all items land here (944 of 2016 across 62 briefings), so
+            # this is not an edge case in the rendering.
+            lines.extend(f"{bullet} {_slack_inline(i.text)}" for i in take)
+            continue
         name = _slack_inline(project_name)
         if len(take) == 1:
             lines.append(f"{bullet} {name} — {_slack_inline(take[0].text)}")
@@ -694,7 +737,7 @@ def render_blocks_payload(
         picks = top_picks(items_by_label)
         if picks and _shortlist_earns_its_place(items_by_label):
             pick_lines = [
-                f"{n}. {SECTION_EMOJI[label]} {project_name} — {item.text}"
+                pick_line(n, label, project_name, item)
                 for n, (label, project_name, item) in enumerate(picks, 1)
             ]
             blocks.append(_section("*오늘의 1순위*\n" + "\n".join(pick_lines)))
