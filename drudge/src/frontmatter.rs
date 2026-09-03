@@ -288,4 +288,24 @@ mod tests {
         let (fm, _) = parse(raw, "/vault/wiki/note.md", &test_cfg()).unwrap();
         assert_eq!(fm.project, "");
     }
+
+    /// The scheduler writes a `brief_sources:` list into the brief note so `/brief` can serve it
+    /// back without regenerating. It is deliberately not the governed `sources:` axis, and a
+    /// parser that rejected the unknown key would stop the day's own briefing from being ingested
+    /// -- silently, since sync is resilient and counts the failure rather than aborting.
+    #[test]
+    fn a_brief_note_with_its_sources_block_still_parses() {
+        let raw = "---\ntitle: \"Daily Brief — 2026-09-03\"\norigin: personal\ndate: 2026-09-03\nkind: note\ntags: [daily-brief]\nbrief_sources:\n  - /vault/wiki/wiki-1.md\n---\n\n## proj\n- Next: x\n";
+        let (fm, body) = parse(raw, "/vault/wiki/daily-brief-2026-09-03.md", &test_cfg()).unwrap();
+        assert_eq!(fm.kind, "note");
+        assert_eq!(fm.project, "", "a brief note declares no project");
+        assert!(
+            fm.sources.is_empty(),
+            "the governed sources axis stays untouched"
+        );
+        assert!(
+            body.trim_start().starts_with("## proj"),
+            "body was {body:?}"
+        );
+    }
 }

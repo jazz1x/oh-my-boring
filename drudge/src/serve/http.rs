@@ -84,7 +84,7 @@ pub(crate) async fn handle_ask(
 /// Today's brief note, split back into answer and sources, when the scheduler has already written
 /// it. Returns None whenever anything is missing or unreadable -- a brief that cannot be read is
 /// not an empty brief, and the caller generates one instead of serving nothing.
-fn todays_brief_note(vault_dir: Option<&PathBuf>) -> Option<(String, Vec<String>)> {
+pub(crate) fn todays_brief_note(vault_dir: Option<&PathBuf>) -> Option<(String, Vec<String>)> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let path = vault_dir?
         .join("wiki")
@@ -98,7 +98,7 @@ fn todays_brief_note(vault_dir: Option<&PathBuf>) -> Option<(String, Vec<String>
     let mut sources = Vec::new();
     let mut in_sources = false;
     for line in head.lines() {
-        if line.starts_with("sources:") {
+        if line.starts_with("brief_sources:") {
             in_sources = true;
         } else if let Some(item) = line.strip_prefix("  - ") {
             if in_sources {
@@ -121,10 +121,23 @@ pub(crate) async fn handle_brief(State(s): State<AppState>) -> Result<Json<AskRe
     // (vault note 08:00, cron output 08:01, both from `ask::brief`). The note is the day's brief;
     // serve it rather than paying to write it again. A day with no note still generates, which is
     // what happens when the engine was down at that hour or when someone asks off-schedule.
-    if let Some(cached) = todays_brief_note(s.vault_dir.as_ref().as_ref()) {
+    if let Some((answer, sources)) = todays_brief_note(s.vault_dir.as_ref().as_ref()) {
+        // Logged like any other brief. `query_log` records that the endpoint was called and what
+        // came back, not that a model ran -- and it is the only trace this channel leaves, so
+        // skipping it here would have flattened a 163-row series to nothing from the first day
+        // the cache started working, which reads as a channel nobody uses.
+        spawn_query_log(
+            s.store.clone(),
+            "brief",
+            String::new(),
+            LoggedHit::without_distances(sources.clone()),
+            sources.clone(),
+            answer.chars().take(280).collect(),
+            started.elapsed(),
+        );
         return Ok(Json(AskResp {
-            answer: cached.0,
-            sources: cached.1,
+            answer,
+            sources,
             injected_claims: Vec::new(),
         }));
     }
@@ -776,7 +789,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                "---\ntitle: \"Daily Brief — {today}\"\ntags: [daily-brief]\nsources:\n  - /vault/wiki/wiki-1.md\n  - /vault/wiki/wiki-2.md\n---\n\n## foodspring-front\n- Next: ship it\n"
+                "---\ntitle: \"Daily Brief — {today}\"\ntags: [daily-brief]\nbrief_sources:\n  - /vault/wiki/wiki-1.md\n  - /vault/wiki/wiki-2.md\n---\n\n## foodspring-front\n- Next: ship it\n"
             ),
         )
         .expect("write");
@@ -788,6 +801,23 @@ mod tests {
             "frontmatter leaked into the body: {body:?}"
         );
         assert_eq!(sources, ["/vault/wiki/wiki-1.md", "/vault/wiki/wiki-2.md"]);
+
+        // A list key after the block ends it. Without that, every indented item below --
+        // `tags:`, `concepts:`, anything -- is read as a source and the evidence line names
+        // files that were never read.
+        std::fs::write(
+            &path,
+            format!(
+                "---\nbrief_sources:\n  - /vault/wiki/wiki-1.md\nconcepts:\n  - retrieval\n  - briefing\ndate: {today}\n---\n\nbody\n"
+            ),
+        )
+        .expect("write");
+        let (_body, sources) = super::todays_brief_note(Some(&dir)).expect("readable");
+        assert_eq!(
+            sources,
+            ["/vault/wiki/wiki-1.md"],
+            "a later list leaked in: {sources:?}"
+        );
 
         // A note with a body but no sources block is still a usable brief.
         std::fs::write(&path, format!("---\ndate: {today}\n---\n\nbody only\n")).expect("w");

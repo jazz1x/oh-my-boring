@@ -928,6 +928,15 @@ async fn mcp_ask(s: &AppState, args: Option<&Value>) -> Result<Value, (i32, Stri
 /// the last is what went into the prompt, so a consumer can tell whether the answer kept it.
 async fn mcp_brief(s: &AppState) -> Result<Value, (i32, String)> {
     let store = s.store.as_ref().ok_or_else(vec_off_rpc)?;
+    // Same day, same brief, whichever door it comes through. Serving today's note over HTTP while
+    // this path still generated left "one briefing a day" true of one caller and not the other.
+    if let Some((answer, sources)) = super::http::todays_brief_note(s.vault_dir.as_ref().as_ref()) {
+        return Ok(json!({
+            "answer": answer,
+            "sources": sources,
+            "injected_claims": Vec::<String>::new(),
+        }));
+    }
     let (out, injected_claims) = ask::brief(store, &s.llm, &[], s.cfg.note_lang.as_str())
         .await
         .map_err(|e| (-32603_i32, format!("brief: {e:#}")))?;
