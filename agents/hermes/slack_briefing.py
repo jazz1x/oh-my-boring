@@ -12,6 +12,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +76,6 @@ TEMPLATE_BLACKLIST = [
     "waiting for next steps",
     "to be continued",
 ]
-SOURCE_LIMIT = 5
 PROJECT_LIMIT = 6
 #: How many items of a group each renderer shows. One number, not two: the text fallback and the
 #: Block Kit payload go into the same message, and Slack picks between them — so a reader whose
@@ -235,26 +235,17 @@ class BriefDocument:
     projects: list[BriefProject] = field(default_factory=list)
 
 
-_VAULT_DIR = Path(
-    os.environ.get("OMB_VAULT") or Path(__file__).resolve().parents[2] / "vault"
-)
+#: The window's final stretch, after which the ask runs every morning: three days is enough to sit
+#: down for the minute it takes and not so long that daily becomes the nag it replaced.
+_AUDIT_LAST_CALL = "2026-09-12"
 
 
-def source_label(source: object) -> str:
-    name = os.path.basename(str(source)) or str(source)
-    if not name.endswith(".md"):
-        return name
-    wiki_path = _VAULT_DIR / "wiki" / name
+def _is_monday(stamp: str) -> bool:
     try:
-        head = wiki_path.read_text(encoding="utf-8", errors="ignore")[:2048]
-        m = re.search(r"^title:\s*(.+)$", head, re.MULTILINE)
-        if m:
-            title = m.group(1).strip().strip('"').strip("'")
-            if title:
-                return f"{title} ({name})"
-    except Exception:
-        pass
-    return name
+        return datetime.strptime(stamp, "%Y-%m-%d").weekday() == 0
+    except ValueError:
+        # An unparseable date is not a reason to fall silent about work the verdict is waiting on.
+        return True
 
 
 def audit_notice(label_stats) -> str:
@@ -274,6 +265,18 @@ def audit_notice(label_stats) -> str:
         return ""
     owed = label_core.audit_backlog(label_stats)
     if not owed:
+        return ""
+    today = verdict_core.window_today()
+    if today > verdict_core.WINDOW_UNTIL:
+        # Past the window the figure this unblocks can no longer be computed, so the ask is spent.
+        # Without this the line outlives the thing it was asking for.
+        return ""
+    if today < _AUDIT_LAST_CALL and not _is_monday(today):
+        # The count only moves when a person sits down for a minute, so on the days nobody did it
+        # says exactly what it said yesterday. It stood at 20 in all 8 briefings actually sent,
+        # 9 days running -- which is how a line teaches the reader to skip that part of the
+        # message, and the next thing they skip is one that mattered. Weekly until the last few
+        # days, then daily, because by then the ask has a deadline behind it.
         return ""
     return f"📋 판정 대기 — 사람 라벨 {owed}건 더 필요 · `label-recall.py --audit`"
 
@@ -331,9 +334,6 @@ def render_message_mrkdwn(
     for notice in (window_notice(uptake_stats), audit_notice(label_stats)):
         if notice:
             out += f"\n\n{notice}"
-    source_text = render_sources(sources)
-    if source_text:
-        out += f"\n\n_{source_text}_"
     return out
 
 
@@ -405,9 +405,9 @@ def render_body_mrkdwn(answer: str, known_projects=None) -> str:
             lines.append(f"_→ {followup}_")
         lines.append("")
 
-    done = items_by_label.get("Done") or []
-    if done:
-        lines.append(f"{SECTION_EMOJI['Done']} {SECTION_TITLE['Done']} {len(done)}건 — 상세는 위키")
+    # The count line at the top already says "✅ 완료 N". Repeating it at the bottom was the same
+    # number twice in one message -- 7 of the 7 sent briefings that had any Done items, and on
+    # 09-02 the repeat was the entire body. The count survives; the echo does not.
     return f"{' · '.join(counts)}\n\n" + "\n".join(lines).strip()
 
 
@@ -761,22 +761,12 @@ def render_blocks_payload(
                 # A context block: present when wanted, visually quiet when not.
                 blocks.append(_context(f"→ {followup}"))
 
-        done = items_by_label.get("Done") or []
-        if done:
-            blocks.append({"type": "divider"})
-            blocks.append(
-                _context(f"{SECTION_EMOJI['Done']} {SECTION_TITLE['Done']} {len(done)}건 — 상세는 위키")
-            )
         blocks.insert(2, _context(" · ".join(counts)))
 
-    source_text = render_sources(sources)
     for notice in (window_notice(uptake_stats), audit_notice(label_stats)):
         if notice:
             blocks.append({"type": "divider"})
             blocks.append(_context(notice))
-    if source_text:
-        blocks.append({"type": "divider"})
-        blocks.append(_context(source_text))
     return {
         "text": fallback,
         "blocks": blocks[:50],
@@ -831,9 +821,6 @@ def render_weekly_blocks(title, stamp, projects, intervention, board, trend, sou
         # "twenty done" has been lied to, and every day here is an independent re-synthesis.
         blocks.append(_context(" · ".join(parts) + " — 일자별 관측치이며 마감률이 아니다"))
 
-    source_text = render_sources(sources)
-    if source_text:
-        blocks.append(_context(source_text))
     return blocks[:50]
 
 
@@ -867,26 +854,7 @@ def render_weekly_mrkdwn(title, stamp, intervention, board, trend, sources) -> s
         ]
         out.append("")
         out.append("_" + " · ".join(parts) + " — 일자별 관측치이며 마감률이 아니다_")
-    source_text = render_sources(sources)
-    if source_text:
-        out.append("")
-        out.append(f"_{source_text}_")
     return "\n".join(out)
-
-
-def render_sources(sources: list[object]) -> str:
-    """One line naming the corpus, not five titles.
-
-    The full list ran to 277 characters of wiki filenames and titles that the item lines had
-    already said. Slack cannot open a vault file — there is no URL — so the reader can do nothing
-    with them; what survives is the trust signal that an answer came from the corpus at all.
-    """
-    labels = [source_label(source) for source in sources[:SOURCE_LIMIT]]
-    if not labels:
-        return ""
-    first = labels[0].split(" (")[-1].rstrip(")") if " (" in labels[0] else labels[0]
-    rest = len(labels) - 1
-    return f"근거: 위키 {len(labels)}건 ({first}" + (f" 외 {rest})" if rest else ")")
 
 
 def parse_brief(answer: str, known_projects=None) -> BriefDocument:

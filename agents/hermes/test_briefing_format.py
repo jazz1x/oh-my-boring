@@ -43,9 +43,7 @@ Blocked:
 • oh-my-boring
    ◦ 🚨 LM Studio embedding model is not loaded
    ◦ ▶️ add ops status JSON
-_→ `recall("…", "oh-my-boring")` · 느림 `next_actions("oh-my-boring")`_
-
-✅ 완료 1건 — 상세는 위키"""
+_→ `recall("…", "oh-my-boring")` · 느림 `next_actions("oh-my-boring")`_"""
 
     assert briefing.slack_mrkdwn(answer) == expected
     assert weekly.slack_mrkdwn(answer) == expected
@@ -81,8 +79,10 @@ _→ `recall("…", "oh-my-boring")` · 느림 `next_actions("oh-my-boring")`_
     assert "🚨" in group, "the status must survive on the item"
     assert "LM Studio" in group
     assert "Blocked: -" not in payload["text"]
-    assert payload["blocks"][-1]["type"] == "context"
-    assert "wiki-0001.md" in payload["blocks"][-1]["elements"][0]["text"]
+    # No filename anywhere: Slack cannot open a vault file, so naming one was a line the reader
+    # could do nothing with, and its count never moved off the cap.
+    rendered = json.dumps(payload, ensure_ascii=False)
+    assert "wiki-0001.md" not in rendered, rendered
 
 
 def test_blocked_is_never_truncated_and_both_renderers_agree():
@@ -367,15 +367,23 @@ def test_slack_mrkdwn_filters_placeholders_and_noise():
     assert "출처 강등 처리" in body
 
 
-def test_done_is_counted_in_the_text_renderer_too():
+def test_done_is_counted_once_and_never_bulleted():
+    """Done is a number, and it is that number in exactly one place.
+
+    It used to be capped at three bullets here and demoted to a count in the blocks -- the two
+    renderings disagreeing is the defect this contract exists to prevent. Then both renderers
+    printed the count twice: once in the header line and again at the foot as "✅ 완료 N건 — 상세는
+    위키". Measured on the 8 briefings actually sent, the two numbers were identical in all 7 that
+    had any Done items, and on 09-02 the repeat was the whole body.
+    """
     slack_briefing = load_module("slack_briefing_test5", ROOT / "slack_briefing.py")
 
     answer = "## kb-rag-bot\n" + "\n".join(f"- Done: task {i}" for i in range(10))
     body = slack_briefing.render_body_mrkdwn(answer)
-    # Done used to be capped at three bullets here and demoted to a count in the blocks — the
-    # two renderings disagreeing is the defect this whole contract exists to prevent.
     assert body.count("task") == 0
-    assert "✅ 완료 10건" in body
+    assert "✅ 완료 10" in body
+    assert body.count("✅ 완료") == 1, f"the count is stated twice:\n{body}"
+    assert "상세는 위키" not in body
 
 
 def test_singular_labels_are_not_dumped_into_the_unlabelled_bucket():
@@ -848,6 +856,8 @@ def test_the_midpoint_warning_rides_the_one_channel_that_reaches_a_person():
 
 
 def test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met():
+    import os
+
     slack_briefing = load_module("slack_briefing_audit", ROOT / "slack_briefing.py")
 
     # The LLM judge accrues 24 a night on its own; the human side only moves when a person
@@ -857,6 +867,7 @@ def test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met
     answer = "# p\n- Next: 뭔가 한다\n"
     behind = {"judges": [{"judge": "llm", "relevant": 18, "irrelevant": 30}], "compared": 4}
 
+    os.environ["BORING_TODAY"] = "2026-09-07"  # a Monday inside the window
     body = slack_briefing.render_message_mrkdwn("*T*", "S", answer, [], "empty", behind)
     payload = slack_briefing.render_blocks_payload("T", "S", answer, [], "empty", behind)
     def all_text(blocks):
@@ -884,6 +895,23 @@ def test_the_audit_backlog_is_named_in_both_renderings_and_falls_silent_when_met
     # Unknown is not the same as outstanding: an unreachable endpoint would otherwise print the
     # full floor as backlog, a number nobody can act on.
     assert slack_briefing.audit_notice(None) == "", "unknown counts must not be reported as owed"
+
+    # The count only moves when a person sits down for a minute, so on every other day it repeats
+    # itself word for word -- it stood at 20 across all 8 briefings actually sent, nine days
+    # running. A line that never changes is one the reader learns to skip.
+    try:
+        os.environ["BORING_TODAY"] = "2026-09-08"  # Tuesday, mid-window
+        assert slack_briefing.audit_notice(behind) == "", "a daily repeat of yesterday's number"
+
+        os.environ["BORING_TODAY"] = "2026-09-12"  # the last stretch: a deadline is behind it now
+        assert "--audit" in slack_briefing.audit_notice(behind)
+
+        os.environ["BORING_TODAY"] = "2026-09-15"  # past the window
+        assert slack_briefing.audit_notice(behind) == "", (
+            "the figure this unblocks can no longer be computed, so the ask is spent"
+        )
+    finally:
+        os.environ.pop("BORING_TODAY", None)
 
 
 def test_the_text_fallback_carries_the_shortlist_too():
@@ -966,16 +994,24 @@ def test_endings_are_shaved_not_truncated():
     assert slack_briefing.shave_ending("no korean tail here") == "no korean tail here"
 
 
-def test_sources_are_one_line_not_five_titles():
-    slack_briefing = load_module("slack_briefing_src", ROOT / "slack_briefing.py")
+def test_no_renderer_names_a_source_file_the_reader_cannot_open():
+    """The evidence line said the same thing every day and pointed at nothing openable.
 
+    It was first five wiki titles (277 characters), then one line -- `근거: 위키 5건 (wiki-1501.md
+    외 4)`. Measured on what was actually sent: 8 of 8 daily briefings and the 1 weekly that
+    carried it all read "5건", because `SOURCE_LIMIT` was 5 and the brief always had at least
+    that many. A number that cannot change is not a signal, and Slack has no URL for a vault
+    file, so the filename bought nothing either.
+    """
+    slack_briefing = load_module("slack_briefing_src", ROOT / "slack_briefing.py")
     sources = [f"/vault/wiki/wiki-{i:04d}.md" for i in range(5)]
-    line = slack_briefing.render_sources(sources)
-    # Slack cannot open a vault file, so five titles were 277 characters the reader could do
-    # nothing with. What survives is the trust signal.
-    assert len(line) <= 40, line
-    assert "위키 5건" in line
-    assert slack_briefing.render_sources([]) == ""
+
+    text = slack_briefing.render_message_mrkdwn(
+        "*brief*", "2026-09-04", "## proj\n- Next: ship it\n", sources, "없음"
+    )
+    assert "wiki-0001.md" not in text, text
+    assert "근거" not in text, text
+    assert "ship it" in text, "the items themselves still render"
 
 
 def test_repeated_project_names_are_written_once():
