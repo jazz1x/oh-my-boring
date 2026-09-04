@@ -85,15 +85,57 @@ _→ `recall("…", "oh-my-boring")` · 느림 `next_actions("oh-my-boring")`_""
     assert "wiki-0001.md" not in rendered, rendered
 
 
+def test_the_reference_zone_stands_aside_on_the_mornings_with_the_most_work():
+    """The zone that is read and forgotten had twice the room of the zone that is acted on.
+
+    Reference held four labels at five each; the action zone held Blocked plus five and five.
+    Across the 63 briefings in the vault the action zone overflowed on 27 of them, hiding 170
+    items behind "외 N개 항목" while the reference zone under it printed 351. On those mornings
+    reference collapses to its counts and the room goes to the work.
+    """
+    slack_briefing = load_module("slack_briefing_budget", ROOT / "slack_briefing.py")
+
+    quiet = "# proj\n" + "\n".join(
+        [f"- Next: action {i}" for i in range(3)] + [f"- Risks: risk {i}" for i in range(3)]
+    )
+    body = slack_briefing.render_body_mrkdwn(quiet)
+    assert "risk 0" in body, "a quiet morning still shows the reference items themselves"
+
+    busy = "# proj\n" + "\n".join(
+        [f"- Next: action {i}" for i in range(14)] + [f"- Risks: risk {i}" for i in range(3)]
+    )
+    body = slack_briefing.render_body_mrkdwn(busy)
+    payload = slack_briefing.render_blocks_payload("T", "S", busy, [], "empty")
+    blocks_text = json.dumps(payload, ensure_ascii=False)
+
+    for rendering in (body, blocks_text):
+        assert "risk 0" not in rendering, f"reference did not stand aside:\n{rendering}"
+
+    # The count has to be on the zone's own line. Asserting it anywhere in the message passes on
+    # the header tally at the top, which says the same words and would keep saying them after the
+    # zone line stopped carrying anything at all.
+    zone_line = next(ln for ln in body.splitlines() if ln.startswith("*참고*"))
+    assert "⚠️ 리스크 3" in zone_line, zone_line
+    assert any(
+        "*참고*" in json.dumps(b, ensure_ascii=False) and "⚠️ 리스크 3" in json.dumps(b, ensure_ascii=False)
+        for b in payload["blocks"]
+    ), blocks_text
+
+    # The room actually goes to the work. Index 13 is past what the action zone shows on a quiet
+    # morning, so this fails if the busy budget is not larger than the ordinary one.
+    assert "action 13" in body, body
+    assert ("action 13" in blocks_text) == ("action 13" in body), "the two renderings disagree"
+
+
 def test_blocked_is_never_truncated_and_both_renderers_agree():
     slack_briefing = load_module("slack_briefing_limits", ROOT / "slack_briefing.py")
 
-    # Eight blockers and eight next-actions: more than any per-group limit.
-    # The zone limit is the sum of its labels' limits, so Next has to exceed that sum before
-    # truncation happens at all — a fixture below it would assert on a cap that never fires.
+    # Eight blockers and thirty next-actions: past the busy budget, which is what the action zone
+    # gets once the reference zone stands aside. The cap has to actually fire or this test asserts
+    # on nothing — a fixture sized below the budget would pass no matter what the renderer did.
     lines = ["# proj"]
     lines += [f"- Blocked: blocker {i}" for i in range(8)]
-    lines += [f"- Next: action {i}" for i in range(20)]
+    lines += [f"- Next: action {i}" for i in range(30)]
     answer = "\n".join(lines)
 
     body = slack_briefing.render_body_mrkdwn(answer)
@@ -109,10 +151,10 @@ def test_blocked_is_never_truncated_and_both_renderers_agree():
 
     # Next is truncated — and both renderers must truncate it to the SAME set, because Slack
     # picks between them and a fallback that disagrees is a second, quieter briefing.
-    shown_text = {i for i in range(20) if f"action {i}" in body}
-    shown_blocks = {i for i in range(20) if f"action {i}" in blocks_text}
+    shown_text = {i for i in range(30) if f"action {i}" in body}
+    shown_blocks = {i for i in range(30) if f"action {i}" in blocks_text}
     assert shown_text == shown_blocks, f"fallback and blocks disagree: {shown_text} vs {shown_blocks}"
-    assert len(shown_text) < 20, "Next must actually be capped, or this test proves nothing"
+    assert len(shown_text) < 30, "Next must actually be capped, or this test proves nothing"
 
 
 def test_done_does_not_push_blockers_off_the_first_screen():

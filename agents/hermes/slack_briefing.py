@@ -393,11 +393,23 @@ def render_body_mrkdwn(answer: str, known_projects=None) -> str:
         if entries:
             counts.append(f"{SECTION_EMOJI[label]} {SECTION_TITLE[label]} {len(entries)}")
 
+    action_limit, reference_yields = zone_plan(items_by_label)
     for zone_title, labels in ZONES:
         entries = zone_entries(items_by_label, labels)
         if not entries:
             continue
-        limit = sum(group_limit(label, len(items_by_label.get(label, ()))) for label in labels)
+        if labels is not ACTIONABLE and reference_yields:
+            # There is more work this morning than fits. The reference zone is read and forgotten;
+            # the action zone is the reason the message was sent, so it takes the room and this
+            # says only how much is waiting below.
+            lines.append(f"*{zone_title}* ({len(entries)}) — {reference_counts(entries)}")
+            lines.append("")
+            continue
+        limit = (
+            action_limit
+            if labels is ACTIONABLE
+            else sum(group_limit(label, len(items_by_label.get(label, ()))) for label in labels)
+        )
         lines.append(f"*{zone_title}* ({len(entries)})")
         lines.extend(render_zone_lines(entries, limit))
         followup = zone_followup(zone_title, entries)
@@ -673,6 +685,47 @@ def group_limit(label: str, total: int) -> int:
     return DONE_ITEM_LIMIT if label == "Done" else ITEM_LIMIT
 
 
+#: What Next and Stalled may show on a day the action zone would otherwise be cut short. Across
+#: the 63 briefings in the vault the action zone overflowed on 27 of them, hiding 170 items behind
+#: "외 N개 항목" while the reference zone below printed 351 -- twice as much read-and-forget
+#: content, on exactly the mornings with the most work. At ten the overflow falls to 5 days and
+#: 26 items, and the room comes from the reference zone rather than from the reader's screen.
+BUSY_ITEM_LIMIT = 10
+
+
+def zone_plan(items_by_label):
+    """How many action items to show, and whether the reference zone yields to make room.
+
+    One function because two renderers must not disagree about which items a reader gets; the
+    fallback text and the Block Kit payload go into the same message and Slack picks between them.
+    """
+    action_labels = ACTIONABLE
+    action = zone_entries(items_by_label, action_labels)
+    plain = sum(group_limit(label, len(items_by_label.get(label, ()))) for label in action_labels)
+    if len(action) <= plain:
+        return plain, False
+    busy = sum(
+        len(items_by_label.get(label, ()))
+        if label in NEVER_TRUNCATED
+        else BUSY_ITEM_LIMIT
+        for label in action_labels
+    )
+    return busy, True
+
+
+def reference_counts(entries) -> str:
+    """The reference zone as one line, for the mornings it has to stand aside."""
+    tally: dict[str, int] = {}
+    for label, _project, _item in entries:
+        tally[label] = tally.get(label, 0) + 1
+    parts = [
+        f"{SECTION_EMOJI.get(label, '•')} {SECTION_TITLE.get(label, '기타')} {n}"
+        for label, n in tally.items()
+        if n
+    ]
+    return " · ".join(parts)
+
+
 def render_blocks_payload(
     title: str,
     stamp: str,
@@ -743,14 +796,24 @@ def render_blocks_payload(
             blocks.append(_section("*오늘의 1순위*\n" + "\n".join(pick_lines)))
             blocks.append({"type": "divider"})
 
+        action_limit, reference_yields = zone_plan(items_by_label)
         for zone_title, labels in ZONES:
             entries = zone_entries(items_by_label, labels)
             if not entries:
                 continue
+            if labels is not ACTIONABLE and reference_yields:
+                blocks.append(
+                    _context(f"*{zone_title}* ({len(entries)}) — {reference_counts(entries)}")
+                )
+                continue
             # Done stays out of the zones entirely: it is confirmation, not work, and on a phone
             # sixteen finished items push the blockers off the first screen.
-            zone_limit = sum(
-                group_limit(label, len(items_by_label.get(label, ()))) for label in labels
+            zone_limit = (
+                action_limit
+                if labels is ACTIONABLE
+                else sum(
+                    group_limit(label, len(items_by_label.get(label, ()))) for label in labels
+                )
             )
             item_lines = render_zone_lines(entries, zone_limit)
             blocks.append(
