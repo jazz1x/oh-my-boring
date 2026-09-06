@@ -808,6 +808,37 @@ def _log_resolution_event(session_id, origin, repo, report, verifier_status, rem
         print(f"[distill-session] event log write failed: {e}", file=sys.stderr)
 
 
+#: Openings that mark a transcript as a tool running itself rather than a person working. These
+#: sessions end, distil, and become notes exactly like a human one -- and they were 143 of the 183
+#: notes written inside the measurement window (78%), 25-35 a day. A corpus that is four fifths
+#: machine runs dilutes every recall made against it and then feeds those runs back in as memory.
+#:
+#: Matched against the first `[user]` turn only. A person quoting one of these phrases mid-session
+#: is doing real work and their session is not an automated run.
+AUTOMATED_RUN_OPENINGS = (
+    "review this change for security vulnerabilities",
+    # The same tool's second pass. Matching only its first stage let one run in four hundred
+    # through, which is how a list like this rots: it is written against one day's transcripts and
+    # never revisited. Both stages are named because both were observed.
+    "you previously flagged these candidate vulnerabilities",
+)
+
+
+def is_automated_run(transcript_text):
+    """True when this transcript is a tool driving itself, not a person solving something.
+
+    The distinction is what the corpus is for: it holds how problems got solved, and a scripted
+    review that says the same sentence every time carries no such story. Absence of a first user
+    turn is not evidence either way, so it answers False and the session distils as before.
+    """
+    for line in (transcript_text or "").splitlines():
+        if not line.startswith("[user]"):
+            continue
+        opening = line[len("[user]") :].strip().lower()
+        return any(opening.startswith(mark) for mark in AUTOMATED_RUN_OPENINGS)
+    return False
+
+
 def log_skip_event(session_id, origin, repo, resolution, reason):
     event_log.try_append_event(
         "distill-session",
