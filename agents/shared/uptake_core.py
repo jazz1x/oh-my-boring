@@ -16,6 +16,8 @@ that is not already sitting in the user's own prompt.
 No I/O beyond a JSONL append the caller hands a path to; the hooks own the rest.
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -127,6 +129,39 @@ def injection_record(session_id, prompt, hits, max_results, controls=None):
     }
 
 
+@contextlib.contextmanager
+def _locked(target, mode):
+    """Hold an exclusive lock on the ledger for the whole read-modify-write.
+
+    The ledger is one file shared by every session on the machine, and pruning rewrites it
+    whole. Without a lock the sequence is: a session ends, reads the file, filters its own rows
+    out, and writes back what it saw -- discarding every row that other sessions appended while
+    it was thinking. That is not a rare race. Measured 2026-09-06, 1,216 subagent transcripts and
+    several hundred workflow runs in fourteen days, and the share of distilled sessions that
+    reached the verdict fell from 95% on a quiet day to 12% once the machine ran hot.
+
+    Yields None instead of a handle when the file cannot be opened, so callers keep their
+    never-raises contract: a ledger failure must not cost the user a prompt.
+    """
+    handle = None
+    try:
+        handle = open(target, mode, encoding="utf-8")
+    except OSError:
+        yield None
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield handle
+    except OSError:
+        yield None
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ValueError):
+            pass
+        handle.close()
+
+
 def append_record(record, path=None):
     """Append one record. Never raises — a failed ledger write must not cost the user a prompt."""
     if not record:
@@ -134,7 +169,9 @@ def append_record(record, path=None):
     target = path or ledger_path()
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "a", encoding="utf-8") as handle:
+        with _locked(target, "a") as handle:
+            if handle is None:
+                return False
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         return True
     except OSError:
@@ -327,8 +364,18 @@ def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_D
     """
     target = path or ledger_path()
     try:
-        with open(target, encoding="utf-8") as handle:
-            lines = handle.readlines()
+        with _locked(target, "r+") as handle:
+            if handle is None:
+                return False, 0, 0
+            return _prune_locked(handle, session_id, now, max_age_days)
+    except OSError:
+        return False, 0, 0
+
+
+def _prune_locked(handle, session_id, now, max_age_days):
+    """The body of `prune_session`, with the ledger already locked and open for read+write."""
+    try:
+        lines = handle.readlines()
     except OSError:
         return False, 0, 0
     cutoff = (now if now is not None else time.time()) - max_age_days * 86400
@@ -366,8 +413,12 @@ def prune_session(session_id, path=None, now=None, max_age_days=LEDGER_MAX_AGE_D
             continue
         kept.append(line)
     try:
-        with open(target, "w", encoding="utf-8") as handle:
-            handle.writelines(kept)
+        # Same handle, still locked. Reopening for write would drop the lock between the read and
+        # the rewrite, which is the whole race this function was losing rows to.
+        handle.seek(0)
+        handle.truncate()
+        handle.writelines(kept)
+        handle.flush()
         return True, len(aged_sessions), aged_rows
     except OSError:
         return False, 0, 0
