@@ -519,5 +519,47 @@ def _read_last_event():
         return json.loads(f.readlines()[-1])
 
 
+class AutomatedRunsAreNotMemory(unittest.TestCase):
+    """A scripted review ends like a session and distils like one.
+
+    Measured on 2026-09-06: of the 34 sessions distilled the previous day, 31 opened with the
+    security-review tool's own prompt, and 143 of the 183 notes written inside the measurement
+    window (78%) came from those runs. The corpus holds how problems got solved; a tool that says
+    the same sentence every night has no such story to tell, and feeding it back in dilutes every
+    recall made against the corpus.
+    """
+
+    def test_the_tools_own_openings_are_not_memory(self):
+        for opening in (
+            "Review this change for security vulnerabilities.\n\nChanged files:",
+            "You previously flagged these candidate vulnerabilities:\n\n[",
+        ):
+            self.assertTrue(
+                distill_core.is_automated_run(f"[user] {opening}\n[assistant] ok"),
+                opening,
+            )
+
+    def test_a_person_is_never_mistaken_for_the_tool(self):
+        # Both stages of the same tool were observed; matching only the first let one run in the
+        # sample through, so both are named.
+        human = "[user] 회수게이트도 다 끊겼나본데요\n[assistant] 확인합니다"
+        self.assertFalse(distill_core.is_automated_run(human))
+
+        # Quoting the tool mid-session is a person doing real work, not the tool running itself.
+        quoting = (
+            "[user] 오늘 리뷰 왜 이래요\n"
+            "[assistant] 확인\n"
+            "[user] Review this change for security vulnerabilities. 라고 떴는데 이게 맞나요"
+        )
+        self.assertFalse(distill_core.is_automated_run(quoting))
+
+    def test_a_transcript_with_no_user_turn_still_distils(self):
+        # Absence of evidence is not evidence: an unparseable or assistant-only transcript is not
+        # a reason to throw a session away.
+        self.assertFalse(distill_core.is_automated_run("[assistant] 혼자 말함"))
+        self.assertFalse(distill_core.is_automated_run(""))
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

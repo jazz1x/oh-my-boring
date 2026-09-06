@@ -25,6 +25,7 @@ from distill_core import (  # noqa: F401
     distill_and_remember,
     git_remote_url,
     log_skip_event,
+    is_automated_run,
     log_uptake_event,
     repo_slug,
 )
@@ -34,7 +35,7 @@ from distill_core import (  # noqa: F401
 __all__ = [
     "_extract_json", "_mark", "_strip_trailing_metadata",
     "_build_prompt", "_call_llm", "_call_remember", "_throttled",
-    "distill_and_remember", "git_remote_url", "log_skip_event", "log_uptake_event", "repo_slug", "extract", "main", "run",
+    "distill_and_remember", "git_remote_url", "is_automated_run", "log_skip_event", "log_uptake_event", "repo_slug", "extract", "main", "run",
 ]
 # fmt: on
 
@@ -80,6 +81,16 @@ def main() -> int:
         # Before the length gate on purpose: a session too short to be worth distilling still
         # received injections, and whether the agent used them is the same measurement.
         log_uptake_event(session_id, repo, text, "claude-code")
+    if is_automated_run(text):
+        # It ended like a session and it distils like one, which is how a scripted review became a
+        # quarter of the corpus. Named in the ledger rather than dropped in silence: a skip nobody
+        # can count is indistinguishable from a session that never happened.
+        print("[omb-distill] automated run; not memory", file=sys.stderr)
+        log_skip_event(session_id, origin, repo, _distill_resolution(), "automated_run")
+        if session_id:
+            _mark(session_id)
+        return 0
+
     if len(text) < 500:
         print("[omb-distill] transcript too short; skipping", file=sys.stderr)
         log_skip_event(session_id, origin, repo, _distill_resolution(), "too_short")
